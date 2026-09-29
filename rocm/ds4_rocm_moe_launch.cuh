@@ -695,9 +695,32 @@ static int routed_moe_launch(
      * selected-expert state to the default stream. Keep the asynchronous
      * read overlap, then use the deterministic compact table below. */
     int split_selected = 0;
+    /* Q4_K one-token decode reads the selected experts in place through the
+     * per-slot pointer tables; DS4_ROCM_Q4K_DECODE_COMPACT=1 restores the
+     * compact copy. */
+    const char * const *q4k_gate_slots = NULL;
+    const char * const *q4k_up_slots = NULL;
+    const char * const *q4k_down_slots = NULL;
+    const int q4k_slot_selected =
+        !split_selected &&
+        !stream_full_layer &&
+        n_tokens == 1u &&
+        q4k_path &&
+        n_expert <= DS4_ROCM_N_EXPERT_USED &&
+        getenv("DS4_ROCM_Q4K_DECODE_COMPACT") == NULL &&
+        cuda_stream_selected_apply_ptrs(model_map,
+                                        layer_index,
+                                        n_total_expert,
+                                        n_expert,
+                                        gate_expert_bytes,
+                                        down_expert_bytes,
+                                        &q4k_gate_slots,
+                                        &q4k_up_slots,
+                                        &q4k_down_slots);
     const int compact_selected =
         split_selected ||
-        (!stream_full_layer &&
+        (!q4k_slot_selected &&
+        !stream_full_layer &&
         n_tokens == 1u &&
         cuda_stream_selected_apply(model_map,
                                    layer_index,
@@ -709,7 +732,8 @@ static int routed_moe_launch(
                                    &gate_w,
                                    &up_w,
                                    &down_w));
-    if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
+    if (!compact_selected && !q4k_slot_selected &&
+        !batch_stream_selected && !batch_stream_split_selected) {
         if (g_ssd_streaming_mode &&
             n_total_expert > n_expert &&
             !stream_full_layer &&
@@ -742,10 +766,13 @@ static int routed_moe_launch(
             return 0;
         }
         if (!cuda_stream_batch_selected_wait_upload_ready()) return 0;
-    } else if (!gate_w || !up_w || !down_w) {
+    } else if (!q4k_slot_selected && (!gate_w || !up_w || !down_w)) {
         return 0;
     }
-    if (compact_selected && !cuda_stream_selected_wait_upload_ready()) return 0;
+    if ((compact_selected || q4k_slot_selected) &&
+        !cuda_stream_selected_wait_upload_ready()) {
+        return 0;
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -1593,7 +1620,21 @@ static int routed_moe_launch(
                 }
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-                if (q4k_path) {
+                if (q4k_slot_selected) {
+                    moe_gate_up_mid_decode_q4K_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        q4k_gate_slots,
+                        q4k_up_slots,
+                        xq,
+                        (const float *)weights->ptr,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        write_gate_up,
+                        clamp);
+                } else if (q4k_path) {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -1877,7 +1918,16 @@ static int routed_moe_launch(
             }
             if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                if (q4k_path) {
+                if (q4k_slot_selected) {
+                    moe_down_q4K_sum6_qwarp32_ptrs_kernel<<<sgrid, 256>>>(
+                        (float *)out->ptr,
+                        q4k_down_slots,
+                        midq,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                } else if (q4k_path) {
                     moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,

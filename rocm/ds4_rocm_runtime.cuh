@@ -4572,6 +4572,46 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+/* One-token Q4_K decode without the compact copy: wait for the pending
+ * selected-expert reads, then hand out the per-slot pointer tables that
+ * cuda_stream_selected_load already uploaded. Kernels read each selected
+ * expert in place from its streaming-cache slot, which saves copying all
+ * selected experts (~113 MiB per layer at Q4_K) device-to-device.
+ *
+ * In-place reads are safe for decode: the next layer's reads start only after
+ * its router ran on the default stream, i.e. after this layer's kernels.
+ * Returns 0 without consuming the pending load when it does not match, so the
+ * caller can fall back to cuda_stream_selected_apply. */
+static int cuda_stream_selected_apply_ptrs(
+        const void *model_map,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const char * const **gate_slots,
+        const char * const **up_slots,
+        const char * const **down_slots) {
+    if (!g_ssd_streaming_mode ||
+        !gate_slots || !up_slots || !down_slots ||
+        !g_stream_selected_cache.gate_ptrs ||
+        !g_stream_selected_cache.up_ptrs ||
+        !g_stream_selected_cache.down_ptrs ||
+        !cuda_stream_selected_pending_matches(model_map,
+                                              layer,
+                                              n_total_expert,
+                                              n_selected,
+                                              gate_expert_bytes,
+                                              down_expert_bytes)) {
+        return 0;
+    }
+    if (!cuda_stream_selected_finish_pending_missing(0u)) return 0;
+    *gate_slots = g_stream_selected_cache.gate_ptrs;
+    *up_slots = g_stream_selected_cache.up_ptrs;
+    *down_slots = g_stream_selected_cache.down_ptrs;
+    return 1;
+}
+
 static const char *cuda_model_range_copy_uncached(
         const void *model_map,
         uint64_t offset,
