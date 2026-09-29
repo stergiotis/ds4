@@ -17,6 +17,33 @@ change in expert-cache size is not bit-identical, because cached and streamed
 experts take different kernel paths. Measured drift: top-1 unchanged at every
 frontier, RMSE 0.12-0.18, max-abs <= 0.91.
 
+- `strix/telemetry.py` samples the machine without root. It decodes amdgpu
+  `gpu_metrics` v3.0 (GFX busy, socket/GFX/core power, temperatures, clocks,
+  throttle residency) and adds CPU load, NVMe reads and GTT use. Its DRAM
+  read/write fields report implausible values on this APU; use `dram_bw.sh`.
+- `strix/dram_bw.sh` measures DRAM read bandwidth on all 16 LPDDR5X channels
+  from the data-fabric PMU (event `0x1f + 0x40*N`, 64 B per beat). It needs
+  `modprobe amd_uncore` and `perf_event_paranoid=-1`; the UMC PMUs report 0
+  counters on this APU.
+
+## How the machine is used (measured 2026-09-29)
+
+Qwen3.8-27B Q8 in llama.cpp (dense, fully in RAM) decodes at 17.3 tok/s:
+
+- DRAM: 203 GB/s read, evenly over all 16 channels, which is 79% of the
+  256 GB/s peak. Decode is memory-bound, so faster kernels will not help much.
+- Power: socket pinned at the 120 W limit. The GPU draws ~41 W; about 60 W
+  goes to memory, fabric and SoC, so moving data costs about half the budget.
+- CPU: two host threads burn cores without doing work.
+  - The GPU-sync wait spins in the HSA runtime. `HSA_ENABLE_MWAITX=1` turns it
+    into MWAITX: core power 8 -> 1 W and socket 123 -> 113 W, at identical
+    speed and output.
+  - The HSA async-event thread polls completion signals in a `wait_any` loop
+    with no pause, ~16 W; no environment switch covers it in ROCm 7.1.
+- Heat: with both threads spinning, Tctl sits at 100 °C with continuous CPU
+  thermal throttling. With MWAITX it is 93.6 °C with almost none. The GPU
+  stays near 63-67 °C at its 2,900 MHz maximum.
+
 ## Settings (environment)
 
 | Variable | Value | Why |
