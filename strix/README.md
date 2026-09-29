@@ -44,6 +44,22 @@ Qwen3.8-27B Q8 in llama.cpp (dense, fully in RAM) decodes at 17.3 tok/s:
   thermal throttling. With MWAITX it is 93.6 °C with almost none. The GPU
   stays near 63-67 °C at its 2,900 MHz maximum.
 
+GLM-5.3-Flash Q4_K in ds4 (sparse MoE, experts streamed from NVMe) uses
+the same machine very differently:
+
+| | Qwen3.8-27B Q8 | GLM-5.3-Flash Q4 |
+|---|---:|---:|
+| GPU busy / clock | 99.8% / 2,899 MHz | 53.6% / 2,194 MHz |
+| Package power | 120 W (at the limit) | 62.8 W |
+| DRAM read | 203 GB/s | 73 GB/s |
+| NVMe read | 0 | 2.4 GB/s avg, 3.0 peak |
+| Tctl / NVMe temp | 94-100 °C / 30 °C | 77 °C / 53 °C |
+
+Qwen is throughput-bound: memory bandwidth and power are saturated. GLM is
+latency-bound: it waits for expert reads, while power, DRAM bandwidth and the
+GPU stay about half idle. Shortening those waits (see PLAN.md) is the lever
+for GLM; for Qwen it would gain nothing.
+
 ## Settings (environment)
 
 | Variable | Value | Why |
