@@ -131,6 +131,10 @@ struct cuda_stream_resident_expert {
     char *down;
     uint64_t bytes;
     uint64_t last_used;
+    uint64_t queued;
+    uint64_t touch_step;
+    uint8_t freq;
+    uint8_t main_queue;
     int pooled;
 };
 
@@ -316,6 +320,18 @@ static cuda_stream_cache_layer_stats
 static int g_stream_cache_stats_enabled = -1;
 static int g_stream_cache_layer_stats_enabled = -1;
 static int g_stream_evict_past_layers_first_enabled = -1;
+/* S3-FIFO state (DS4_ROCM_STREAM_CACHE_POLICY=s3fifo): experts enter a small
+ * FIFO and move to the main FIFO once reused; the main FIFO reinserts reused
+ * experts instead of evicting them; a ghost map remembers keys evicted from
+ * the small FIFO so that their return goes straight to the main FIFO. */
+static int g_stream_cache_policy = -1;
+static uint64_t g_stream_resident_step;
+static uint32_t g_stream_s3_small_count;
+static uint64_t g_stream_s3_ghost_gen;
+static std::unordered_map<cuda_stream_resident_key,
+                          uint64_t,
+                          cuda_stream_resident_key_hash> g_stream_s3_ghost;
+static std::deque<std::pair<cuda_stream_resident_key, uint64_t>> g_stream_s3_ghost_fifo;
 static int32_t g_routed_moe_selected_override[DS4_ROCM_N_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
 static cudaEvent_t g_stream_selected_reuse_event;
@@ -421,6 +437,31 @@ static int cuda_stream_evict_past_layers_first(void) {
             (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return g_stream_evict_past_layers_first_enabled;
+}
+
+static int cuda_stream_env_percent(const char *name, int fallback, int lo, int hi) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    const long v = strtol(env, &end, 10);
+    return end != env && *end == '\0' && v >= lo && v <= hi ? (int)v : fallback;
+}
+
+static int cuda_stream_cache_policy_s3fifo(void) {
+    if (g_stream_cache_policy < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_CACHE_POLICY");
+        g_stream_cache_policy = env && strcmp(env, "s3fifo") == 0 ? 1 : 0;
+    }
+    return g_stream_cache_policy == 1;
+}
+
+/* Counts one use per routing step, however many times the step touches it. */
+static void cuda_stream_resident_touch(cuda_stream_resident_expert &e) {
+    e.last_used = ++g_stream_resident_clock;
+    if (e.touch_step != g_stream_resident_step) {
+        e.touch_step = g_stream_resident_step;
+        if (e.freq < 3u) e.freq++;
+    }
 }
 
 static void cuda_stream_cache_stats_note_resident(void) {
@@ -671,6 +712,9 @@ static void cuda_stream_resident_cache_release(void) {
     g_stream_resident_index.clear();
     g_stream_resident_bytes = 0;
     g_stream_resident_clock = 0;
+    g_stream_s3_small_count = 0;
+    g_stream_s3_ghost.clear();
+    g_stream_s3_ghost_fifo.clear();
     for (cuda_stream_expert_slab &slab : g_stream_expert_slabs) {
         if (slab.base) (void)cudaFree(slab.base);
     }
@@ -1475,6 +1519,7 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     } else {
         g_stream_resident_bytes = 0;
     }
+    if (!e.main_queue && g_stream_s3_small_count) g_stream_s3_small_count--;
     g_stream_resident_index.erase(evicted_key);
     const size_t last = g_stream_resident_experts.size() - 1u;
     if (idx != last) {
@@ -1486,10 +1531,85 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     return 1;
 }
 
+static int cuda_stream_s3fifo_evict_one(
+        uint32_t layer,
+        const int32_t *selected_ids,
+        uint32_t n_selected) {
+    static int small_pct = -1, promote = -1;
+    if (small_pct < 0) {
+        small_pct = cuda_stream_env_percent("DS4_ROCM_STREAM_S3FIFO_SMALL_PCT", 10, 1, 90);
+        promote = cuda_stream_env_percent("DS4_ROCM_STREAM_S3FIFO_PROMOTE", 1, 1, 3);
+    }
+    uint32_t small_target = (uint32_t)((uint64_t)g_stream_expert_cache_budget * (uint64_t)small_pct / 100u);
+    if (small_target == 0) small_target = 1;
+    const size_t n = g_stream_resident_experts.size();
+    for (size_t round = 0; round < 4u * n + 8u; round++) {
+        bool from_small = g_stream_s3_small_count >= small_target ||
+                          g_stream_s3_small_count == n;
+        size_t victim = (size_t)-1;
+        for (int pass = 0; pass < 2 && victim == (size_t)-1; pass++) {
+            uint64_t oldest = UINT64_MAX;
+            for (size_t i = 0; i < n; i++) {
+                const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
+                if ((bool)e.main_queue == from_small ||
+                    cuda_stream_selected_is_current(e, layer, selected_ids, n_selected)) {
+                    continue;
+                }
+                if (e.queued < oldest) {
+                    oldest = e.queued;
+                    victim = i;
+                }
+            }
+            if (victim == (size_t)-1) from_small = !from_small;
+        }
+        if (victim == (size_t)-1) return 0;
+        cuda_stream_resident_expert &e = g_stream_resident_experts[victim];
+        if (from_small) {
+            if (e.freq >= (uint8_t)promote) {
+                e.main_queue = 1;
+                e.freq = 0;
+                e.queued = ++g_stream_resident_clock;
+                g_stream_s3_small_count--;
+                continue;
+            }
+            const cuda_stream_resident_key key = cuda_stream_resident_entry_key(e);
+            const uint64_t gen = ++g_stream_s3_ghost_gen;
+            try {
+                g_stream_s3_ghost[key] = gen;
+                g_stream_s3_ghost_fifo.push_back({key, gen});
+                const size_t ghost_cap = g_stream_expert_cache_budget > small_target ?
+                    g_stream_expert_cache_budget - small_target : 1u;
+                while (g_stream_s3_ghost_fifo.size() > ghost_cap) {
+                    const auto &old = g_stream_s3_ghost_fifo.front();
+                    const auto it = g_stream_s3_ghost.find(old.first);
+                    if (it != g_stream_s3_ghost.end() && it->second == old.second) {
+                        g_stream_s3_ghost.erase(it);
+                    }
+                    g_stream_s3_ghost_fifo.pop_front();
+                }
+            } catch (...) {
+                /* The ghost is advisory; a failed insertion only loses history. */
+            }
+            return cuda_stream_resident_evict_at(victim);
+        }
+        if (e.freq > 0) {
+            e.freq--;
+            e.queued = ++g_stream_resident_clock;
+            continue;
+        }
+        return cuda_stream_resident_evict_at(victim);
+    }
+    return 0;
+}
+
 static int cuda_stream_resident_evict_one(
         uint32_t layer,
         const int32_t *selected_ids,
         uint32_t n_selected) {
+    if (cuda_stream_cache_policy_s3fifo() &&
+        cuda_stream_s3fifo_evict_one(layer, selected_ids, n_selected)) {
+        return 1;
+    }
     size_t victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
     if (cuda_stream_evict_past_layers_first()) {
@@ -1738,6 +1858,18 @@ static int cuda_stream_resident_alloc(
     e.down = e.base + 2u * gate_expert_bytes;
     e.bytes = bytes;
     e.last_used = ++g_stream_resident_clock;
+    e.queued = e.last_used;
+    e.touch_step = g_stream_resident_step;
+    e.main_queue = 1;
+    if (cuda_stream_cache_policy_s3fifo()) {
+        const auto ghost = g_stream_s3_ghost.find(cuda_stream_resident_entry_key(e));
+        if (ghost != g_stream_s3_ghost.end()) {
+            g_stream_s3_ghost.erase(ghost);
+        } else {
+            e.main_queue = 0;
+            g_stream_s3_small_count++;
+        }
+    }
     e.pooled = pooled;
     g_stream_resident_experts.push_back(e);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
@@ -2818,8 +2950,7 @@ static int cuda_stream_resident_seed_experts(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             loaded++;
             continue;
         }
@@ -2988,7 +3119,7 @@ static int cuda_stream_selected_compact_mask(
         }
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
-        entry.last_used = ++g_stream_resident_clock;
+        cuda_stream_resident_touch(entry);
         err = cudaMemcpyAsync(g_stream_selected_cache.gate +
                                   (uint64_t)i * gate_expert_bytes,
                               entry.gate,
@@ -3065,7 +3196,7 @@ static int cuda_stream_selected_prepare_ptrs(
         }
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
-        entry.last_used = ++g_stream_resident_clock;
+        cuda_stream_resident_touch(entry);
         gate_ptrs[i] = entry.gate;
         up_ptrs[i] = entry.up;
         down_ptrs[i] = entry.down;
@@ -3138,6 +3269,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         const char ***down_ptrs,
         uint32_t *unique_out,
         int begin_pending) {
+    g_stream_resident_step++;
     if (!g_ssd_streaming_mode ||
         !model_map ||
         !ids ||
@@ -3360,7 +3492,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         if (idx >= 0) {
             cuda_stream_resident_expert &entry =
                 g_stream_resident_experts[(size_t)idx];
-            entry.last_used = ++g_stream_resident_clock;
+            cuda_stream_resident_touch(entry);
             gate_host[u] = entry.gate;
             up_host[u] = entry.up;
             down_host[u] = entry.down;
@@ -3974,8 +4106,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             continue;
         }
 
@@ -4064,6 +4195,7 @@ static int cuda_stream_selected_load(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
     g_stream_selected_cache.loaded = 0;
+    g_stream_resident_step++;
     if (g_stream_selected_pending.active) {
         cuda_stream_selected_abort_pending();
     }
@@ -4184,8 +4316,7 @@ static int cuda_stream_selected_load(
             }
         }
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             resident_mask |= 1u << i;
             continue;
         }

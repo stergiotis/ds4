@@ -36,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <algorithm>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
