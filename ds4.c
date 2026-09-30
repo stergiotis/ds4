@@ -48336,6 +48336,43 @@ static bool glm_graph_profile_router_selection(
     return true;
 }
 
+/* Routing trace (DS4_GLM_ROUTE_TRACE=FILE, one-token decode only): appends
+ * one line per token and layer, "pos layer e0 .. e7", with the experts the
+ * router selected, for replaying expert-cache policies offline. It
+ * synchronizes at every layer, so it is a measurement tool. */
+static struct {
+    int enabled;
+    FILE *fp;
+} g_glm_route_trace = { .enabled = -1 };
+
+static bool glm_graph_route_trace(ds4_glm_gpu_graph *g, uint32_t il, uint32_t pos) {
+    if (g_glm_route_trace.enabled < 0) {
+        const char *path = getenv("DS4_GLM_ROUTE_TRACE");
+        g_glm_route_trace.enabled = 0;
+        if (path && path[0]) {
+            g_glm_route_trace.fp = fopen(path, "a");
+            if (!g_glm_route_trace.fp) {
+                fprintf(stderr, "ds4: cannot open GLM route trace %s: %s\n", path, strerror(errno));
+                return false;
+            }
+            g_glm_route_trace.enabled = 1;
+        }
+    }
+    if (!g_glm_route_trace.enabled) return true;
+    const uint32_t k = DS4_N_EXPERT_USED;
+    int32_t selected[DS4_MAX_EXPERT_USED] = {0};
+    if (k > DS4_MAX_EXPERT_USED || ds4_gpu_end_commands() == 0) return false;
+    const bool ok = ds4_gpu_tensor_read(g->router_selected, 0, selected,
+                                        (uint64_t)k * sizeof(int32_t)) != 0;
+    if (ds4_gpu_begin_commands() == 0) return false;
+    if (!ok) return false;
+    fprintf(g_glm_route_trace.fp, "%u %u", pos, il);
+    for (uint32_t i = 0; i < k; i++) fprintf(g_glm_route_trace.fp, " %d", selected[i]);
+    fputc('\n', g_glm_route_trace.fp);
+    if (il + 1u == DS4_N_LAYER) fflush(g_glm_route_trace.fp);
+    return true;
+}
+
 /* Next-layer routing probe (DS4_GLM_PREDICT_PROBE=1, one-token decode only).
  * At layer il it runs layer il+1's router on layer il's FFN input and ranks
  * the top 16 experts by the same score the router uses. When layer il+1
@@ -49203,6 +49240,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          1,
                                          stage_t0);
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
+    if (ok) ok = glm_graph_route_trace(g, il, pos);
     if (ok) ok = glm_graph_predict_probe(g, model, l, il, ffn_norm,
                                              gate_out * gate_row_bytes,
                                              down_out * down_row_bytes);
