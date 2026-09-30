@@ -424,6 +424,15 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
 #endif
+#ifdef DS4_ROCM_BUILD
+/* Sets resident[i] to 1 when expert ids[i] of the table's layer is in the
+ * streaming expert cache, else 0. Returns 0 on bad arguments. */
+int ds4_gpu_stream_expert_cache_resident_mask(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *ids,
+        uint32_t                           n,
+        uint8_t                           *resident);
+#endif
 void ds4_gpu_print_memory_report(const char *label);
 
 #include "ds4_gpu_tp.h"

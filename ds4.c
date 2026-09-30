@@ -48337,50 +48337,121 @@ static bool glm_graph_profile_router_selection(
 }
 
 /* Next-layer routing probe (DS4_GLM_PREDICT_PROBE=1, one-token decode only).
- * At layer il it runs layer il+1's router on layer il's FFN input and later
- * scores that top-k against the experts layer il+1 really selects: the recall
- * a cross-layer expert prefetcher could reach. It synchronizes at every
- * layer, so it is a measurement tool, not a runtime feature. */
+ * At layer il it runs layer il+1's router on layer il's FFN input and ranks
+ * the top 16 experts by the same score the router uses. When layer il+1
+ * routes, it scores that ranking against the real selection and against the
+ * streaming expert cache: of the experts that are not resident (the ones
+ * decode waits for), how many would a top-8/12/16 prefetch have covered, and
+ * how many predicted experts would it have read in vain. It synchronizes at
+ * every layer, so it is a measurement tool, not a runtime feature. */
 #define GLM_PREDICT_PROBE_MAX_LAYERS 128
+#define GLM_PREDICT_PROBE_MAX_EXPERT 1024
+#define GLM_PREDICT_PROBE_TOP 16
+#define GLM_PREDICT_PROBE_NW 3
+static const uint32_t g_glm_predict_probe_width[GLM_PREDICT_PROBE_NW] = {8, 12, 16};
 static struct {
     int enabled;
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *probs;
     ds4_gpu_tensor *selected;
     ds4_gpu_tensor *weights;
-    int32_t pred[GLM_PREDICT_PROBE_MAX_LAYERS][DS4_MAX_EXPERT_USED];
+    int32_t pred[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_TOP];
     bool have[GLM_PREDICT_PROBE_MAX_LAYERS];
     uint64_t hist[DS4_MAX_EXPERT_USED + 1];
-    uint64_t layer_hits[GLM_PREDICT_PROBE_MAX_LAYERS];
-    uint64_t layer_total[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t rank_mismatch;
+    uint64_t layer_steps[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t layer_actual[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t layer_missing[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t layer_hits[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_NW];
+    uint64_t layer_covered[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_NW];
+    uint64_t layer_extra[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_NW];
 } g_glm_predict_probe = { .enabled = -1 };
 
 static void glm_predict_probe_report(void) {
-    uint64_t hits = 0, total = 0, samples = 0;
+    uint64_t steps = 0, actual = 0, missing = 0;
+    uint64_t hits[GLM_PREDICT_PROBE_NW] = {0};
+    uint64_t covered[GLM_PREDICT_PROBE_NW] = {0};
+    uint64_t extra[GLM_PREDICT_PROBE_NW] = {0};
     for (uint32_t i = 0; i < GLM_PREDICT_PROBE_MAX_LAYERS; i++) {
-        hits += g_glm_predict_probe.layer_hits[i];
-        total += g_glm_predict_probe.layer_total[i];
+        steps += g_glm_predict_probe.layer_steps[i];
+        actual += g_glm_predict_probe.layer_actual[i];
+        missing += g_glm_predict_probe.layer_missing[i];
+        for (uint32_t w = 0; w < GLM_PREDICT_PROBE_NW; w++) {
+            hits[w] += g_glm_predict_probe.layer_hits[i][w];
+            covered[w] += g_glm_predict_probe.layer_covered[i][w];
+            extra[w] += g_glm_predict_probe.layer_extra[i][w];
+        }
     }
-    for (uint32_t k = 0; k <= DS4_MAX_EXPERT_USED; k++) samples += g_glm_predict_probe.hist[k];
-    if (total == 0) return;
-    fprintf(stderr, "ds4: GLM next-layer prediction recall %.4f (%llu/%llu experts, %llu layer steps)\n",
-            (double)hits / (double)total, (unsigned long long)hits,
-            (unsigned long long)total, (unsigned long long)samples);
-    fprintf(stderr, "ds4: GLM next-layer prediction hits histogram:");
+    if (steps == 0 || actual == 0) return;
+    fprintf(stderr, "ds4: GLM next-layer prediction: %llu layer steps, %.2f of %.0f experts not resident per step (%.1f%%), rank mismatches %llu\n",
+            (unsigned long long)steps, (double)missing / (double)steps,
+            (double)actual / (double)steps, 100.0 * (double)missing / (double)actual,
+            (unsigned long long)g_glm_predict_probe.rank_mismatch);
+    for (uint32_t w = 0; w < GLM_PREDICT_PROBE_NW; w++) {
+        fprintf(stderr, "ds4: GLM next-layer prediction top-%u: recall %.4f, missing covered %.4f (%.2f per step), useless reads %.2f per step\n",
+                g_glm_predict_probe_width[w],
+                (double)hits[w] / (double)actual,
+                missing ? (double)covered[w] / (double)missing : 0.0,
+                (double)covered[w] / (double)steps,
+                (double)extra[w] / (double)steps);
+    }
+    fprintf(stderr, "ds4: GLM next-layer prediction top-8 hits histogram:");
     for (uint32_t k = 0; k <= DS4_MAX_EXPERT_USED; k++) {
         if (g_glm_predict_probe.hist[k]) {
             fprintf(stderr, " %u:%llu", k, (unsigned long long)g_glm_predict_probe.hist[k]);
         }
     }
-    fprintf(stderr, "\nds4: GLM next-layer prediction recall by layer:");
+    fprintf(stderr, "\nds4: GLM next-layer prediction by layer (missing per step / top-12 missing covered):");
     for (uint32_t i = 0; i < GLM_PREDICT_PROBE_MAX_LAYERS; i++) {
-        if (g_glm_predict_probe.layer_total[i]) {
-            fprintf(stderr, " %u:%.2f", i,
-                    (double)g_glm_predict_probe.layer_hits[i] /
-                    (double)g_glm_predict_probe.layer_total[i]);
+        const uint64_t n = g_glm_predict_probe.layer_steps[i];
+        const uint64_t m = g_glm_predict_probe.layer_missing[i];
+        if (n) {
+            fprintf(stderr, " %u:%.1f/%.2f", i, (double)m / (double)n,
+                    m ? (double)g_glm_predict_probe.layer_covered[i][1] / (double)m : 0.0);
         }
     }
     fprintf(stderr, "\n");
+}
+
+static bool glm_predict_probe_contains(const int32_t *ids, uint32_t n, int32_t id) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] == id) return true;
+    }
+    return false;
+}
+
+/* Ranks the top GLM_PREDICT_PROBE_TOP experts by sigmoid probability plus
+ * selection bias, ties to the lower index, as the router kernel does. */
+static bool glm_predict_probe_rank(
+        const ds4_model         *model,
+        const ds4_layer_weights *next,
+        int32_t                 *out) {
+    const uint32_t n_expert = DS4_N_EXPERT;
+    static float probs[GLM_PREDICT_PROBE_MAX_EXPERT];
+    if (n_expert > GLM_PREDICT_PROBE_MAX_EXPERT || n_expert < GLM_PREDICT_PROBE_TOP) return false;
+    if (ds4_gpu_tensor_read(g_glm_predict_probe.probs, 0, probs,
+                            (uint64_t)n_expert * sizeof(float)) == 0) {
+        return false;
+    }
+    const float *bias = (const float *)((const char *)model->map + next->ffn_exp_probs_b->abs_offset);
+    float best[GLM_PREDICT_PROBE_TOP];
+    for (uint32_t k = 0; k < GLM_PREDICT_PROBE_TOP; k++) {
+        best[k] = -INFINITY;
+        out[k] = -1;
+    }
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float s = probs[e] + bias[e];
+        uint32_t k = GLM_PREDICT_PROBE_TOP;
+        while (k > 0 && (s > best[k - 1] || (s == best[k - 1] && (int32_t)e < out[k - 1]))) k--;
+        if (k == GLM_PREDICT_PROBE_TOP) continue;
+        for (uint32_t j = GLM_PREDICT_PROBE_TOP - 1; j > k; j--) {
+            best[j] = best[j - 1];
+            out[j] = out[j - 1];
+        }
+        best[k] = s;
+        out[k] = (int32_t)e;
+    }
+    return true;
 }
 
 static bool glm_graph_predict_probe(
@@ -48388,22 +48459,25 @@ static bool glm_graph_predict_probe(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
         uint32_t                 il,
-        const ds4_gpu_tensor    *ffn_norm) {
+        const ds4_gpu_tensor    *ffn_norm,
+        uint64_t                 gate_expert_bytes,
+        uint64_t                 down_expert_bytes) {
     if (g_glm_predict_probe.enabled < 0) {
         const char *env = getenv("DS4_GLM_PREDICT_PROBE");
         g_glm_predict_probe.enabled = env && env[0] && strcmp(env, "0") != 0;
         if (g_glm_predict_probe.enabled) atexit(glm_predict_probe_report);
     }
     if (!g_glm_predict_probe.enabled) return true;
-    if (il + 1u >= GLM_PREDICT_PROBE_MAX_LAYERS || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
+    if (il + 1u >= GLM_PREDICT_PROBE_MAX_LAYERS || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED ||
+        DS4_N_EXPERT_USED > g_glm_predict_probe_width[0]) {
         return true;
     }
-    const uint64_t k = DS4_N_EXPERT_USED;
+    const uint32_t k = DS4_N_EXPERT_USED;
     if (!g_glm_predict_probe.logits) {
         g_glm_predict_probe.logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
         g_glm_predict_probe.probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
-        g_glm_predict_probe.selected = ds4_gpu_tensor_alloc(k * sizeof(int32_t));
-        g_glm_predict_probe.weights = ds4_gpu_tensor_alloc(k * sizeof(float));
+        g_glm_predict_probe.selected = ds4_gpu_tensor_alloc((uint64_t)k * sizeof(int32_t));
+        g_glm_predict_probe.weights = ds4_gpu_tensor_alloc((uint64_t)k * sizeof(float));
         if (!g_glm_predict_probe.logits || !g_glm_predict_probe.probs ||
             !g_glm_predict_probe.selected || !g_glm_predict_probe.weights) {
             fprintf(stderr, "ds4: GLM prediction probe allocation failed\n");
@@ -48412,27 +48486,60 @@ static bool glm_graph_predict_probe(
     }
     if (ds4_gpu_end_commands() == 0) return false;
 
-    /* Score this layer's real routing against the prediction made one layer
-     * earlier for the same token. */
+    /* Score this layer's real routing and cache state against the ranking
+     * made one layer earlier for the same token. */
     int32_t actual[DS4_MAX_EXPERT_USED] = {0};
-    bool ok = ds4_gpu_tensor_read(g->router_selected, 0, actual, k * sizeof(int32_t)) != 0;
+    bool ok = ds4_gpu_tensor_read(g->router_selected, 0, actual, (uint64_t)k * sizeof(int32_t)) != 0;
     if (ok && g_glm_predict_probe.have[il]) {
-        uint32_t hits = 0;
-        for (uint64_t i = 0; i < k; i++) {
-            for (uint64_t j = 0; j < k; j++) {
-                if (actual[i] == g_glm_predict_probe.pred[il][j]) {
+        const int32_t *pred = g_glm_predict_probe.pred[il];
+        uint8_t actual_res[DS4_MAX_EXPERT_USED] = {0};
+        uint8_t pred_res[GLM_PREDICT_PROBE_TOP] = {0};
+#ifdef DS4_ROCM_BUILD
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = model->map,
+            .model_size = model->size,
+            .layer = il,
+            .n_total_expert = DS4_N_EXPERT,
+            .gate_offset = layer->ffn_gate_exps->abs_offset,
+            .up_offset = layer->ffn_up_exps->abs_offset,
+            .down_offset = layer->ffn_down_exps->abs_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+        };
+        if (g->ssd_streaming) {
+            (void)ds4_gpu_stream_expert_cache_resident_mask(&table, actual, k, actual_res);
+            (void)ds4_gpu_stream_expert_cache_resident_mask(&table, pred, GLM_PREDICT_PROBE_TOP, pred_res);
+        }
+#else
+        (void)gate_expert_bytes;
+        (void)down_expert_bytes;
+#endif
+        uint32_t n_missing = 0;
+        for (uint32_t i = 0; i < k; i++) n_missing += !actual_res[i];
+        g_glm_predict_probe.layer_steps[il]++;
+        g_glm_predict_probe.layer_actual[il] += k;
+        g_glm_predict_probe.layer_missing[il] += n_missing;
+        for (uint32_t w = 0; w < GLM_PREDICT_PROBE_NW; w++) {
+            const uint32_t n = g_glm_predict_probe_width[w];
+            uint32_t hits = 0, covered = 0, extra = 0;
+            for (uint32_t i = 0; i < k; i++) {
+                if (glm_predict_probe_contains(pred, n, actual[i])) {
                     hits++;
-                    break;
+                    covered += !actual_res[i];
                 }
             }
+            for (uint32_t j = 0; j < n; j++) {
+                extra += !pred_res[j] && !glm_predict_probe_contains(actual, k, pred[j]);
+            }
+            if (w == 0) g_glm_predict_probe.hist[hits]++;
+            g_glm_predict_probe.layer_hits[il][w] += hits;
+            g_glm_predict_probe.layer_covered[il][w] += covered;
+            g_glm_predict_probe.layer_extra[il][w] += extra;
         }
-        g_glm_predict_probe.hist[hits]++;
-        g_glm_predict_probe.layer_hits[il] += hits;
-        g_glm_predict_probe.layer_total[il] += k;
     }
     g_glm_predict_probe.have[il] = false;
 
-    /* Predict layer il+1 from this layer's FFN input. */
+    /* Rank layer il+1's experts from this layer's FFN input. */
     const ds4_layer_weights *next = layer + 1;
     if (ok && il + 1u < DS4_N_LAYER && next->ffn_gate_inp && next->ffn_exp_probs_b) {
         if (ds4_gpu_begin_commands() == 0) return false;
@@ -48455,12 +48562,20 @@ static bool glm_graph_predict_probe(
                                               DS4_N_EXPERT_USED,
                                               DS4_EXPERT_WEIGHT_SCALE) != 0;
         if (ds4_gpu_end_commands() == 0) return false;
+        int32_t *pred = g_glm_predict_probe.pred[il + 1u];
+        if (ok) ok = glm_predict_probe_rank(model, next, pred);
         if (ok) {
-            ok = ds4_gpu_tensor_read(g_glm_predict_probe.selected, 0,
-                                     g_glm_predict_probe.pred[il + 1u],
-                                     k * sizeof(int32_t)) != 0;
-            g_glm_predict_probe.have[il + 1u] = ok;
+            int32_t gpu_sel[DS4_MAX_EXPERT_USED] = {0};
+            ok = ds4_gpu_tensor_read(g_glm_predict_probe.selected, 0, gpu_sel,
+                                     (uint64_t)k * sizeof(int32_t)) != 0;
+            for (uint32_t i = 0; ok && i < k; i++) {
+                if (!glm_predict_probe_contains(pred, k, gpu_sel[i])) {
+                    g_glm_predict_probe.rank_mismatch++;
+                    break;
+                }
+            }
         }
+        g_glm_predict_probe.have[il + 1u] = ok;
     }
     if (ds4_gpu_begin_commands() == 0) return false;
     if (!ok) fprintf(stderr, "ds4: GLM prediction probe failed at layer %u\n", il);
@@ -49088,7 +49203,9 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          1,
                                          stage_t0);
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
-    if (ok) ok = glm_graph_predict_probe(g, model, l, il, ffn_norm);
+    if (ok) ok = glm_graph_predict_probe(g, model, l, il, ffn_norm,
+                                             gate_out * gate_row_bytes,
+                                             down_out * down_row_bytes);
     const bool resident_decode_layer =
         g->ssd_streaming && glm_stream_resident_decode_layer_enabled(l, il);
     const bool streaming_expert_cache =
