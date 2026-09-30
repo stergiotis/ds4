@@ -48337,9 +48337,10 @@ static bool glm_graph_profile_router_selection(
 }
 
 /* Routing trace (DS4_GLM_ROUTE_TRACE=FILE, one-token decode only): appends
- * one line per token and layer, "pos layer e0 .. e7", with the experts the
- * router selected, for replaying expert-cache policies offline. It
- * synchronizes at every layer, so it is a measurement tool. */
+ * one line per token and layer, "pos layer e0 .. e7 ; w0 .. w7", with the
+ * experts the router selected and their gate weights, for replaying
+ * expert-cache policies offline. It synchronizes at every layer, so it is a
+ * measurement tool. */
 static struct {
     int enabled;
     FILE *fp;
@@ -48361,13 +48362,18 @@ static bool glm_graph_route_trace(ds4_glm_gpu_graph *g, uint32_t il, uint32_t po
     if (!g_glm_route_trace.enabled) return true;
     const uint32_t k = DS4_N_EXPERT_USED;
     int32_t selected[DS4_MAX_EXPERT_USED] = {0};
+    float weights[DS4_MAX_EXPERT_USED] = {0};
     if (k > DS4_MAX_EXPERT_USED || ds4_gpu_end_commands() == 0) return false;
     const bool ok = ds4_gpu_tensor_read(g->router_selected, 0, selected,
-                                        (uint64_t)k * sizeof(int32_t)) != 0;
+                                        (uint64_t)k * sizeof(int32_t)) != 0 &&
+                    ds4_gpu_tensor_read(g->router_weights, 0, weights,
+                                        (uint64_t)k * sizeof(float)) != 0;
     if (ds4_gpu_begin_commands() == 0) return false;
     if (!ok) return false;
     fprintf(g_glm_route_trace.fp, "%u %u", pos, il);
     for (uint32_t i = 0; i < k; i++) fprintf(g_glm_route_trace.fp, " %d", selected[i]);
+    fputs(" ;", g_glm_route_trace.fp);
+    for (uint32_t i = 0; i < k; i++) fprintf(g_glm_route_trace.fp, " %.5f", weights[i]);
     fputc('\n', g_glm_route_trace.fp);
     if (il + 1u == DS4_N_LAYER) fflush(g_glm_route_trace.fp);
     return true;

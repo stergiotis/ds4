@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay GLM routing traces against expert-cache policies.
 
-A trace line is "pos layer e0 .. e7" (DS4_GLM_ROUTE_TRACE). Every expert is
+A trace line is "pos layer e0 .. e7 [; w0 .. w7]" (DS4_GLM_ROUTE_TRACE). Every expert is
 the same size, so capacity is counted in experts. The experts of the layer
 being routed are pinned: a policy may not evict one of them to make room for
 another. Misses are counted after a warm-up of the first --warmup tokens.
@@ -29,7 +29,8 @@ def load(paths):
                 if last is not None and pos != last:
                     tok += 1
                 last = pos
-                steps.append((tok, layer, tuple(int(x) for x in v[2:])))
+                ids = v[2:v.index(";")] if ";" in v else v[2:]
+                steps.append((tok, layer, tuple(int(x) for x in ids)))
         tok += 1
     return steps
 
