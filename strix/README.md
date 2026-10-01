@@ -68,6 +68,9 @@ for GLM; for Qwen it would gain nothing.
 | `DS4_SSD_AUTO_CACHE_PCT` | 90 | So that the 80% plan is not the binding limit. |
 | `DS4_ROCM_STREAM_MODEL_CACHE_GB` | 24 | The layer-span cache defaults to GTT/3 (36 GiB) but the memory plan counts only 7.6 GiB of it. Prefill and the ROCm per-layer decode path both use it: at 12 GiB decode drops to 0.27 tok/s. |
 | `DS4_ROCM_ENABLE_STREAMING_STATIC_DECODE_MAP` | 1 | Maps every layer's decode spans once (14.5 GiB) instead of remapping per layer. Decode +3-12% on top of the pointer tables, same GTT peak, logits bit-identical. |
+| `HSA_ENABLE_MWAITX` | 1 | Waits on GPU signals with MWAITX instead of spinning. For ds4 (A/B, ABAB, 2026-09-30): decode unchanged (2.84/3.61/3.12/3.24 tok/s at 2K-8K both ways), logits bit-identical, core power 17.4 -> 15.3 W, socket ~79 W either way. ds4's ~115% CPU is streaming work, not spinning, so the gain is much smaller than Qwen's 8 -> 1 W. |
+| `DS4_ROCM_STREAM_FREE_RESERVE_GB` | 4 | Free GTT the expert cache keeps while it grows (default 16). At 16 the cache stalls at ~4,790 of its 5,869-expert budget. 1,500-token coding run: 16 -> 8 -> 4 GiB gives 2.36 -> 2.60 -> 2.75 tok/s, misses 18.9 -> 15.5 -> 13.9%, GTT peak 91 -> 99 -> 103 GiB of 107, MemAvailable min 21 -> 13 -> 9 GB, output byte-identical. |
+| `DS4_ROCM_STREAM_CACHE_POLICY` | s3fifo | S3-FIFO eviction instead of LRU (fork commit, opt-in). Misses -6% (coding) and -13% (olympiad), decode +3% and +7% at headroom 4, output byte-identical. |
 
 GLM-5.3-Flash Q4_K, 2026-09-29 (steady decode tok/s, teacher-forced):
 
@@ -91,6 +94,56 @@ tokens, seed 42, 64K context, same build:
 | Prefill | 324 s | 335 s |
 | Decode | 1.87 tok/s | 2.38 tok/s (+27%) |
 | Total | 42.0 min | 34.3 min |
+
+Expert-cache size and policy, 2026-09-30/10-01 (1,500 greedy tokens,
+16K context, coding prompt unless noted):
+
+| Config | Cache reached | Misses | Decode |
+|---|---:|---:|---:|
+| headroom 16 (default), LRU | 4,790 | 18.9% | 2.36 tok/s |
+| headroom 8, LRU | 5,396 | 15.5% | 2.60 |
+| headroom 4, LRU | 5,699 | 13.9% | 2.75 / 2.82 (repeat) |
+| headroom 4, S3-FIFO | - | 13.1% | **2.90** |
+| olympiad prompt, headroom 4, LRU / S3-FIFO | - | 14.9% / 13.0% | 2.74 / **2.93** |
+
+Real tasks through `ds4-server` (64K context, sampled, so token counts
+differ) with headroom 4 and S3-FIFO, against the same tasks on 2026-09-30
+with headroom 16 and LRU: expr 2.30 -> 2.59, glob 2.42 -> 2.58, semver
+2.23 -> 2.38 tok/s. The server stops at its planned budget (5,244 experts at
+64K); `DS4_GLM_MEMORY_GUARD_RESERVE_GB=8` raises the plan to 73.1 GiB
+(~5,548 experts) at the same 103 GiB GTT peak (CLI, 64K), not yet measured
+in the server. ~60 W socket, Tctl 76 °C.
+
+The bench (teacher-forced, prefill to 8K) is 4-6% *slower* at 4K-8K with
+headroom 4 or 8 (e.g. 3.63 -> 3.42 tok/s at 4K), and its 6K/8K frontier
+logits differ (max |d| ~1.0, same argmax). Cause: at headroom 16 the memory
+is so tight that prefill falls back from the q8->fp16 weight cache to the q8
+kernels ("q8 fp16 cache budget exhausted"); every lower headroom produces the
+same, other logits. ds4 picks that path from free memory at run time, so
+prefill numerics depend on memory pressure, not only on the input.
+
+### Offline cache replay
+
+`DS4_GLM_ROUTE_TRACE=FILE` writes every decode routing decision and its gate
+weights; `strix/cachesim/` replays traces on the CPU. Replaying LRU at the
+size the real cache reached reproduces ds4's own miss count exactly (19.72%).
+Three 3,000-token traces (coding, olympiad, code review) at 5,869 slots:
+
+| Policy | Misses vs LRU |
+|---|---:|
+| S3-FIFO (10% small queue, promote on first reuse) | -5 to -12% (-9% combined) |
+| ARC | -0.3 to -1.2% |
+| W-TinyLFU (1% window) | +3 to +34%; break-even needs a ~60% window |
+| LRU, past layers first | +18 to +20% (A/B: decode -2 to -3.5%) |
+| pinned hotlist trained on another trace | +4 to +23% |
+| Belady OPT (bound) | -63% |
+
+Miss rate against cache size (LRU, coding): 4,000 -> 24.9%, 4,790 -> 19.4%,
+5,869 -> 13.3%, 7,000 -> 8.5%, 8,000 -> 5.5%. Size dominates policy.
+
+Cross-layer prediction (layer L+1's router on layer L's FFN input) covers
+52/64/71% of the *missing* experts at top-8/12/16, at 1.3/2.7/4.3 wasted
+reads per layer step: below the 70%-at-top-12 bar the plan set.
 
 ## Code changes
 
