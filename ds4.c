@@ -23482,6 +23482,93 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
 #endif
 }
 
+#ifdef DS4_ROCM_BUILD
+/* Q2 tier (DS4_GLM_Q2_FILE=path to a Q2 GGUF of the same model,
+ * DS4_GLM_Q2_WEIGHT_MAX=w > 0): during one-token decode, a selected expert
+ * that is not in the streaming cache and whose gate weight is below w (never
+ * the heaviest of the step) is read from the Q2 file at half the bytes and
+ * computed from that copy, instead of being read and cached at full
+ * precision. The regular routed launch sees it with weight 0 and the
+ * heaviest expert's id; the Q2 partial is added afterwards. */
+static struct {
+    int enabled;
+    float weight_max;
+    ds4_model q2;
+    bool layer_ok[DS4_MAX_LAYER];
+    uint64_t gate_offset[DS4_MAX_LAYER];
+    uint64_t up_offset[DS4_MAX_LAYER];
+    uint64_t down_offset[DS4_MAX_LAYER];
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *out;
+    uint64_t steps;
+    uint64_t experts;
+    uint64_t q2_experts;
+    double weight_mass;
+    double q2_weight_mass;
+} g_glm_q2tier = { .enabled = -1 };
+
+static void glm_q2tier_report(void) {
+    if (g_glm_q2tier.steps == 0) return;
+    fprintf(stderr,
+            "ds4: GLM Q2 tier (weight < %.4f): %llu of %llu expert uses at Q2 (%.2f%%), "
+            "%.2f%% of the gate-weight mass\n",
+            g_glm_q2tier.weight_max,
+            (unsigned long long)g_glm_q2tier.q2_experts,
+            (unsigned long long)g_glm_q2tier.experts,
+            100.0 * (double)g_glm_q2tier.q2_experts / (double)g_glm_q2tier.experts,
+            g_glm_q2tier.weight_mass > 0.0 ?
+                100.0 * g_glm_q2tier.q2_weight_mass / g_glm_q2tier.weight_mass : 0.0);
+}
+
+static bool glm_q2tier_enabled(void) {
+    if (g_glm_q2tier.enabled >= 0) return g_glm_q2tier.enabled == 1;
+    g_glm_q2tier.enabled = 0;
+    const char *path = getenv("DS4_GLM_Q2_FILE");
+    const char *wmax = getenv("DS4_GLM_Q2_WEIGHT_MAX");
+    if (!path || !path[0] || !wmax || !wmax[0]) return false;
+    g_glm_q2tier.weight_max = strtof(wmax, NULL);
+    if (!(g_glm_q2tier.weight_max > 0.0f)) return false;
+    model_open(&g_glm_q2tier.q2, path, false, false);
+    uint32_t n_ok = 0;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER && il < DS4_MAX_LAYER; il++) {
+        const ds4_tensor *gate = tensor_by_namef(&g_glm_q2tier.q2, "blk.%u.ffn_gate_exps.weight", il);
+        const ds4_tensor *up = tensor_by_namef(&g_glm_q2tier.q2, "blk.%u.ffn_up_exps.weight", il);
+        const ds4_tensor *down = tensor_by_namef(&g_glm_q2tier.q2, "blk.%u.ffn_down_exps.weight", il);
+        if (!gate || !up || !down ||
+            gate->type != DS4_TENSOR_IQ2_XXS || up->type != DS4_TENSOR_IQ2_XXS ||
+            down->type != DS4_TENSOR_Q2_K) {
+            continue;
+        }
+        uint64_t in = 0, gout = 0, grow = 0, dout = 0, drow = 0;
+        (void)tensor_expert_bytes(&g_glm_q2tier.q2, gate, 0, &in, &gout, &grow);
+        (void)tensor_expert_bytes(&g_glm_q2tier.q2, down, 0, &in, &dout, &drow);
+        g_glm_q2tier.gate_expert_bytes = gout * grow;
+        g_glm_q2tier.gate_row_bytes = grow;
+        g_glm_q2tier.down_expert_bytes = dout * drow;
+        g_glm_q2tier.down_row_bytes = drow;
+        g_glm_q2tier.gate_offset[il] = gate->abs_offset;
+        g_glm_q2tier.up_offset[il] = up->abs_offset;
+        g_glm_q2tier.down_offset[il] = down->abs_offset;
+        g_glm_q2tier.layer_ok[il] = true;
+        n_ok++;
+    }
+    if (n_ok == 0 || !ds4_gpu_q2tier_open(path)) {
+        fprintf(stderr, "ds4: GLM Q2 tier disabled: no usable IQ2_XXS/Q2_K expert tensors in %s\n", path);
+        return false;
+    }
+    fprintf(stderr, "ds4: GLM Q2 tier on: %u layers from %s, gate weight < %.4f, %.2f MiB per Q2 expert\n",
+            n_ok, path, g_glm_q2tier.weight_max,
+            (double)(2u * g_glm_q2tier.gate_expert_bytes + g_glm_q2tier.down_expert_bytes) / 1048576.0);
+    atexit(glm_q2tier_report);
+    g_glm_q2tier.enabled = 1;
+    return true;
+}
+#endif
+
 typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
@@ -23496,6 +23583,13 @@ typedef struct metal_graph_selected_async_load {
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
+    /* Q2 tier decision for this step (ROCm). */
+    bool                      q2_eval;
+    uint32_t                  q2_n;
+    uint32_t                  q2_mask;
+    int32_t                   q2_ids[DS4_MAX_EXPERT_USED];
+    float                     q2_weights[DS4_MAX_EXPERT_USED];
+    float                     weights[DS4_MAX_EXPERT_USED];
 } metal_graph_selected_async_load;
 
 static pthread_mutex_t g_metal_graph_selected_async_load_mutex =
@@ -23563,6 +23657,44 @@ static void metal_graph_selected_async_load_run(
                                        job->il,
                                        job->gate_expert_bytes,
                                        job->down_expert_bytes);
+#ifdef DS4_ROCM_BUILD
+    job->q2_n = 0;
+    job->q2_mask = 0;
+    job->q2_eval = false;
+    if (g_glm_q2tier.enabled == 1 && job->il < DS4_MAX_LAYER &&
+        g_glm_q2tier.layer_ok[job->il] && g_glm_q2tier.router_weights &&
+        ds4_gpu_tensor_read_after_selected_event(
+                g_glm_q2tier.router_weights, 0, job->weights,
+                (uint64_t)DS4_N_EXPERT_USED * sizeof(job->weights[0]),
+                job->event_value, "q2 tier weights") != 0) {
+        job->q2_eval = true;
+        uint8_t resident[DS4_MAX_EXPERT_USED] = {0};
+        (void)ds4_gpu_stream_expert_cache_resident_mask(&table, job->selected_ids,
+                                                        DS4_N_EXPERT_USED, resident);
+        uint32_t top = 0;
+        for (uint32_t i = 1; i < DS4_N_EXPERT_USED; i++) {
+            if (job->weights[i] > job->weights[top]) top = i;
+        }
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            if (i == top || resident[i] || !(job->weights[i] < g_glm_q2tier.weight_max)) continue;
+            job->q2_ids[job->q2_n] = job->selected_ids[i];
+            job->q2_weights[job->q2_n] = job->weights[i];
+            job->q2_n++;
+            job->q2_mask |= 1u << i;
+            job->selected_ids[i] = job->selected_ids[top];
+            job->weights[i] = 0.0f;
+        }
+        const uint32_t il = job->il;
+        if (ds4_gpu_q2tier_request(job->q2_ids, job->q2_n,
+                                   g_glm_q2tier.gate_offset[il],
+                                   g_glm_q2tier.up_offset[il],
+                                   g_glm_q2tier.down_offset[il],
+                                   g_glm_q2tier.gate_expert_bytes,
+                                   g_glm_q2tier.down_expert_bytes) == 0) {
+            return;
+        }
+    }
+#endif
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
                 &table,
                 job->selected_ids,
@@ -49300,6 +49432,11 @@ static bool glm_graph_encode_sparse_ffn_one(
             glm_graph_use_streaming_selected_async_load(g);
         async_path_profiled = false;
         uint64_t selected_event = 0;
+#ifdef DS4_ROCM_BUILD
+        if (async_selected_load && glm_q2tier_enabled()) {
+            g_glm_q2tier.router_weights = g->router_weights;
+        }
+#endif
         if (async_selected_load) {
             if (ds4_gpu_signal_selected_readback_ready(&selected_event) != 0) {
                 async_load_started = metal_graph_selected_async_load_start_tensor(
@@ -49402,6 +49539,12 @@ static bool glm_graph_encode_sparse_ffn_one(
         }
         const bool finish_ok = metal_graph_selected_async_load_finish(&async_load);
         ok = ok && flush_ok && finish_ok;
+#ifdef DS4_ROCM_BUILD
+        if (ok && async_load.q2_n > 0) {
+            ok = ds4_gpu_q2tier_zero_weights(g->router_weights, async_load.q2_mask,
+                                             DS4_N_EXPERT_USED) != 0;
+        }
+#endif
         if (async_profile) {
             g_glm_streaming_async_profile.async_finish_ms +=
                 glm_graph_streaming_async_profile_ms() - stream_t0;
@@ -49438,6 +49581,38 @@ static bool glm_graph_encode_sparse_ffn_one(
             ffn_norm,
             g->ssd_streaming && !streaming_selected_cache) != 0;
     }
+#ifdef DS4_ROCM_BUILD
+    if (ok && async_load_started && async_load.ok && async_load.q2_eval) {
+        g_glm_q2tier.steps++;
+        g_glm_q2tier.experts += DS4_N_EXPERT_USED;
+        g_glm_q2tier.q2_experts += async_load.q2_n;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) g_glm_q2tier.weight_mass += async_load.weights[i];
+        for (uint32_t i = 0; i < async_load.q2_n; i++) {
+            g_glm_q2tier.weight_mass += async_load.q2_weights[i];
+            g_glm_q2tier.q2_weight_mass += async_load.q2_weights[i];
+        }
+    }
+    if (ok && async_load_started && async_load.ok && async_load.q2_n > 0) {
+        if (!g_glm_q2tier.out) {
+            g_glm_q2tier.out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        }
+        ok = g_glm_q2tier.out &&
+             ds4_gpu_q2tier_moe_one(g_glm_q2tier.out,
+                                    ffn_norm,
+                                    async_load.q2_weights,
+                                    async_load.q2_n,
+                                    g_glm_q2tier.gate_expert_bytes,
+                                    g_glm_q2tier.gate_row_bytes,
+                                    g_glm_q2tier.down_expert_bytes,
+                                    g_glm_q2tier.down_row_bytes,
+                                    DS4_N_EMBD,
+                                    DS4_N_FF_EXP,
+                                    DS4_N_EMBD,
+                                    g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f) != 0 &&
+             ds4_gpu_add_tensor(routed_dst, routed_dst, g_glm_q2tier.out, DS4_N_EMBD) != 0;
+        if (!ok) fprintf(stderr, "ds4: GLM Q2 tier compute failed at layer %u\n", il);
+    }
+#endif
     if (ok && g->imatrix &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = imatrix_collect_glm_one(g->imatrix, g, il);

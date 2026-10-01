@@ -1893,6 +1893,12 @@ typedef struct cuda_stream_read_job {
     int uploaded;
     int errnum;
     int direct;
+    /* alt: read from fd/direct_fd (a second model file) instead of the
+     * model's own descriptors. */
+    int alt;
+    int fd;
+    int direct_fd;
+    uint64_t file_size;
 } cuda_stream_read_job;
 
 struct cuda_stream_batch_selected_pending {
@@ -1930,7 +1936,7 @@ struct cuda_stream_selected_pending {
     uint32_t resident_mask;
     uint32_t missing_mask;
     int32_t selected_ids[DS4_ROCM_N_EXPERT_USED];
-    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 3u];
+    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 6u];
     uint32_t read_job_count;
 };
 
@@ -2089,7 +2095,10 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
     job->uploaded = 0;
     job->errnum = 0;
     job->direct = 0;
-    if (!stage || job->bytes == 0 || g_model_fd < 0) {
+    const int read_fd = job->alt ? job->fd : g_model_fd;
+    const int direct_fd = job->alt ? job->direct_fd : g_model_direct_fd;
+    const uint64_t file_size = job->alt ? job->file_size : g_model_file_size;
+    if (!stage || job->bytes == 0 || read_fd < 0) {
         job->errnum = EINVAL;
         return;
     }
@@ -2104,18 +2113,18 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
      * alone so concurrent workers are unaffected.
      */
     if (!cuda_stream_read_direct_disabled() &&
-        g_model_direct_fd >= 0 &&
+        direct_fd >= 0 &&
         g_model_direct_align > 1 &&
-        g_model_file_size != 0) {
+        file_size != 0) {
         const uint64_t aligned_off =
             cuda_round_down(job->offset, g_model_direct_align);
         const uint64_t delta = job->offset - aligned_off;
         const uint64_t read_size =
             cuda_round_up(delta + job->bytes, g_model_direct_align);
         if (read_size <= stage_bytes &&
-            aligned_off <= g_model_file_size &&
-            read_size <= g_model_file_size - aligned_off &&
-            cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            aligned_off <= file_size &&
+            read_size <= file_size - aligned_off &&
+            cuda_pread_full(direct_fd, stage, read_size, aligned_off)) {
             job->host_buf = (char *)stage + delta;
             job->direct = 1;
             job->ok = 1;
@@ -2123,7 +2132,7 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
         }
     }
 #endif
-    if (cuda_pread_full(g_model_fd, job->host_buf, job->bytes, job->offset)) {
+    if (cuda_pread_full(read_fd, job->host_buf, job->bytes, job->offset)) {
         job->ok = 1;
     } else {
         job->errnum = errno ? errno : EIO;
@@ -2153,7 +2162,7 @@ static int cuda_stream_read_job_upload(
         return 0;
     }
     job->uploaded = 1;
-    if (!job->direct) cuda_model_drop_file_pages(job->offset, job->bytes);
+    if (!job->direct && !job->alt) cuda_model_drop_file_pages(job->offset, job->bytes);
     return 1;
 }
 
@@ -2628,7 +2637,7 @@ static int cuda_stream_selected_upload_read_jobs(
             (void)cudaGetLastError();
             return 0;
         }
-        if (!jobs[i].direct) {
+        if (!jobs[i].direct && !jobs[i].alt) {
             cuda_model_drop_file_pages(jobs[i].offset, jobs[i].bytes);
         }
     }
@@ -4182,6 +4191,124 @@ static int cuda_stream_layer_expert_cache_seed_selected(
     return ok;
 }
 
+/* Q2 tier: a decode step may compute some selected experts from a second,
+ * lower-precision model file. The caller registers those experts with
+ * ds4_gpu_q2tier_request() before the selected load; the load then reads
+ * them into a planar scratch buffer (gate | up | down regions, one expert
+ * per slot) as part of the same read-job set, and ds4_gpu_q2tier_moe_one()
+ * computes them after the regular routed MoE. */
+static struct {
+    int fd;
+    int direct_fd;
+    uint64_t file_size;
+    char *buf;
+    uint64_t buf_bytes;
+    uint32_t req_n;
+    uint32_t loaded_n;
+    int32_t req_ids[DS4_ROCM_N_EXPERT_USED];
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+} g_q2tier = { -1, -1, 0, NULL, 0, 0, 0, {0}, 0, 0, 0, 0, 0 };
+
+extern "C" int ds4_gpu_q2tier_open(const char *path) {
+    if (!path || !path[0]) return 0;
+    if (g_q2tier.fd >= 0) return 1;
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "cannot open Q2 tier file %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        (void)close(fd);
+        return 0;
+    }
+    g_q2tier.fd = fd;
+    g_q2tier.file_size = (uint64_t)st.st_size;
+#if defined(__linux__) && defined(O_DIRECT)
+    g_q2tier.direct_fd = open(path, O_RDONLY | O_DIRECT);
+#endif
+    return 1;
+}
+
+extern "C" int ds4_gpu_q2tier_request(
+        const int32_t *ids,
+        uint32_t n,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    g_q2tier.req_n = 0;
+    g_q2tier.loaded_n = 0;
+    if (n == 0) return 1;
+    if (g_q2tier.fd < 0 || !ids || n > DS4_ROCM_N_EXPERT_USED ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 0;
+    }
+    const uint64_t need =
+        (uint64_t)DS4_ROCM_N_EXPERT_USED * (2u * gate_expert_bytes + down_expert_bytes);
+    if (g_q2tier.buf_bytes < need) {
+        if (g_q2tier.buf) (void)cudaFree(g_q2tier.buf);
+        g_q2tier.buf = NULL;
+        g_q2tier.buf_bytes = 0;
+        if (cudaMalloc((void **)&g_q2tier.buf, (size_t)need) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_q2tier.buf_bytes = need;
+    }
+    for (uint32_t i = 0; i < n; i++) g_q2tier.req_ids[i] = ids[i];
+    g_q2tier.req_n = n;
+    g_q2tier.gate_offset = gate_offset;
+    g_q2tier.up_offset = up_offset;
+    g_q2tier.down_offset = down_offset;
+    g_q2tier.gate_expert_bytes = gate_expert_bytes;
+    g_q2tier.down_expert_bytes = down_expert_bytes;
+    return 1;
+}
+
+/* Appends the read jobs of a pending Q2 request; returns the number added. */
+static uint32_t cuda_q2tier_append_jobs(cuda_stream_read_job *jobs,
+                                        uint32_t count,
+                                        uint32_t capacity) {
+    const uint32_t n = g_q2tier.req_n;
+    g_q2tier.req_n = 0;
+    if (n == 0 || count + 3u * n > capacity) return 0;
+    const uint64_t geb = g_q2tier.gate_expert_bytes;
+    const uint64_t deb = g_q2tier.down_expert_bytes;
+    char *gate_base = g_q2tier.buf;
+    char *up_base = gate_base + (uint64_t)DS4_ROCM_N_EXPERT_USED * geb;
+    char *down_base = up_base + (uint64_t)DS4_ROCM_N_EXPERT_USED * geb;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t e = (uint64_t)(uint32_t)g_q2tier.req_ids[i];
+        const uint64_t offs[3] = {
+            g_q2tier.gate_offset + e * geb,
+            g_q2tier.up_offset + e * geb,
+            g_q2tier.down_offset + e * deb,
+        };
+        char *dsts[3] = { gate_base + i * geb, up_base + i * geb, down_base + i * deb };
+        const uint64_t sizes[3] = { geb, geb, deb };
+        for (uint32_t t = 0; t < 3u; t++) {
+            cuda_stream_read_job job;
+            memset(&job, 0, sizeof(job));
+            job.dst = dsts[t];
+            job.offset = offs[t];
+            job.bytes = sizes[t];
+            job.alt = 1;
+            job.fd = g_q2tier.fd;
+            job.direct_fd = g_q2tier.direct_fd;
+            job.file_size = g_q2tier.file_size;
+            jobs[count++] = job;
+        }
+    }
+    g_q2tier.loaded_n = n;
+    return 3u * n;
+}
+
 static int cuda_stream_selected_load(
         const void *model_map,
         uint64_t model_size,
@@ -4244,7 +4371,7 @@ static int cuda_stream_selected_load(
         ls->selected_slots += n_selected;
     }
 
-    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 3u];
+    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 6u];
     memset(read_jobs, 0, sizeof(read_jobs));
     uint32_t read_job_count = 0;
     uint32_t resident_mask = 0;
@@ -4378,7 +4505,19 @@ static int cuda_stream_selected_load(
         }
     }
 
-    if (resident_mask != 0 && missing_mask == 0) {
+    uint32_t q2_jobs = 0;
+    if (g_q2tier.req_n != 0) {
+        if (!use_fd) {
+            g_q2tier.req_n = 0;
+            return 0;
+        }
+        q2_jobs = cuda_q2tier_append_jobs(read_jobs, read_job_count,
+                                          DS4_ROCM_N_EXPERT_USED * 6u);
+        if (q2_jobs == 0) return 0;
+        read_job_count += q2_jobs;
+    }
+
+    if (resident_mask != 0 && missing_mask == 0 && q2_jobs == 0) {
         g_stream_selected_pending.active = 1;
         g_stream_selected_pending.model_map = model_map;
         g_stream_selected_pending.layer = layer;
