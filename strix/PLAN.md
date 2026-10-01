@@ -32,6 +32,7 @@ after prefill (5,301 to 5,877 experts).
 | Expert-cache free headroom 16 -> 4 GiB (`DS4_ROCM_STREAM_FREE_RESERVE_GB`) | +17% (1,500-token run), real tasks +7-13% with S3-FIFO | `env.sh` |
 | S3-FIFO eviction (`DS4_ROCM_STREAM_CACHE_POLICY=s3fifo`) | +3-7% on top | this branch |
 | Memory guard 12 -> 8 (server plan at 64K: 69.1 -> 73.1 GiB) | +3% (misses -10%) | `env.sh` |
+| Q2 tier, opt-in (`DS4_GLM_Q2_FILE`, `DS4_GLM_Q2_WEIGHT_MAX=0.30`, `DS4_GLM_Q2_POOL_EXPERTS=1000`) | wall -13/-14% (1,500 scored tokens), ppl within 0.3% | `f5386ee`, `fbb45ef` |
 
 Measured and dropped: chunked reads, overlapping uploads with reads, counting
 only uncached spans against the span-cache limit, evicting past layers first
@@ -44,23 +45,35 @@ LRU misses fall from 19.4% at 4,790 experts to 13.3% at 5,869 and 5.5% at
 8,000. Everything that adds effective capacity or removes bytes per miss
 ranks first.
 
-### 1. Q2 copies for low-weight misses (expected -40% expert reads, large)
+### 1. Q2 tier: validate, measure end to end, then decide the default
 
-The Q2 file has the same tensors, shapes and expert order, at exactly half the
-bytes per expert (IQ2_XXS gate/up, Q2_K down). Replaying traces with gate
-weights: loading misses below the median gate weight as Q2 cuts reads by
-41-42% with ~9% of the gate-weight mass computed at Q2 (upgrade-on-reuse
-saves 42-49% but puts 14-15% of the mass at Q2). Output changes, so it needs
-the hard-smoke and Go-task evals before and after.
+Status (2026-10-01, paused by request): implemented and committed, opt-in.
+A selected expert that is not in the Q4 cache, has gate weight < 0.30 and is
+not the heaviest of its step is computed from the Q2 GGUF, kept in a
+1,000-slot LRU pool (6.6 GiB). With nothing below the threshold the output
+is byte-identical. Measured on 1,500 scored tokens against the Q4 reference
+(`DS4_PPL_DUMP` + `strix/pplcompare.py`): 19-22% of expert uses (12-13% of
+the gate-weight mass) at Q2, perplexity x0.998-1.001, top-1 agreement 94%
+(Go) / 89% (Markdown), wall time -13/-14%. The full Q2 model: x1.135, 81%.
+Task check, cut short: hard-smoke cases 1-6, 10, 11 all passed with the
+tier (as with plain Q4).
 
-Code survey: partial sums work (the router weight is applied in gate/up, the
-down kernels only sum), so a layer can run a Q4 subset and a Q2 subset and
-add them. The work is in the streaming plumbing: the single global pending
-load and override, a second slab size class with a byte-based budget and
-eviction, a per-map read fd (pread is tied to one fd today), reading gate
-weights back with the ids, and the Q2 file must never become the current
-model map. There is no in-place IQ2 decode kernel, so Q2 experts pay the
-compact copy.
+Remaining, in order (the scripts are in `~/.local/share/ds4/evals/`):
+1. Finish the task validation: `tier/eval-queue.sh` (hard-smoke case 12,
+   then the three Go tasks through ds4-server at 64K with the tier). Check
+   the server path's pool allocation against GTT (the plan leaves ~10 GiB).
+2. End-to-end speed on identical workloads: `overall/overall-queue.sh`
+   (drop its wait-for-eval gate). Configs: V = near-vanilla (`ebb4f50`,
+   upstream + Q4 prefill fix, ds4 defaults; worktree `~/repo/ds4-vanilla`),
+   E = same code + `env.sh`, T = this branch + `env.sh`, Q = T + tier.
+   Workloads: perplexity scoring of 1,500 Go tokens (identical tokens), and
+   the 8K review prompt + 1,000 greedy tokens (prefill and decode t/s).
+   Expected from piecewise numbers: ~1.9 -> ~3.0-3.1 tok/s decode.
+3. If both hold: enable the tier in `scripts/ds4/env.sh` (needs the fork
+   pushed and `DS4_REF` moved).
+4. Refinements: express the threshold as a quantile of the gate weights
+   (portable across models); S3-FIFO for the pool; a per-layer threshold;
+   upgrading a Q2 expert to Q4 when it keeps coming back.
 
 ### 2. Faster routing handoff (unknown gain, medium effort)
 
