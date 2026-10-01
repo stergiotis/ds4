@@ -31,6 +31,7 @@ after prefill (5,301 to 5,877 experts).
 | `HSA_ENABLE_MWAITX=1` | none (cores -2 W) | `env.sh` |
 | Expert-cache free headroom 16 -> 4 GiB (`DS4_ROCM_STREAM_FREE_RESERVE_GB`) | +17% (1,500-token run), real tasks +7-13% with S3-FIFO | `env.sh` |
 | S3-FIFO eviction (`DS4_ROCM_STREAM_CACHE_POLICY=s3fifo`) | +3-7% on top | this branch |
+| Memory guard 12 -> 8 (server plan at 64K: 69.1 -> 73.1 GiB) | +3% (misses -10%) | `env.sh` |
 
 Measured and dropped: chunked reads, overlapping uploads with reads, counting
 only uncached spans against the span-cache limit, evicting past layers first
@@ -43,15 +44,7 @@ LRU misses fall from 19.4% at 4,790 experts to 13.3% at 5,869 and 5.5% at
 8,000. Everything that adds effective capacity or removes bytes per miss
 ranks first.
 
-### 1. Server budget at 64K (small, measured half)
-
-`ds4-server` does not grow its cache after prefill; at 64K context it stops at
-the planned 5,244 experts. `DS4_GLM_MEMORY_GUARD_RESERVE_GB=8` raises the plan
-to ~5,548 at the same 103 GiB GTT peak in the CLI. Next: the three Go tasks
-through the server with guard 8, and a long-prefill (8K+) server request, as
-the safety check.
-
-### 2. Q2 copies for low-weight misses (expected -40% expert reads, large)
+### 1. Q2 copies for low-weight misses (expected -40% expert reads, large)
 
 The Q2 file has the same tensors, shapes and expert order, at exactly half the
 bytes per expert (IQ2_XXS gate/up, Q2_K down). Replaying traces with gate
@@ -69,7 +62,7 @@ weights back with the ids, and the Q2 file must never become the current
 model map. There is no in-place IQ2 decode kernel, so Q2 experts pay the
 compact copy.
 
-### 3. Faster routing handoff (unknown gain, medium effort)
+### 2. Faster routing handoff (unknown gain, medium effort)
 
 The 54% "attention + router + readback" phase includes a GPU-to-host sync per
 layer before reads can start. Measure GPU kernel time against sync latency
@@ -77,14 +70,14 @@ layer before reads can start. Measure GPU kernel time against sync latency
 dominates, a spin-wait on the event, or pinned-memory polling of the routing
 result, could shorten each of the 42 handoffs.
 
-### 4. Cross-layer expert prefetch (demoted: ~1.1x at best, high effort)
+### 3. Cross-layer expert prefetch (demoted: ~1.1x at best, high effort)
 
 Measured with the extended probe: top-12 prediction covers 64% of missing
 experts, below the 70% bar; top-8 covers 52% at 1.3 wasted reads per layer
 step. With the disk already at ~2.5 GB/s average, wasted reads compete with
-demand reads. Revisit only after items 1-2 cut the miss traffic.
+demand reads. Revisit only after item 1 cuts the miss traffic.
 
-### 5. Root cause of the Q4_K tiled prefill fault (prefill speed, medium effort)
+### 4. Root cause of the Q4_K tiled prefill fault (prefill speed, medium effort)
 
 The sorted/tiled Q4_K kernels fault (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`
 in `routed_moe down`). Ruled out: an expert-id mismatch and NULL activation
@@ -92,7 +85,7 @@ pointers. Prefill already runs at ~25-30 tok/s on the per-pair path, and
 expert streaming dominates it, so the expected gain is modest. Next step:
 bounds-check instrumentation inside the tiled kernel.
 
-### 6. Upstream reports (no local gain, reduces fork drift)
+### 5. Upstream reports (no local gain, reduces fork drift)
 
 - The Q4_K tiled fault on gfx1151, with the serialized-launch reproduction.
 - ds4's memory plan omits the layer-span cache (up to GTT/3), so budgets that
