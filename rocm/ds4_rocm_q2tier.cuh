@@ -1,7 +1,7 @@
 /* Q2 tier compute: the experts that ds4_gpu_q2tier_request() registered for
- * this decode step, read by the selected load into g_q2tier.buf, run through
- * the IQ2_XXS gate/up and Q2_K down decode kernels with their own gate
- * weights. The result is a separate routed partial that the caller adds. */
+ * this decode step, resident in their Q2 pool slots, run through the IQ2_XXS
+ * gate/up and Q2_K down decode kernels with their own gate weights. The
+ * result is a separate routed partial that the caller adds. */
 static struct {
     int32_t *sel;
     float *weights;
@@ -15,15 +15,16 @@ static struct {
 
 struct q2tier_args {
     float weights[DS4_ROCM_N_EXPERT_USED];
+    int32_t slots[DS4_ROCM_N_EXPERT_USED];
     uint32_t n;
 };
 
-/* Writes the compact ids 0..n-1 and the Q2 gate weights from kernel
- * arguments, so no host-to-device copy blocks the host. */
+/* Writes the pool slots and the Q2 gate weights from kernel arguments, so
+ * no host-to-device copy blocks the host. */
 __global__ static void q2tier_set_args_kernel(int32_t *sel, float *weights, q2tier_args a) {
     const uint32_t i = threadIdx.x;
     if (i < a.n) {
-        sel[i] = (int32_t)i;
+        sel[i] = a.slots[i];
         weights[i] = a.weights[i];
     }
 }
@@ -57,7 +58,7 @@ extern "C" int ds4_gpu_q2tier_moe_one(
         uint32_t out_dim,
         float clamp) {
     if (!out || !x || !weights || n == 0 || n > DS4_ROCM_N_EXPERT_USED ||
-        n != g_q2tier.loaded_n || !g_q2tier.buf ||
+        n != g_q2tier.loaded_n || n != g_q2tier.step_n || !g_q2tier.buf ||
         gate_expert_bytes != g_q2tier.gate_expert_bytes ||
         down_expert_bytes != g_q2tier.down_expert_bytes ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -96,13 +97,16 @@ extern "C" int ds4_gpu_q2tier_moe_one(
     }
     q2tier_args args;
     memset(&args, 0, sizeof(args));
-    for (uint32_t i = 0; i < n; i++) args.weights[i] = weights[i];
+    for (uint32_t i = 0; i < n; i++) {
+        args.weights[i] = weights[i];
+        args.slots[i] = (int32_t)g_q2tier.step_slots[i];
+    }
     args.n = n;
     q2tier_set_args_kernel<<<1, 32>>>(s.sel, s.weights, args);
     if (!cuda_ok(cudaGetLastError(), "q2 tier args")) return 0;
     const char *gate_base = g_q2tier.buf;
-    const char *up_base = gate_base + (uint64_t)DS4_ROCM_N_EXPERT_USED * gate_expert_bytes;
-    const char *down_base = up_base + (uint64_t)DS4_ROCM_N_EXPERT_USED * gate_expert_bytes;
+    const char *up_base = gate_base + (uint64_t)g_q2tier.n_slots * gate_expert_bytes;
+    const char *down_base = up_base + (uint64_t)g_q2tier.n_slots * gate_expert_bytes;
 
     q8_K_quantize_kernel<<<dim3(xq_blocks, 1, 1), 256>>>(s.xq, (const float *)x->ptr, expert_in_dim, 1);
     if (!cuda_ok(cudaGetLastError(), "q2 tier x quantize")) return 0;

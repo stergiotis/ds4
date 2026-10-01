@@ -429,8 +429,8 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
  * streaming expert cache, else 0. Returns 0 on bad arguments. */
 /* Q2 tier: open the second model file, register this decode step's Q2
  * experts before the selected load, and compute them afterwards. */
-int ds4_gpu_q2tier_open(const char *path);
-int ds4_gpu_q2tier_request(const int32_t *ids, uint32_t n,
+int ds4_gpu_q2tier_open(const char *path, uint32_t pool_slots);
+int ds4_gpu_q2tier_request(const int32_t *ids, uint32_t n, uint32_t layer,
                            uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
                            uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
 int ds4_gpu_q2tier_zero_weights(ds4_gpu_tensor *weights, uint32_t mask, uint32_t n);

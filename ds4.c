@@ -23487,7 +23487,8 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
  * DS4_GLM_Q2_WEIGHT_MAX=w > 0): during one-token decode, a selected expert
  * that is not in the streaming cache and whose gate weight is below w (never
  * the heaviest of the step) is read from the Q2 file at half the bytes and
- * computed from that copy, instead of being read and cached at full
+ * computed from that copy, kept in a pool of DS4_GLM_Q2_POOL_EXPERTS Q2
+ * experts (default 1000), instead of being read and cached at full
  * precision. The regular routed launch sees it with weight 0 and the
  * heaviest expert's id; the Q2 partial is added afterwards. */
 static struct {
@@ -23556,7 +23557,9 @@ static bool glm_q2tier_enabled(void) {
         g_glm_q2tier.layer_ok[il] = true;
         n_ok++;
     }
-    if (n_ok == 0 || !ds4_gpu_q2tier_open(path)) {
+    const char *pool = getenv("DS4_GLM_Q2_POOL_EXPERTS");
+    const uint32_t pool_slots = pool && pool[0] ? (uint32_t)strtoul(pool, NULL, 10) : 1000u;
+    if (n_ok == 0 || !ds4_gpu_q2tier_open(path, pool_slots)) {
         fprintf(stderr, "ds4: GLM Q2 tier disabled: no usable IQ2_XXS/Q2_K expert tensors in %s\n", path);
         return false;
     }
@@ -23685,7 +23688,7 @@ static void metal_graph_selected_async_load_run(
             job->weights[i] = 0.0f;
         }
         const uint32_t il = job->il;
-        if (ds4_gpu_q2tier_request(job->q2_ids, job->q2_n,
+        if (ds4_gpu_q2tier_request(job->q2_ids, job->q2_n, il,
                                    g_glm_q2tier.gate_offset[il],
                                    g_glm_q2tier.up_offset[il],
                                    g_glm_q2tier.down_offset[il],

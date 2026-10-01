@@ -4192,28 +4192,53 @@ static int cuda_stream_layer_expert_cache_seed_selected(
 }
 
 /* Q2 tier: a decode step may compute some selected experts from a second,
- * lower-precision model file. The caller registers those experts with
- * ds4_gpu_q2tier_request() before the selected load; the load then reads
- * them into a planar scratch buffer (gate | up | down regions, one expert
- * per slot) as part of the same read-job set, and ds4_gpu_q2tier_moe_one()
- * computes them after the regular routed MoE. */
+ * lower-precision model file. Those experts live in a pool of fixed slots
+ * (planar gate | up | down regions), keyed by layer and expert and evicted
+ * least recently used. The caller registers a step's Q2 experts with
+ * ds4_gpu_q2tier_request() before the selected load; pool misses are read
+ * into their slots as part of the same read-job set, and
+ * ds4_gpu_q2tier_moe_one() computes the step's experts from the pool after
+ * the regular routed MoE. Pool slots are rewritten only after the GPU has
+ * passed the next router, so a queued Q2 launch never sees them change. */
 static struct {
     int fd;
     int direct_fd;
     uint64_t file_size;
+    uint32_t want_slots;
+    uint32_t n_slots;
     char *buf;
-    uint64_t buf_bytes;
-    uint32_t req_n;
-    uint32_t loaded_n;
-    int32_t req_ids[DS4_ROCM_N_EXPERT_USED];
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    std::unordered_map<uint64_t, uint32_t> *index;
+    uint64_t *slot_key;
+    uint64_t *slot_used;
+    uint64_t clock;
+    uint32_t free_next;
+    /* the current step */
+    uint32_t step_n;
+    uint32_t step_slots[DS4_ROCM_N_EXPERT_USED];
+    uint32_t read_n;
+    uint32_t read_slots[DS4_ROCM_N_EXPERT_USED];
+    int32_t read_ids[DS4_ROCM_N_EXPERT_USED];
     uint64_t gate_offset;
     uint64_t up_offset;
     uint64_t down_offset;
-    uint64_t gate_expert_bytes;
-    uint64_t down_expert_bytes;
-} g_q2tier = { -1, -1, 0, NULL, 0, 0, 0, {0}, 0, 0, 0, 0, 0 };
+    uint32_t loaded_n;
+    uint64_t hits;
+    uint64_t misses;
+} g_q2tier = { -1, -1, 0, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0, {0}, 0, {0}, {0}, 0, 0, 0, 0, 0, 0 };
 
-extern "C" int ds4_gpu_q2tier_open(const char *path) {
+static void cuda_q2tier_report(void) {
+    if (g_q2tier.hits + g_q2tier.misses == 0) return;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "Q2 tier pool: %u slots (%.2f GiB), %llu hits, %llu misses (%.1f%% hit rate)\n",
+            g_q2tier.n_slots,
+            (double)g_q2tier.n_slots * (double)(2u * g_q2tier.gate_expert_bytes + g_q2tier.down_expert_bytes) /
+                1073741824.0,
+            (unsigned long long)g_q2tier.hits, (unsigned long long)g_q2tier.misses,
+            100.0 * (double)g_q2tier.hits / (double)(g_q2tier.hits + g_q2tier.misses));
+}
+
+extern "C" int ds4_gpu_q2tier_open(const char *path, uint32_t pool_slots) {
     if (!path || !path[0]) return 0;
     if (g_q2tier.fd >= 0) return 1;
     const int fd = open(path, O_RDONLY);
@@ -4231,66 +4256,151 @@ extern "C" int ds4_gpu_q2tier_open(const char *path) {
 #if defined(__linux__) && defined(O_DIRECT)
     g_q2tier.direct_fd = open(path, O_RDONLY | O_DIRECT);
 #endif
+    g_q2tier.want_slots = pool_slots < DS4_ROCM_N_EXPERT_USED ? DS4_ROCM_N_EXPERT_USED : pool_slots;
+    atexit(cuda_q2tier_report);
+    return 1;
+}
+
+/* Allocates the pool on first use, halving the size until it fits. */
+static int cuda_q2tier_ensure_pool(uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (g_q2tier.buf) {
+        return g_q2tier.gate_expert_bytes == gate_expert_bytes &&
+               g_q2tier.down_expert_bytes == down_expert_bytes;
+    }
+    const uint64_t slot_bytes = 2u * gate_expert_bytes + down_expert_bytes;
+    for (uint32_t n = g_q2tier.want_slots; n >= DS4_ROCM_N_EXPERT_USED; n /= 2u) {
+        if (cudaMalloc((void **)&g_q2tier.buf, (size_t)((uint64_t)n * slot_bytes)) == cudaSuccess) {
+            g_q2tier.n_slots = n;
+            break;
+        }
+        (void)cudaGetLastError();
+        g_q2tier.buf = NULL;
+        if (n == DS4_ROCM_N_EXPERT_USED) break;
+        if (n / 2u < DS4_ROCM_N_EXPERT_USED) n = DS4_ROCM_N_EXPERT_USED * 2u;
+    }
+    if (!g_q2tier.buf) return 0;
+    if (g_q2tier.n_slots < g_q2tier.want_slots) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "Q2 tier pool reduced to %u slots (asked %u)\n",
+                g_q2tier.n_slots, g_q2tier.want_slots);
+    }
+    g_q2tier.gate_expert_bytes = gate_expert_bytes;
+    g_q2tier.down_expert_bytes = down_expert_bytes;
+    g_q2tier.slot_key = (uint64_t *)calloc(g_q2tier.n_slots, sizeof(uint64_t));
+    g_q2tier.slot_used = (uint64_t *)calloc(g_q2tier.n_slots, sizeof(uint64_t));
+    g_q2tier.index = new (std::nothrow) std::unordered_map<uint64_t, uint32_t>();
+    if (!g_q2tier.slot_key || !g_q2tier.slot_used || !g_q2tier.index) return 0;
+    g_q2tier.index->reserve(g_q2tier.n_slots * 2u);
+    return 1;
+}
+
+/* Returns the slot for key, reusing a free or the least recently used slot
+ * that the current step does not hold; *miss tells whether it must be read. */
+static int cuda_q2tier_slot(uint64_t key, uint32_t *slot, int *miss) {
+    auto &idx = *g_q2tier.index;
+    const auto it = idx.find(key);
+    if (it != idx.end()) {
+        *slot = it->second;
+        *miss = 0;
+    } else {
+        uint32_t victim = UINT32_MAX;
+        if (g_q2tier.free_next < g_q2tier.n_slots) {
+            victim = g_q2tier.free_next++;
+        } else {
+            uint64_t oldest = UINT64_MAX;
+            for (uint32_t s = 0; s < g_q2tier.n_slots; s++) {
+                bool held = false;
+                for (uint32_t j = 0; j < g_q2tier.step_n; j++) held |= g_q2tier.step_slots[j] == s;
+                if (!held && g_q2tier.slot_used[s] < oldest) {
+                    oldest = g_q2tier.slot_used[s];
+                    victim = s;
+                }
+            }
+            if (victim == UINT32_MAX) return 0;
+            idx.erase(g_q2tier.slot_key[victim]);
+        }
+        try {
+            idx[key] = victim;
+        } catch (...) {
+            return 0;
+        }
+        g_q2tier.slot_key[victim] = key;
+        *slot = victim;
+        *miss = 1;
+    }
+    g_q2tier.slot_used[*slot] = ++g_q2tier.clock;
     return 1;
 }
 
 extern "C" int ds4_gpu_q2tier_request(
         const int32_t *ids,
         uint32_t n,
+        uint32_t layer,
         uint64_t gate_offset,
         uint64_t up_offset,
         uint64_t down_offset,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
-    g_q2tier.req_n = 0;
+    g_q2tier.step_n = 0;
+    g_q2tier.read_n = 0;
     g_q2tier.loaded_n = 0;
     if (n == 0) return 1;
     if (g_q2tier.fd < 0 || !ids || n > DS4_ROCM_N_EXPERT_USED ||
-        gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        !cuda_q2tier_ensure_pool(gate_expert_bytes, down_expert_bytes)) {
         return 0;
     }
-    const uint64_t need =
-        (uint64_t)DS4_ROCM_N_EXPERT_USED * (2u * gate_expert_bytes + down_expert_bytes);
-    if (g_q2tier.buf_bytes < need) {
-        if (g_q2tier.buf) (void)cudaFree(g_q2tier.buf);
-        g_q2tier.buf = NULL;
-        g_q2tier.buf_bytes = 0;
-        if (cudaMalloc((void **)&g_q2tier.buf, (size_t)need) != cudaSuccess) {
-            (void)cudaGetLastError();
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t key = ((uint64_t)layer << 32) | (uint32_t)ids[i];
+        uint32_t slot = 0;
+        int miss = 0;
+        if (!cuda_q2tier_slot(key, &slot, &miss)) {
+            g_q2tier.step_n = 0;
+            g_q2tier.read_n = 0;
             return 0;
         }
-        g_q2tier.buf_bytes = need;
+        g_q2tier.step_slots[g_q2tier.step_n++] = slot;
+        if (miss) {
+            g_q2tier.read_slots[g_q2tier.read_n] = slot;
+            g_q2tier.read_ids[g_q2tier.read_n] = ids[i];
+            g_q2tier.read_n++;
+            g_q2tier.misses++;
+        } else {
+            g_q2tier.hits++;
+        }
     }
-    for (uint32_t i = 0; i < n; i++) g_q2tier.req_ids[i] = ids[i];
-    g_q2tier.req_n = n;
     g_q2tier.gate_offset = gate_offset;
     g_q2tier.up_offset = up_offset;
     g_q2tier.down_offset = down_offset;
-    g_q2tier.gate_expert_bytes = gate_expert_bytes;
-    g_q2tier.down_expert_bytes = down_expert_bytes;
     return 1;
 }
 
-/* Appends the read jobs of a pending Q2 request; returns the number added. */
+/* Appends read jobs for the current step's pool misses and marks the step
+ * loaded; returns the number of jobs added (0 when nothing is pending). */
 static uint32_t cuda_q2tier_append_jobs(cuda_stream_read_job *jobs,
                                         uint32_t count,
-                                        uint32_t capacity) {
-    const uint32_t n = g_q2tier.req_n;
-    g_q2tier.req_n = 0;
-    if (n == 0 || count + 3u * n > capacity) return 0;
+                                        uint32_t capacity,
+                                        int *ok) {
+    *ok = 1;
+    if (g_q2tier.step_n == 0) return 0;
+    const uint32_t n = g_q2tier.read_n;
+    if (count + 3u * n > capacity) {
+        *ok = 0;
+        return 0;
+    }
     const uint64_t geb = g_q2tier.gate_expert_bytes;
     const uint64_t deb = g_q2tier.down_expert_bytes;
     char *gate_base = g_q2tier.buf;
-    char *up_base = gate_base + (uint64_t)DS4_ROCM_N_EXPERT_USED * geb;
-    char *down_base = up_base + (uint64_t)DS4_ROCM_N_EXPERT_USED * geb;
+    char *up_base = gate_base + (uint64_t)g_q2tier.n_slots * geb;
+    char *down_base = up_base + (uint64_t)g_q2tier.n_slots * geb;
     for (uint32_t i = 0; i < n; i++) {
-        const uint64_t e = (uint64_t)(uint32_t)g_q2tier.req_ids[i];
+        const uint64_t e = (uint64_t)(uint32_t)g_q2tier.read_ids[i];
+        const uint64_t s = g_q2tier.read_slots[i];
         const uint64_t offs[3] = {
             g_q2tier.gate_offset + e * geb,
             g_q2tier.up_offset + e * geb,
             g_q2tier.down_offset + e * deb,
         };
-        char *dsts[3] = { gate_base + i * geb, up_base + i * geb, down_base + i * deb };
+        char *dsts[3] = { gate_base + s * geb, up_base + s * geb, down_base + s * deb };
         const uint64_t sizes[3] = { geb, geb, deb };
         for (uint32_t t = 0; t < 3u; t++) {
             cuda_stream_read_job job;
@@ -4305,7 +4415,8 @@ static uint32_t cuda_q2tier_append_jobs(cuda_stream_read_job *jobs,
             jobs[count++] = job;
         }
     }
-    g_q2tier.loaded_n = n;
+    g_q2tier.loaded_n = g_q2tier.step_n;
+    g_q2tier.read_n = 0;
     return 3u * n;
 }
 
@@ -4506,14 +4617,15 @@ static int cuda_stream_selected_load(
     }
 
     uint32_t q2_jobs = 0;
-    if (g_q2tier.req_n != 0) {
+    if (g_q2tier.step_n != 0) {
+        int q2_ok = 0;
         if (!use_fd) {
-            g_q2tier.req_n = 0;
+            g_q2tier.step_n = 0;
             return 0;
         }
         q2_jobs = cuda_q2tier_append_jobs(read_jobs, read_job_count,
-                                          DS4_ROCM_N_EXPERT_USED * 6u);
-        if (q2_jobs == 0) return 0;
+                                          DS4_ROCM_N_EXPERT_USED * 6u, &q2_ok);
+        if (!q2_ok) return 0;
         read_job_count += q2_jobs;
     }
 
