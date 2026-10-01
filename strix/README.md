@@ -64,7 +64,7 @@ for GLM; for Qwen it would gain nothing.
 
 | Variable | Value | Why |
 |---|---|---|
-| `DS4_GLM_MEMORY_GUARD_RESERVE_GB` | 12 | The default reserve is 18 GiB only if GTT >= 108 GiB and 32 GiB otherwise. GTT = 107 GiB here, so the default shrinks the expert cache to 49.9 GiB. |
+| `DS4_GLM_MEMORY_GUARD_RESERVE_GB` | 8 | The default reserve is 18 GiB only if GTT >= 108 GiB and 32 GiB otherwise. GTT = 107 GiB here, so the default shrinks the expert cache to 49.9 GiB. 2026-10-01: 8 raises ds4-server's planned cache at 64K from 69.1 to 73.1 GiB (the server does not grow past its plan); 8K prompt + 1,500 tokens: misses -10%, decode 2.93 -> 3.01 tok/s, output identical, GTT peak 93 GiB. |
 | `DS4_SSD_AUTO_CACHE_PCT` | 90 | So that the 80% plan is not the binding limit. |
 | `DS4_ROCM_STREAM_MODEL_CACHE_GB` | 24 | The layer-span cache defaults to GTT/3 (36 GiB) but the memory plan counts only 7.6 GiB of it. Prefill and the ROCm per-layer decode path both use it: at 12 GiB decode drops to 0.27 tok/s. |
 | `DS4_ROCM_ENABLE_STREAMING_STATIC_DECODE_MAP` | 1 | Maps every layer's decode spans once (14.5 GiB) instead of remapping per layer. Decode +3-12% on top of the pointer tables, same GTT peak, logits bit-identical. |
@@ -111,8 +111,9 @@ differ) with headroom 4 and S3-FIFO, against the same tasks on 2026-09-30
 with headroom 16 and LRU: expr 2.30 -> 2.59, glob 2.42 -> 2.58, semver
 2.23 -> 2.38 tok/s. The server stops at its planned budget (5,244 experts at
 64K); `DS4_GLM_MEMORY_GUARD_RESERVE_GB=8` raises the plan to 73.1 GiB
-(~5,548 experts) at the same 103 GiB GTT peak (CLI, 64K), not yet measured
-in the server. ~60 W socket, Tctl 76 °C.
+(~5,548 experts) at the same 103 GiB GTT peak (CLI, 64K); through the server (8K-token review prompt, 1,500 greedy
+tokens, no KV reuse) guard 8 vs 12 gives misses -10%, decode 2.93 -> 3.01
+tok/s, identical output, GTT peak 93 GiB. ~60 W socket, Tctl 76 °C.
 
 The bench (teacher-forced, prefill to 8K) is 4-6% *slower* at 4K-8K with
 headroom 4 or 8 (e.g. 3.63 -> 3.42 tok/s at 4K), and its 6K/8K frontier
