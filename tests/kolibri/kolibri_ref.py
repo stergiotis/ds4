@@ -42,8 +42,9 @@ F8_MAX = 448.0
 class SafeTensors:
     """Minimal mmap reader for a sharded safetensors checkpoint."""
 
-    def __init__(self, model_dir: str):
+    def __init__(self, model_dir: str, weight_q8: bool = False):
         self.dir = model_dir
+        self.weight_q8 = weight_q8
         idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
         self.where = idx["weight_map"]
         self.shards = {}
@@ -75,7 +76,19 @@ class SafeTensors:
         s = self.get(prefix + ".weight_scale_inv").astype(np.float32)
         o, i = w.shape
         w = w.astype(np.float32).reshape(s.shape[0], 128, s.shape[1], 128)
-        return (w * s[:, None, :, None]).reshape(o, i)
+        w = (w * s[:, None, :, None]).reshape(o, i)
+        return q8_0_roundtrip(w) if self.weight_q8 else w
+
+
+def q8_0_roundtrip(w: np.ndarray) -> np.ndarray:
+    """ggml Q8_0 quantize + dequantize along rows: blocks of 32, d = amax/127
+    stored as f16, q = round(x / d) computed with the f32 d."""
+    o, i = w.shape
+    b = w.reshape(o, i // 32, 32)
+    d = np.abs(b).max(-1, keepdims=True) / 127.0
+    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1), 0)
+    q = np.round(b * inv).clip(-127, 127)
+    return (q * d.astype(np.float16).astype(np.float32)).reshape(o, i)
 
 
 def act_quant(x: np.ndarray) -> np.ndarray:
@@ -97,9 +110,9 @@ def silu(x):
 
 
 class Kolibri:
-    def __init__(self, model_dir: str, act_quant: bool = False):
+    def __init__(self, model_dir: str, act_quant: bool = False, weight_q8: bool = False):
         self.cfg = json.load(open(os.path.join(model_dir, "config.json")))
-        self.st = SafeTensors(model_dir)
+        self.st = SafeTensors(model_dir, weight_q8)
         c = self.cfg
         self.L = c["num_hidden_layers"]
         self.H = c["hidden_size"]
