@@ -99,9 +99,9 @@ FP8 blocks (`e4m3 * scale_inv`) and requantizes with `libds4quants`:
 
 1. **Q8_0** for every linear layer including the experts (about 83 GB), BF16
    embeddings, F32 norms, router and expert bias, LM head Q8_0 or BF16
-   (decided by the logit comparison). Q8_0 with 32-element blocks and an f16
-   scale per block re-represents e4m3 values almost exactly; this is the
-   fidelity baseline. #1070 decodes Q8_0 experts with `moe_mv<8>`; Q8_0
+   (decided by the logit comparison). Q8_0 (32-element blocks, f16 scale)
+   adds at most half a step, 0.4% of the block maximum, to each FP8 value;
+   this is the fidelity baseline. #1070 decodes Q8_0 experts with `moe_mv<8>`; Q8_0
    prefill uses the generic `matrix<8>` until a WMMA tile is added.
 2. **Q4_K experts** + Q8_0 dense (about 47 GB): fits next to other resident
    workloads and uses #1070's WMMA prefill tiles.
