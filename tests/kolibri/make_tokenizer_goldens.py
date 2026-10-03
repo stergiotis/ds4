@@ -32,6 +32,10 @@ RAW = [
     ("tool_tags", "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"),
     ("punct_prefix", "(Hello) [world] {foo} \"bar\" 'baz' -qux _x"),
     ("long_word", "Donaudampfschifffahrtsgesellschaftskapitänsmütze"),
+    # Combining marks (\p{M}): Kolibri's regex does not join them to letters.
+    ("marks", "Cafe\u0301 nai\u0308ve \u0301x Zu\u0308rich"),
+    ("devanagari", "नमस्ते दुनिया, यह एक परीक्षण है।"),
+    ("thai_hebrew", "สวัสดีครับ שָׁלוֹם"),
 ]
 
 WEATHER_TOOL = {
