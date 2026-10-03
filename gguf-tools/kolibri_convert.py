@@ -235,7 +235,7 @@ def model_records(cfg, args, n_tensors):
     ]
 
 
-def build_plan(src, cfg, experts_q):
+def build_plan(src, cfg, experts_q, dense_q="Q8_0"):
     L, E = cfg["num_hidden_layers"], cfg["num_experts"]
     H, ff = cfg["hidden_size"], cfg["moe_intermediate_size"]
     tensors = []
@@ -248,7 +248,7 @@ def build_plan(src, cfg, experts_q):
         shape = src.raw(key)[1]
         tensors.append(Tensor(name, "F32", shape[::-1], [lambda k=key: src.f32(k).reshape(-1, shape[-1])]))
 
-    def lin(name, key, q="Q8_0"):
+    def lin(name, key, q=dense_q):
         shape = src.raw(key + ".weight")[1]
         tensors.append(Tensor(name, q, shape[::-1], [lambda k=key: src.f32(k + ".weight")]))
 
@@ -289,7 +289,7 @@ def tensor_bytes(q, t):
 
 
 def write(args, src, cfg, q):
-    tensors = build_plan(src, cfg, args.experts.upper())
+    tensors = build_plan(src, cfg, args.experts.upper(), args.dense.upper())
     # Every source tensor must be consumed: catches a missed rename.
     unused = sorted(k for k in src.where if k not in src.used and
                     not (k.endswith("_scale_inv") and k[:-len("_scale_inv")] in src.used))
@@ -337,7 +337,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hf-dir", required=True, help="Kolibri-1 snapshot directory")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--experts", choices=("q8_0", "q4_k"), default="q8_0")
+    ap.add_argument("--experts", choices=("q8_0", "q4_k", "f32"), default="q8_0")
+    ap.add_argument("--dense", choices=("q8_0", "f32"), default="q8_0",
+                    help="attention and shared-expert projections (f32 is for tests)")
     ap.add_argument("--threads", type=int, default=min(16, os.cpu_count() or 4))
     ap.add_argument("--quants-lib", default=str(Path(__file__).with_name("libds4quants.so")))
     ap.add_argument("--revision", default="unknown")

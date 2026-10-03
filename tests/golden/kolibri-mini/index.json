@@ -1,0 +1,82 @@
+{
+ "en_capital": {
+  "prompt": "The capital of France is",
+  "n_prompt": 5,
+  "gen_ids": [
+   95873,
+   119973,
+   60482,
+   105422,
+   23812,
+   12294,
+   10201,
+   78665
+  ],
+  "gen_text": " Ravens blackberries Genesung trembled Sche friinftySPR",
+  "act_quant": false
+ },
+ "de_story": {
+  "prompt": "Es war einmal ein kleiner Kolibri, der",
+  "n_prompt": 10,
+  "gen_ids": [
+   93584,
+   93570,
+   2554,
+   65226,
+   120166,
+   21420,
+   87143,
+   11456
+  ],
+  "gen_text": "hampton speeding question Rückmeldung-\n\nANNEL UAV puzz",
+  "act_quant": false
+ },
+ "count": {
+  "prompt": "1, 2, 3, 4, 5,",
+  "n_prompt": 14,
+  "gen_ids": [
+   48034,
+   83271,
+   83271,
+   13965,
+   28116,
+   103665,
+   67825,
+   46332
+  ],
+  "gen_text": " lefto engraving engraving� substringbeyregendesBlank",
+  "act_quant": false
+ },
+ "chat_en_default": {
+  "prompt": "<|im_start|>system\n# Reasoning effort\n\nReasoning effort is set to high. Think carefully through the task in the user's language, validate key assumptions, consider plausible alternatives, and prioritize correctness and clarity.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+  "n_prompt": 57,
+  "gen_ids": [
+   54851,
+   110104,
+   92536,
+   100902,
+   31233,
+   113638,
+   81179,
+   100526
+  ],
+  "gen_text": "baijan Toolbar Antip Reiner Mechanical OpenStreetMap HülsenTurning",
+  "act_quant": false
+ },
+ "chat_de_nothink": {
+  "prompt": "<|im_start|>system\n# Reasoning effort\n\nReasoning is disabled. Proceed straight to answering according to the user's instructions.<|im_end|>\n<|im_start|>user\nErkläre kurz, was ein Kolibri ist.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "n_prompt": 48,
+  "gen_ids": [
+   60715,
+   22377,
+   31644,
+   29776,
+   104202,
+   82618,
+   108909,
+   66304
+  ],
+  "gen_text": " DHLomatic erzielte scholarly finalists zebraahndung Jong",
+  "act_quant": false
+ }
+}

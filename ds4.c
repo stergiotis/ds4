@@ -70320,6 +70320,250 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
     return 0;
 }
 
+/* =========================================================================
+ * Kolibri 1 CPU reference.
+ * =========================================================================
+ *
+ * A direct, single-threaded transcription of the reference model
+ * (aleph_alpha_inference/kolibri1.py) used to validate the GPU graph and the
+ * numpy goldens in tests/golden/kolibri.  Per layer:
+ *
+ *   h = attn(rms(x, attn_norm));       x += rms(h, post_attention_norm)
+ *   h = moe(rms(x, ffn_norm));         x += rms(h, post_ffw_norm)
+ *
+ * Attention: per-head RMSNorm on q and k, neox RoPE on sliding layers only
+ * (full layers are NoPE), GQA, the sliding window covers the current token
+ * and the DS4_N_SLIDING_WINDOW - 1 before it.  Routing selects the top-k of
+ * logits + exp_probs_b and weights each pick by sigmoid(logit), without
+ * renormalisation; the ungated shared expert is added on top. */
+
+typedef struct {
+    uint32_t cap;
+    float *k;           /* [layer][cap][Hkv*D], after norm (and RoPE) */
+    float *v;           /* [layer][cap][Hkv*D] */
+} kolibri_ref_state;
+
+static void kolibri_ref_rope(float *x, uint32_t pos) {
+    const uint32_t D = DS4_N_HEAD_DIM, half = D / 2u;
+    for (uint32_t i = 0; i < half; i++) {
+        const double theta = (double)pos * pow((double)DS4_ROPE_FREQ_BASE, -2.0 * i / D);
+        const float c = (float)cos(theta), sn = (float)sin(theta);
+        const float a = x[i], b = x[i + half];
+        x[i] = a * c - b * sn;
+        x[i + half] = b * c + a * sn;
+    }
+}
+
+static void kolibri_ref_attention(const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                                  kolibri_ref_state *st, const float *x, uint32_t pos, float *out) {
+    const uint32_t H = DS4_N_HEAD, Hkv = DS4_N_HEAD_KV, D = DS4_N_HEAD_DIM;
+    const uint32_t kv_dim = Hkv * D;
+    const bool sliding = ds4_kolibri_layer_is_sliding(il);
+    float *q = xmalloc((size_t)H * D * sizeof(float));
+    float *o = xmalloc((size_t)H * D * sizeof(float));
+    float *kc = st->k + ((uint64_t)il * st->cap + pos) * kv_dim;
+    float *vc = st->v + ((uint64_t)il * st->cap + pos) * kv_dim;
+    qwen4_ref_matvec(m, l->attn_q, x, q);
+    qwen4_ref_matvec(m, l->attn_k, x, kc);
+    qwen4_ref_matvec(m, l->attn_v, x, vc);
+    const float *gq = qwen4_ref_f32(m, l->attn_q_norm), *gk = qwen4_ref_f32(m, l->attn_k_norm);
+    for (uint32_t h = 0; h < H; h++) {
+        qwen4_ref_rms(q + h * D, q + h * D, gq, D, DS4_RMS_EPS);
+        if (sliding) kolibri_ref_rope(q + h * D, pos);
+    }
+    for (uint32_t h = 0; h < Hkv; h++) {
+        qwen4_ref_rms(kc + h * D, kc + h * D, gk, D, DS4_RMS_EPS);
+        if (sliding) kolibri_ref_rope(kc + h * D, pos);
+    }
+    const uint32_t first = sliding && pos + 1u > DS4_N_SLIDING_WINDOW ?
+                           pos + 1u - DS4_N_SLIDING_WINDOW : 0u;
+    const uint32_t n = pos + 1u - first;
+    float *p = xmalloc(n * sizeof(float));
+    const float scale = 1.0f / sqrtf((float)D);
+    for (uint32_t h = 0; h < H; h++) {
+        const uint32_t kvh = h / (H / Hkv);
+        float mx = -FLT_MAX;
+        for (uint32_t i = 0; i < n; i++) {
+            const float *kt = st->k + ((uint64_t)il * st->cap + first + i) * kv_dim + kvh * D;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < D; d++) dot += (double)q[h * D + d] * kt[d];
+            p[i] = (float)dot * scale;
+            if (p[i] > mx) mx = p[i];
+        }
+        double sum = 0.0;
+        for (uint32_t i = 0; i < n; i++) { p[i] = expf(p[i] - mx); sum += p[i]; }
+        for (uint32_t d = 0; d < D; d++) {
+            double acc = 0.0;
+            for (uint32_t i = 0; i < n; i++) {
+                acc += (double)p[i] * st->v[((uint64_t)il * st->cap + first + i) * kv_dim + kvh * D + d];
+            }
+            o[h * D + d] = (float)(acc / sum);
+        }
+    }
+    qwen4_ref_matvec(m, l->attn_output, o, out);
+    free(p); free(o); free(q);
+}
+
+/* Top-k by logit + bias; ties keep the lower expert id, like a stable sort. */
+static void kolibri_ref_route(const ds4_model *m, const ds4_layer_weights *l, const float *x,
+                              int *sel, float *wgt) {
+    const uint32_t NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED;
+    float *logits = xmalloc(NE * sizeof(float));
+    qwen4_ref_matvec(m, l->ffn_gate_inp, x, logits);
+    const float *bias = qwen4_ref_f32(m, l->ffn_exp_probs_b);
+    for (uint32_t i = 0; i < K; i++) {
+        int best = -1;
+        for (uint32_t e = 0; e < NE; e++) {
+            bool used = false;
+            for (uint32_t j = 0; j < i; j++) used |= sel[j] == (int)e;
+            if (!used && (best < 0 || logits[e] + bias[e] > logits[best] + bias[best])) best = (int)e;
+        }
+        sel[i] = best;
+        wgt[i] = sigmoid_stable(logits[best]) * DS4_EXPERT_WEIGHT_SCALE;
+    }
+    free(logits);
+}
+
+static void kolibri_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const float *x,
+                            float *out, int *sel_out) {
+    const uint32_t E = DS4_N_EMBD, K = DS4_N_EXPERT_USED, F = DS4_N_FF_EXP;
+    float *g = xmalloc(F * sizeof(float)), *u = xmalloc(F * sizeof(float));
+    float *y = xmalloc(E * sizeof(float));
+    int sel[DS4_MAX_EXPERT_USED];
+    float wgt[DS4_MAX_EXPERT_USED];
+    kolibri_ref_route(m, l, x, sel, wgt);
+    if (sel_out) memcpy(sel_out, sel, K * sizeof(int));
+    qwen4_ref_matvec(m, l->ffn_gate_shexp, x, g);
+    qwen4_ref_matvec(m, l->ffn_up_shexp, x, u);
+    for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
+    qwen4_ref_matvec(m, l->ffn_down_shexp, g, out);
+    for (uint32_t i = 0; i < K; i++) {
+        const uint64_t e = (uint64_t)sel[i];
+        qwen4_ref_matvec_rows(m, l->ffn_gate_exps, e * F, F, x, g);
+        qwen4_ref_matvec_rows(m, l->ffn_up_exps, e * F, F, x, u);
+        for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
+        qwen4_ref_matvec_rows(m, l->ffn_down_exps, e * E, E, g, y);
+        for (uint32_t d = 0; d < E; d++) out[d] += wgt[i] * y[d];
+    }
+    free(y); free(u); free(g);
+}
+
+/* Forward one token.  resid (optional) receives the residual stream after
+ * the embedding and after every layer, [L+1][E]; sel (optional) the routed
+ * experts, [L][K]. */
+static void kolibri_ref_forward_token(const ds4_model *m, const ds4_weights *w, kolibri_ref_state *st,
+                                      int token, uint32_t pos, float *logits, float *resid, int *sel) {
+    const uint32_t E = DS4_N_EMBD;
+    float *x = xmalloc(E * sizeof(float)), *n = xmalloc(E * sizeof(float));
+    float *h = xmalloc(E * sizeof(float));
+    qwen4_ref_row(m, w->token_embd, (uint64_t)token, x);
+    if (resid) memcpy(resid, x, E * sizeof(float));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        qwen4_ref_rms(n, x, qwen4_ref_f32(m, l->attn_norm), E, DS4_RMS_EPS);
+        kolibri_ref_attention(m, l, il, st, n, pos, h);
+        qwen4_ref_rms(h, h, qwen4_ref_f32(m, l->attn_post_norm), E, DS4_RMS_EPS);
+        for (uint32_t d = 0; d < E; d++) x[d] += h[d];
+        qwen4_ref_rms(n, x, qwen4_ref_f32(m, l->ffn_norm), E, DS4_RMS_EPS);
+        kolibri_ref_moe(m, l, n, h, sel ? sel + (uint64_t)il * DS4_N_EXPERT_USED : NULL);
+        qwen4_ref_rms(h, h, qwen4_ref_f32(m, l->ffn_post_norm), E, DS4_RMS_EPS);
+        for (uint32_t d = 0; d < E; d++) x[d] += h[d];
+        if (resid) memcpy(resid + (uint64_t)(il + 1u) * E, x, E * sizeof(float));
+    }
+    qwen4_ref_rms(n, x, qwen4_ref_f32(m, w->output_norm), E, DS4_RMS_EPS);
+    qwen4_ref_matvec(m, w->output, n, logits);
+    free(h); free(n); free(x);
+}
+
+static bool kolibri_write_f32(const char *path, const float *v, size_t n) {
+    FILE *f = fopen(path, "wb");
+    const bool ok = f && fwrite(v, sizeof(float), n, f) == n;
+    if (f) fclose(f);
+    if (!ok) fprintf(stderr, "ds4: cannot write %s\n", path);
+    return ok;
+}
+
+/* Diagnostic entry for tests/kolibri/compare_golden.py.
+ *   DS4_KOLIBRI_FT_TOKENS  comma-separated prompt ids (default: the CLI prompt)
+ *   DS4_KOLIBRI_FT_GEN     greedy tokens to generate after the prompt (default 0)
+ *   DS4_KOLIBRI_FT_OUT     f32 logits for every prompt position, [T][V]
+ *   DS4_KOLIBRI_FT_HIDDEN  f32 residual stream per prompt position, [T][L+1][E]
+ *   DS4_KOLIBRI_FT_EXPERTS i32 routed experts per prompt position, [T][L][K]
+ * Prints the prompt's last-position top logits and the greedy continuation. */
+static int kolibri_first_token_test(const ds4_model *m, const ds4_weights *w, const ds4_tokens *prompt) {
+    int ids[4096];
+    uint32_t T = 0;
+    const char *env = getenv("DS4_KOLIBRI_FT_TOKENS");
+    if (env && env[0]) {
+        T = qwen4_parse_token_list(env, ids, 4096);
+    } else {
+        for (int i = 0; i < prompt->len && T < 4096; i++) ids[T++] = prompt->v[i];
+    }
+    const char *gen_env = getenv("DS4_KOLIBRI_FT_GEN");
+    const uint32_t G = gen_env ? (uint32_t)strtoul(gen_env, NULL, 10) : 0u;
+    if (T == 0 || T + G > 4096) {
+        fprintf(stderr, "ds4: Kolibri first-token test needs 1..4096 tokens\n");
+        return 1;
+    }
+    const char *out_path = getenv("DS4_KOLIBRI_FT_OUT");
+    const char *hid_path = getenv("DS4_KOLIBRI_FT_HIDDEN");
+    const char *exp_path = getenv("DS4_KOLIBRI_FT_EXPERTS");
+    const uint32_t V = DS4_N_VOCAB, E = DS4_N_EMBD, L = DS4_N_LAYER, K = DS4_N_EXPERT_USED;
+    const uint32_t kv_dim = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    kolibri_ref_state st = { .cap = T + G };
+    st.k = xcalloc((size_t)L * st.cap * kv_dim, sizeof(float));
+    st.v = xcalloc((size_t)L * st.cap * kv_dim, sizeof(float));
+    float *logits = xmalloc((size_t)(out_path ? T : 1u) * V * sizeof(float));
+    float *resid = hid_path ? xmalloc((size_t)T * (L + 1u) * E * sizeof(float)) : NULL;
+    int *sel = exp_path ? xmalloc((size_t)T * L * K * sizeof(int)) : NULL;
+    for (uint32_t t = 0; t < T; t++) {
+        float *lg = logits + (out_path ? (uint64_t)t * V : 0u);
+        kolibri_ref_forward_token(m, w, &st, ids[t], t, lg,
+                                  resid ? resid + (uint64_t)t * (L + 1u) * E : NULL,
+                                  sel ? sel + (uint64_t)t * L * K : NULL);
+    }
+    const float *last = logits + (out_path ? (uint64_t)(T - 1u) * V : 0u);
+    int best[8];
+    for (int i = 0; i < 8; i++) best[i] = -1;
+    for (uint32_t i = 0; i < V; i++) {
+        for (int j = 0; j < 8; j++) {
+            if (best[j] < 0 || last[i] > last[best[j]]) {
+                for (int k = 7; k > j; k--) best[k] = best[k - 1];
+                best[j] = (int)i;
+                break;
+            }
+        }
+    }
+    printf("kolibri cpu reference: %u prompt tokens, top logits at the last position:\n", T);
+    for (int i = 0; i < 8; i++) printf("  %6d %.6f\n", best[i], last[best[i]]);
+    int ok = 1;
+    if (out_path) ok &= kolibri_write_f32(out_path, logits, (size_t)T * V);
+    if (hid_path) ok &= kolibri_write_f32(hid_path, resid, (size_t)T * (L + 1u) * E);
+    if (exp_path) {
+        FILE *f = fopen(exp_path, "wb");
+        ok &= f && fwrite(sel, sizeof(int), (size_t)T * L * K, f) == (size_t)T * L * K;
+        if (f) fclose(f);
+    }
+    if (G) {
+        float *lg = xmalloc((size_t)V * sizeof(float));
+        int tok = best[0];
+        printf("greedy:");
+        for (uint32_t i = 0; i < G; i++) {
+            printf(" %d", tok);
+            fflush(stdout);
+            if (i + 1u == G) break;
+            kolibri_ref_forward_token(m, w, &st, tok, T + i, lg, NULL, NULL);
+            int b = 0;
+            for (uint32_t v = 1; v < V; v++) if (lg[v] > lg[b]) b = (int)v;
+            tok = b;
+        }
+        printf("\n");
+        free(lg);
+    }
+    free(sel); free(resid); free(logits); free(st.v); free(st.k);
+    return ok ? 0 : 1;
+}
+
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     if (!engine_legacy_graph_test_supported(e)) return 1;
     if (!prompt || prompt->len <= 0) {
@@ -70333,6 +70577,9 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 
     if (ds4_model_is_qwen4()) {
         return qwen4_first_token_test(model, vocab, weights, prompt, ds4_backend_uses_graph(e->backend));
+    }
+    if (ds4_model_is_kolibri()) {
+        return kolibri_first_token_test(model, weights, prompt);
     }
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
