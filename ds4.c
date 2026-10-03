@@ -2424,6 +2424,8 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    /* ds4's own: FP8 e4m3 with one fp32 scale per 128 (see DS4_TENSOR_F8_B128) */
+    [200] = {"f8_b128", 128, 132},
 };
 
 enum {
@@ -2442,6 +2444,10 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    /* FP8 e4m3 weights kept exactly as released block-scaled checkpoints
+     * store them, made row-local: each block of 128 values is the fp32 scale
+     * followed by 128 e4m3 bytes.  No ggml equivalent. */
+    DS4_TENSOR_F8_B128  = 200,
 };
 
 typedef struct {
@@ -6062,6 +6068,16 @@ static void weights_validate_glm_dsa_layout(
 
 /* Dense projections Q8_0/BF16/F16/F32 (the qwen4 set), routed experts any
  * routed type; norms, router and selection bias are F32. */
+static void kolibri_expect_dense(const ds4_tensor *t, uint64_t d0, uint64_t d1) {
+    if (t && t->type == DS4_TENSOR_F8_B128) tensor_expect_layout(t, t->type, 2, d0, d1, 0);
+    else tensor_expect_qwen4_dense_layout(t, 2, d0, d1, 0);
+}
+
+static void kolibri_expect_experts(const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
+    if (t && t->type == DS4_TENSOR_F8_B128) tensor_expect_layout(t, t->type, 3, d0, d1, d2);
+    else tensor_expect_qwen4_expert_layout(t, d0, d1, d2);
+}
+
 static void weights_validate_kolibri_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -6082,25 +6098,25 @@ static void weights_validate_kolibri_layout(
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
-        tensor_expect_qwen4_dense_layout(l->attn_q, 2, E, q_dim, 0);
-        tensor_expect_qwen4_dense_layout(l->attn_k, 2, E, kv_dim, 0);
-        tensor_expect_qwen4_dense_layout(l->attn_v, 2, E, kv_dim, 0);
+        kolibri_expect_dense(l->attn_q, E, q_dim);
+        kolibri_expect_dense(l->attn_k, E, kv_dim);
+        kolibri_expect_dense(l->attn_v, E, kv_dim);
         tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, D, 0, 0);
         tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, D, 0, 0);
-        tensor_expect_qwen4_dense_layout(l->attn_output, 2, q_dim, E, 0);
+        kolibri_expect_dense(l->attn_output, q_dim, E);
         tensor_expect_layout(l->attn_post_norm, DS4_TENSOR_F32, 1, E, 0, 0);
         tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, E, DS4_N_EXPERT, 0);
         tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_qwen4_expert_layout(l->ffn_up_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, E, DS4_N_EXPERT);
+        kolibri_expect_experts(l->ffn_gate_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        kolibri_expect_experts(l->ffn_up_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        kolibri_expect_experts(l->ffn_down_exps, DS4_N_FF_EXP, E, DS4_N_EXPERT);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             ds4_die("Kolibri gate and up experts must share a type");
         }
-        tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, E, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_up_shexp, 2, E, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, E, 0);
+        kolibri_expect_dense(l->ffn_gate_shexp, E, DS4_N_FF_EXP);
+        kolibri_expect_dense(l->ffn_up_shexp, E, DS4_N_FF_EXP);
+        kolibri_expect_dense(l->ffn_down_shexp, DS4_N_FF_EXP, E);
         tensor_expect_layout(l->ffn_post_norm, DS4_TENSOR_F32, 1, E, 0, 0);
     }
 }
@@ -59969,6 +59985,7 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_F8_B128 ||
            type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS;
 }
 
@@ -69577,9 +69594,27 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
  * gammas except ssm_norm are folded to 1+w, ssm_a holds -exp(A_log).
  * --------------------------------------------------------------------- */
 
+/* e4m3fn (no infinities; 0x7f/0xff are NaN) */
+static float f8_e4m3_to_f32(uint8_t c) {
+    const uint32_t e = (c >> 3) & 15u, mant = c & 7u;
+    const float mag = e ? ldexpf(1.0f + (float)mant / 8.0f, (int)e - 7) : ldexpf((float)mant / 8.0f, -6);
+    if (e == 15u && mant == 7u) return NAN;
+    return c & 0x80u ? -mag : mag;
+}
+
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
+    case DS4_TENSOR_F8_B128: {
+        const uint64_t blocks = n / 128u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 132u;
+        for (uint64_t b = 0; b < blocks; b++, p += 132u) {
+            float d;
+            memcpy(&d, p, sizeof(d));
+            for (uint32_t j = 0; j < 128u; j++) out[b * 128u + j] = d * f8_e4m3_to_f32(p[4 + j]);
+        }
+        break;
+    }
     case DS4_TENSOR_F32:
         memcpy(out, (const float *)tensor_data(m, t) + row * n, n * sizeof(float));
         break;

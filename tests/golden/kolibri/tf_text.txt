@@ -1,0 +1,11 @@
+Kolibris sind die kleinsten Vögel der Welt. Sie leben ausschließlich in Amerika, von Alaska bis Feuerland, und die meisten Arten kommen in den Tropen vor. Ihr Herz schlägt bis zu 1200 Mal pro Minute, und im Schwebeflug bewegen sie ihre Flügel etwa 50 Mal in der Sekunde. Weil sie so viel Energie verbrauchen, müssen sie täglich ein Vielfaches ihres Körpergewichts an Nektar aufnehmen.
+
+Hummingbirds are also remarkable for their memory. They remember which flowers they have visited and how long each one takes to refill with nectar. Some species migrate thousands of kilometres every year; the ruby-throated hummingbird crosses the Gulf of Mexico in a single non-stop flight of about twenty hours.
+
+def fib(n):
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+print([fib(i) for i in range(10)])

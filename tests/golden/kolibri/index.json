@@ -1,0 +1,122 @@
+{
+ "en_capital": {
+  "prompt": "The capital of France is",
+  "n_prompt": 5,
+  "gen_ids": [
+   9224,
+   46,
+   543,
+   9255,
+   279,
+   6905,
+   735,
+   5513,
+   46,
+   543,
+   9255,
+   279,
+   10347,
+   735,
+   18677,
+   46
+  ],
+  "gen_text": " Paris. The capital of Germany is Berlin. The capital of Italy is Rome.",
+  "act_quant": false
+ },
+ "de_story": {
+  "prompt": "Es war einmal ein kleiner Kolibri, der",
+  "n_prompt": 10,
+  "gen_ids": [
+   622,
+   1097,
+   13963,
+   536,
+   313,
+   44,
+   948,
+   622,
+   1097,
+   13963,
+   536,
+   313,
+   44,
+   948,
+   622,
+   1097
+  ],
+  "gen_text": " in einem Kolibri, der in einem Kolibri, der in einem",
+  "act_quant": false
+ },
+ "count": {
+  "prompt": "1, 2, 3, 4, 5,",
+  "n_prompt": 14,
+  "gen_ids": [
+   32,
+   54,
+   44,
+   32,
+   55,
+   44,
+   32,
+   56,
+   44,
+   32,
+   57,
+   44,
+   32,
+   49,
+   48,
+   44
+  ],
+  "gen_text": " 6, 7, 8, 9, 10,",
+  "act_quant": false
+ },
+ "chat_en_default": {
+  "prompt": "<|im_start|>system\n# Reasoning effort\n\nReasoning effort is set to high. Think carefully through the task in the user's language, validate key assumptions, consider plausible alternatives, and prioritize correctness and clarity.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+  "n_prompt": 57,
+  "gen_ids": [
+   127907,
+   10,
+   49,
+   46,
+   32,
+   5274,
+   28381,
+   262,
+   3143,
+   589,
+   2554,
+   1115,
+   543,
+   3143,
+   735,
+   12589
+  ],
+  "gen_text": "<think>\n1.  **Identify the user's question:** The user is asking",
+  "act_quant": false
+ },
+ "chat_de_nothink": {
+  "prompt": "<|im_start|>system\n# Reasoning effort\n\nReasoning is disabled. Proceed straight to answering according to the user's instructions.<|im_end|>\n<|im_start|>user\nErkläre kurz, was ein Kolibri ist.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "n_prompt": 48,
+  "gen_ids": [
+   1113,
+   13963,
+   536,
+   313,
+   2459,
+   922,
+   21832,
+   44,
+   5675,
+   1238,
+   52763,
+   3774,
+   23420,
+   1953,
+   948,
+   5818
+  ],
+  "gen_text": "Ein Kolibri ist ein kleiner, farbenprächtiger Vogel aus der Familie",
+  "act_quant": false
+ }
+}

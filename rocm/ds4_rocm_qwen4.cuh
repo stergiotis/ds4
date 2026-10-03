@@ -244,6 +244,7 @@ static uint64_t row_bytes(uint32_t type, uint64_t n) {
     case 10: return n % 256 ? 0 : n / 256 * 84;
     case 12: return n % 256 ? 0 : n / 256 * 144;
     case 16: return n % 256 ? 0 : n / 256 * 66;
+    case 200: return n % 128 ? 0 : n / 128 * 132;
     default: return 0;
     }
 }
@@ -302,10 +303,22 @@ __device__ __forceinline__ float softplus(float x) {
 
 /* These readers preserve the GGUF values, including padded Q2_K down rows.
  * Templates remove unused formats from each matrix kernel. */
+/* e4m3 -> f16 bit pattern: the 7 magnitude bits land in f16's exponent and
+ * mantissa fields with an exponent bias 8 short, so the f16 value times 2^8
+ * is exact, subnormals included.  Callers fold the 2^8 into the scale.
+ * (0x7f/0xff, e4m3fn's NaN, never occur in released weights.) */
+__device__ __forceinline__ float f8_e4m3_x256(uint8_t c) {
+    return __half2float(__ushort_as_half((unsigned short)(((c & 0x80u) << 8) | ((c & 0x7fu) << 7))));
+}
+
 template<unsigned TYPE>
 __device__ __forceinline__ float value(const char *row, unsigned i,
         const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
     if (TYPE == 0) return ((const float *)row)[i];
+    if (TYPE == 200) {
+        const char *b = row + (i / 128) * 132;
+        return *(const float *)b * 256.0f * f8_e4m3_x256((uint8_t)b[4 + i % 128]);
+    }
     if (TYPE == 1) return __half2float(((const __half *)row)[i]);
     if (TYPE == 30) return (float)((const hip_bfloat16 *)row)[i];
     if (TYPE == 8) {
@@ -366,6 +379,7 @@ __device__ __forceinline__ float scalar(const char *row, unsigned i, unsigned ty
     case 8: return value<8>(row, i);
     case 30: return value<30>(row, i);
     case 39: return value<39>(row, i);
+    case 200: return value<200>(row, i);
     default: return 0;
     }
 }
@@ -642,7 +656,7 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
     else moe_mv<TYPE, false><<<grid,128,0,0>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); break
     switch (type) {
     QWEN_MOE(0); QWEN_MOE(1); QWEN_MOE(2); QWEN_MOE(8); QWEN_MOE(10);
-    QWEN_MOE(12); QWEN_MOE(16); QWEN_MOE(30); QWEN_MOE(39);
+    QWEN_MOE(12); QWEN_MOE(16); QWEN_MOE(30); QWEN_MOE(39); QWEN_MOE(200);
     default: return 0;
     }
 #undef QWEN_MOE
@@ -1008,7 +1022,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     else matrix<TYPE,false,true><<<grid,256,0,0>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); break
     switch (type) {
     QWEN_MM(0); QWEN_MM(1); QWEN_MM(2); QWEN_MM(8); QWEN_MM(10);
-    QWEN_MM(12); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
+    QWEN_MM(12); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39); QWEN_MM(200);
     default: return 0;
     }
 #undef QWEN_MM
@@ -1275,7 +1289,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     else matvec<TYPE><<<grid,128,0,0>>>(out,w,x,K,M,stride); break
     switch (type) {
     QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(8); QWEN_MV(10);
-    QWEN_MV(12); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
+    QWEN_MV(12); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39); QWEN_MV(200);
     default: return 0;
     }
 #undef QWEN_MV
@@ -1592,7 +1606,7 @@ static int dense_blas(float *out, const float *x, const char *w,
 #define QWEN_UNPACK(TYPE) case TYPE: unpack<TYPE><<<((uint64_t)n*K+255)/256,256,0,0>>>(scratch,w+(uint64_t)r*rb,K,n,rb); break
             switch (type) {
             QWEN_UNPACK(1); QWEN_UNPACK(2); QWEN_UNPACK(8); QWEN_UNPACK(10);
-            QWEN_UNPACK(12); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39);
+            QWEN_UNPACK(12); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39); QWEN_UNPACK(200);
             default: return 0;
             }
 #undef QWEN_UNPACK

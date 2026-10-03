@@ -35,7 +35,10 @@ from glm53_quantize import (GGUF_ALIGNMENT, GGUF_ARRAY, GGUF_STRING, GGUF_VERSIO
                             pack_string)
 
 ARCH = "kolibri1"
-QTYPES = {"F32": 0, "Q8_0": 8, "Q4_K": 12, "BF16": 30}
+# F8_B128 is ds4's own type (no ggml equivalent): the release's FP8 weights
+# kept bit-exact, row-local.  Each 128-element block is the fp32 scale of
+# its 128x128 source block followed by the 128 e4m3 bytes (132 bytes).
+QTYPES = {"F32": 0, "Q8_0": 8, "Q4_K": 12, "BF16": 30, "F8_B128": 200}
 SRC_DTYPES = {"F8_E4M3": 1, "BF16": 2, "F32": 4}
 
 
@@ -76,6 +79,19 @@ class Source:
                 header = json.loads(f.read(n))
             self.shards[name] = (header, np.memmap(path, np.uint8, "r"), 8 + n)
         return self.shards[name]
+
+    def f8_b128(self, key):
+        """F8_B128 bytes of an FP8 block-scaled [out, in] weight, rows in order."""
+        dtype, shape, data = self.raw(key)
+        if dtype != "F8_E4M3":
+            fail(f"{key}: F8_B128 needs an F8_E4M3 source, got {dtype}")
+        _, sshape, sdata = self.raw(key + "_scale_inv")
+        o, i = shape
+        s = sdata.view("<f4").reshape(sshape)
+        out = np.empty((o, i // 128, 132), np.uint8)
+        out[:, :, :4] = np.repeat(s, 128, axis=0).reshape(o, i // 128, 1).view(np.uint8)
+        out[:, :, 4:] = data.reshape(o, i // 128, 128)
+        return out.tobytes()
 
     def raw(self, key):
         if key not in self.where:
@@ -128,6 +144,8 @@ class Quantizer:
         self.lib = lib
 
     def row_size(self, qtype, n):
+        if qtype == "F8_B128":
+            return n // 128 * 132
         if qtype == "F32":
             return 4 * n
         if qtype == "BF16":
@@ -250,7 +268,10 @@ def build_plan(src, cfg, experts_q, dense_q="Q8_0"):
 
     def lin(name, key, q=dense_q):
         shape = src.raw(key + ".weight")[1]
-        tensors.append(Tensor(name, q, shape[::-1], [lambda k=key: src.f32(k + ".weight")]))
+        src.raw(key + ".weight_scale_inv")
+        part = (lambda k=key: src.f8_b128(k + ".weight")) if q == "F8_B128" else \
+               (lambda k=key: src.f32(k + ".weight"))
+        tensors.append(Tensor(name, q, shape[::-1], [part]))
 
     bf16("token_embd.weight", "model.embed_tokens.weight")
     for l in range(L):
@@ -272,7 +293,10 @@ def build_plan(src, cfg, experts_q, dense_q="Q8_0"):
             for k in keys:
                 src.raw(k)
                 src.raw(k + "_scale_inv")
-            parts = [lambda k=k: src.f32(k) for k in keys]
+            if experts_q == "F8_B128":
+                parts = [lambda k=k: src.f8_b128(k) for k in keys]
+            else:
+                parts = [lambda k=k: src.f32(k) for k in keys]
             tensors.append(Tensor(f"{b}.ffn_{short}_exps.weight", experts_q, (*ne, E), parts))
             lin(f"{b}.ffn_{short}_shexp.weight", f"{m}.mlp.shared_experts.{proj}")
         f32(b + ".post_ffw_norm.weight", m + ".post_ffn_norm.weight")
@@ -337,8 +361,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hf-dir", required=True, help="Kolibri-1 snapshot directory")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--experts", choices=("q8_0", "q4_k", "f32"), default="q8_0")
-    ap.add_argument("--dense", choices=("q8_0", "f32"), default="q8_0",
+    ap.add_argument("--experts", choices=("q8_0", "q4_k", "f8_b128", "f32"), default="q8_0")
+    ap.add_argument("--dense", choices=("q8_0", "f8_b128", "f32"), default="q8_0",
                     help="attention and shared-expert projections (f32 is for tests)")
     ap.add_argument("--threads", type=int, default=min(16, os.cpu_count() or 4))
     ap.add_argument("--quants-lib", default=str(Path(__file__).with_name("libds4quants.so")))
