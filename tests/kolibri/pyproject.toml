@@ -1,0 +1,5 @@
+[project]
+name = "kolibri-harness"
+version = "0"
+requires-python = ">=3.11"
+dependencies = ["numpy", "safetensors", "tokenizers", "jinja2", "ml_dtypes"]
