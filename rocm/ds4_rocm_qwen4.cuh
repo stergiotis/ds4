@@ -548,7 +548,11 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
     const uint64_t pair = (uint64_t)t * stride + slot;
     const float *xt = x + (DOWN ? pair : t) * K;
     float a = 0, b = 0;
-    if (shared) {
+    if (shared && shared_type == TYPE) {
+        /* a shared expert in the routed type reads like a routed one */
+        a = dot<TYPE>(sh0 + row * srb, xt, K, grid_table, sign_table);
+        if (!DOWN) b = dot<TYPE>(sh1 + row * srb, xt, K, grid_table, sign_table);
+    } else if (shared) {
         for (unsigned i = threadIdx.x & 31; i < K; i += 32) {
             a += scalar(sh0 + row * srb, i, shared_type) * xt[i];
             if (!DOWN) b += scalar(sh1 + row * srb, i, shared_type) * xt[i];
@@ -558,7 +562,7 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
             const uint64_t off = ((uint64_t)e * M + row) * rb;
-            if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39 || TYPE == 200) && !((uintptr_t)xt&15)) {
+            if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39) && !((uintptr_t)xt&15)) {
                 for (unsigned i = (threadIdx.x&31)*4; i < K; i += 128) {
                     const float4 xv = *(const float4 *)(xt+i);
                     const float4 av = value4<TYPE>(w0+off,i,grid_table,sign_table);
@@ -1035,9 +1039,34 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     return launched();
 }
 
+/* One wave's partial dot of an F8_B128 row with x (n % 512 == 0, x 16-byte
+ * aligned): per step a lane reads 16 weights (one uint4) of the 512-value
+ * block and its group's scale, so a wave step covers exactly one block. */
+__device__ __forceinline__ float dot_f8(const char *row, const float *x, unsigned n) {
+    const unsigned lane = threadIdx.x & 31, off = lane * 16, group = lane / 8;
+    float acc = 0;
+    for (unsigned base = 0; base < n; base += 512) {
+        const char *b = row + (base / 512) * 528;
+        const float scale = ((const float *)b)[group] * 256.0f;
+        const uint4 q = *(const uint4 *)(b + 16 + off);
+        const float4 *xv = (const float4 *)(x + base + off);
+        const unsigned w[4] = {q.x, q.y, q.z, q.w};
+        float part = 0;
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const float4 v = xv[k];
+            part += f8_e4m3_x256(w[k] & 255) * v.x + f8_e4m3_x256((w[k] >> 8) & 255) * v.y +
+                    f8_e4m3_x256((w[k] >> 16) & 255) * v.z + f8_e4m3_x256(w[k] >> 24) * v.w;
+        }
+        acc += part * scale;
+    }
+    return acc;
+}
+
 template<unsigned TYPE>
 __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n,
         const uint64_t *grid, const uint8_t *signs) {
+    if (TYPE == 200 && !((uintptr_t)x & 15) && !(n % 512)) return sum(dot_f8(row, x, n));
     float acc = 0;
     if ((TYPE == 1 && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) ||
         (TYPE == 200 && !((uintptr_t)x&15))) {

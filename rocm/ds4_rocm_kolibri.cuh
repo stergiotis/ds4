@@ -107,6 +107,64 @@ __global__ void attention(float *out, float *partial, const float *q, const __ha
     }
 }
 
+/* Decode-sized batches: one wave per (KV head, key split, row) applies every
+ * K/V row it loads to all G query heads of that KV head, so the cache is read
+ * once per KV head instead of once per query head.  Writes split partials
+ * in attention_merge's layout. */
+template<unsigned D, unsigned G>
+__launch_bounds__(32)
+__global__ void attention_gqa(float *out, float *partial, const float *q, const __half *kc,
+        const __half *vc, unsigned H, unsigned Hkv, unsigned pos0, unsigned cache_rows,
+        unsigned window, unsigned splits, unsigned per, float scale) {
+    constexpr unsigned J = D / 32;
+    const unsigned kh = blockIdx.x, split = blockIdx.y, t = blockIdx.z, lane = threadIdx.x;
+    const unsigned pos = pos0 + t, lo = window && pos + 1 > window ? pos + 1 - window : 0;
+    const unsigned begin = lo + split * per, end = min(pos + 1, begin + per);
+    float qv[G][J], acc[G][J], m[G], denom[G];
+    #pragma unroll
+    for (unsigned g = 0; g < G; g++) {
+        const float *qr = q + ((uint64_t)t * H + kh * G + g) * D;
+        #pragma unroll
+        for (unsigned j = 0; j < J; j++) { qv[g][j] = qr[lane + 32 * j] * scale; acc[g][j] = 0; }
+        m[g] = -3e38f; denom[g] = 0;
+    }
+    for (unsigned p = begin; p < end; p++) {
+        const uint64_t row = ((uint64_t)(p % cache_rows) * Hkv + kh) * D;
+        float kv[J], vv[J];
+        #pragma unroll
+        for (unsigned j = 0; j < J; j++) {
+            kv[j] = __half2float(kc[row + lane + 32 * j]);
+            vv[j] = __half2float(vc[row + lane + 32 * j]);
+        }
+        #pragma unroll
+        for (unsigned g = 0; g < G; g++) {
+            float sc = 0;
+            #pragma unroll
+            for (unsigned j = 0; j < J; j++) sc += qv[g][j] * kv[j];
+            sc = sum(sc);
+            const float nm = fmaxf(m[g], sc), corr = expf(m[g] - nm), w = expf(sc - nm);
+            denom[g] = denom[g] * corr + w;
+            #pragma unroll
+            for (unsigned j = 0; j < J; j++) acc[g][j] = acc[g][j] * corr + w * vv[j];
+            m[g] = nm;
+        }
+    }
+    #pragma unroll
+    for (unsigned g = 0; g < G; g++) {
+        const uint64_t hq = (uint64_t)t * H + kh * G + g;
+        if (splits == 1) {
+            #pragma unroll
+            for (unsigned j = 0; j < J; j++)
+                out[hq * D + lane + 32 * j] = denom[g] > 0 ? acc[g][j] / denom[g] : 0;
+        } else {
+            float *dst = partial + (hq * splits + split) * (D + 2);
+            if (!lane) { dst[0] = m[g]; dst[1] = denom[g]; }
+            #pragma unroll
+            for (unsigned j = 0; j < J; j++) dst[2 + lane + 32 * j] = acc[g][j];
+        }
+    }
+}
+
 __global__ void attention_merge(float *out, const float *partial, unsigned H, unsigned D, unsigned splits) {
     const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     if (d >= D) return;
@@ -341,6 +399,32 @@ extern "C" int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_g
             (const float *)q->ptr, (const __half *)kc->ptr, (const __half *)vc->ptr,
             T, H, Hkv, pos0, cache_rows, window, 1.4426950408889634f / sqrtf((float)D));
         return launched();
+    }
+    /* Decode-sized batches read each KV head's cache once for all its query
+     * heads; splits of 128 keys give the GPU enough waves. */
+    const unsigned G = H / Hkv;
+    if (T < 16 && (G == 12 || G == 4)) {
+        const unsigned last = pos0 + T;
+        const unsigned span = window && last > window ? window : last;
+        const unsigned splits = std::min(64u, std::max(1u, (span + 127) / 128));
+        const unsigned per = (span + splits - 1) / splits;
+        float *partial = NULL;
+        if (splits > 1) {
+            partial = (float *)cuda_tmp_alloc((uint64_t)T * H * splits * (D + 2) * 4, "Kolibri attention partials");
+            if (!partial) return 0;
+        }
+        const dim3 grid(Hkv, splits, T);
+        const float scale = 1.0f / sqrtf((float)D);
+        if (G == 12) attention_gqa<128, 12><<<grid, 32, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
+            (const __half *)kc->ptr, (const __half *)vc->ptr, H, Hkv, pos0, cache_rows, window, splits, per, scale);
+        else attention_gqa<128, 4><<<grid, 32, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
+            (const __half *)kc->ptr, (const __half *)vc->ptr, H, Hkv, pos0, cache_rows, window, splits, per, scale);
+        if (!launched()) return 0;
+        if (splits > 1) {
+            attention_merge<<<dim3(H, T), D, 0, 0>>>((float *)out->ptr, partial, H, D, splits);
+            if (!launched()) return 0;
+        }
+        return 1;
     }
     /* The longest key range of the batch decides the split: short batches
      * over long contexts split keys so the GPU has enough waves. */
