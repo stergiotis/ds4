@@ -548,10 +548,15 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
     const uint64_t pair = (uint64_t)t * stride + slot;
     const float *xt = x + (DOWN ? pair : t) * K;
     float a = 0, b = 0;
-    if (shared && shared_type == TYPE) {
-        /* a shared expert in the routed type reads like a routed one */
-        a = dot<TYPE>(sh0 + row * srb, xt, K, grid_table, sign_table);
-        if (!DOWN) b = dot<TYPE>(sh1 + row * srb, xt, K, grid_table, sign_table);
+    if (shared && (shared_type == TYPE || shared_type == 200)) {
+        /* a shared expert in the routed type, or F8, reads with a typed dot */
+        if (shared_type == TYPE) {
+            a = dot<TYPE>(sh0 + row * srb, xt, K, grid_table, sign_table);
+            if (!DOWN) b = dot<TYPE>(sh1 + row * srb, xt, K, grid_table, sign_table);
+        } else {
+            a = dot<200>(sh0 + row * srb, xt, K);
+            if (!DOWN) b = dot<200>(sh1 + row * srb, xt, K);
+        }
     } else if (shared) {
         for (unsigned i = threadIdx.x & 31; i < K; i += 32) {
             a += scalar(sh0 + row * srb, i, shared_type) * xt[i];
