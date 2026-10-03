@@ -134,6 +134,10 @@ struct cuda_stream_resident_expert {
     char *down;
     uint64_t bytes;
     uint64_t last_used;
+    uint64_t queued;
+    uint64_t touch_step;
+    uint8_t freq;
+    uint8_t main_queue;
     int pooled;
 };
 
@@ -332,6 +336,18 @@ static cuda_stream_cache_layer_stats
 static int g_stream_cache_stats_enabled = -1;
 static int g_stream_cache_layer_stats_enabled = -1;
 static int g_stream_evict_past_layers_first_enabled = -1;
+/* S3-FIFO state (DS4_ROCM_STREAM_CACHE_POLICY=s3fifo): experts enter a small
+ * FIFO and move to the main FIFO once reused; the main FIFO reinserts reused
+ * experts instead of evicting them; a ghost map remembers keys evicted from
+ * the small FIFO so that their return goes straight to the main FIFO. */
+static int g_stream_cache_policy = -1;
+static uint64_t g_stream_resident_step;
+static uint32_t g_stream_s3_small_count;
+static uint64_t g_stream_s3_ghost_gen;
+static std::unordered_map<cuda_stream_resident_key,
+                          uint64_t,
+                          cuda_stream_resident_key_hash> g_stream_s3_ghost;
+static std::deque<std::pair<cuda_stream_resident_key, uint64_t>> g_stream_s3_ghost_fifo;
 static int32_t g_routed_moe_selected_override[DS4_ROCM_N_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
 static cudaEvent_t g_stream_selected_reuse_event;
@@ -437,6 +453,31 @@ static int cuda_stream_evict_past_layers_first(void) {
             (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return g_stream_evict_past_layers_first_enabled;
+}
+
+static int cuda_stream_env_percent(const char *name, int fallback, int lo, int hi) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    const long v = strtol(env, &end, 10);
+    return end != env && *end == '\0' && v >= lo && v <= hi ? (int)v : fallback;
+}
+
+static int cuda_stream_cache_policy_s3fifo(void) {
+    if (g_stream_cache_policy < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_CACHE_POLICY");
+        g_stream_cache_policy = env && strcmp(env, "s3fifo") == 0 ? 1 : 0;
+    }
+    return g_stream_cache_policy == 1;
+}
+
+/* Counts one use per routing step, however many times the step touches it. */
+static void cuda_stream_resident_touch(cuda_stream_resident_expert &e) {
+    e.last_used = ++g_stream_resident_clock;
+    if (e.touch_step != g_stream_resident_step) {
+        e.touch_step = g_stream_resident_step;
+        if (e.freq < 3u) e.freq++;
+    }
 }
 
 static void cuda_stream_cache_stats_note_resident(void) {
@@ -702,6 +743,9 @@ static void cuda_stream_resident_cache_release(void) {
     g_stream_resident_index.clear();
     g_stream_resident_bytes = 0;
     g_stream_resident_clock = 0;
+    g_stream_s3_small_count = 0;
+    g_stream_s3_ghost.clear();
+    g_stream_s3_ghost_fifo.clear();
     for (cuda_stream_expert_slab &slab : g_stream_expert_slabs) {
         if (slab.base) (void)cudaFree(slab.base);
     }
@@ -1555,6 +1599,7 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     } else {
         g_stream_resident_bytes = 0;
     }
+    if (!e.main_queue && g_stream_s3_small_count) g_stream_s3_small_count--;
     g_stream_resident_index.erase(evicted_key);
     const size_t last = g_stream_resident_experts.size() - 1u;
     if (idx != last) {
@@ -1566,10 +1611,85 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     return 1;
 }
 
+static int cuda_stream_s3fifo_evict_one(
+        uint32_t layer,
+        const int32_t *selected_ids,
+        uint32_t n_selected) {
+    static int small_pct = -1, promote = -1;
+    if (small_pct < 0) {
+        small_pct = cuda_stream_env_percent("DS4_ROCM_STREAM_S3FIFO_SMALL_PCT", 10, 1, 90);
+        promote = cuda_stream_env_percent("DS4_ROCM_STREAM_S3FIFO_PROMOTE", 1, 1, 3);
+    }
+    uint32_t small_target = (uint32_t)((uint64_t)g_stream_expert_cache_budget * (uint64_t)small_pct / 100u);
+    if (small_target == 0) small_target = 1;
+    const size_t n = g_stream_resident_experts.size();
+    for (size_t round = 0; round < 4u * n + 8u; round++) {
+        bool from_small = g_stream_s3_small_count >= small_target ||
+                          g_stream_s3_small_count == n;
+        size_t victim = (size_t)-1;
+        for (int pass = 0; pass < 2 && victim == (size_t)-1; pass++) {
+            uint64_t oldest = UINT64_MAX;
+            for (size_t i = 0; i < n; i++) {
+                const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
+                if ((bool)e.main_queue == from_small ||
+                    cuda_stream_selected_is_current(e, layer, selected_ids, n_selected)) {
+                    continue;
+                }
+                if (e.queued < oldest) {
+                    oldest = e.queued;
+                    victim = i;
+                }
+            }
+            if (victim == (size_t)-1) from_small = !from_small;
+        }
+        if (victim == (size_t)-1) return 0;
+        cuda_stream_resident_expert &e = g_stream_resident_experts[victim];
+        if (from_small) {
+            if (e.freq >= (uint8_t)promote) {
+                e.main_queue = 1;
+                e.freq = 0;
+                e.queued = ++g_stream_resident_clock;
+                g_stream_s3_small_count--;
+                continue;
+            }
+            const cuda_stream_resident_key key = cuda_stream_resident_entry_key(e);
+            const uint64_t gen = ++g_stream_s3_ghost_gen;
+            try {
+                g_stream_s3_ghost[key] = gen;
+                g_stream_s3_ghost_fifo.push_back({key, gen});
+                const size_t ghost_cap = g_stream_expert_cache_budget > small_target ?
+                    g_stream_expert_cache_budget - small_target : 1u;
+                while (g_stream_s3_ghost_fifo.size() > ghost_cap) {
+                    const auto &old = g_stream_s3_ghost_fifo.front();
+                    const auto it = g_stream_s3_ghost.find(old.first);
+                    if (it != g_stream_s3_ghost.end() && it->second == old.second) {
+                        g_stream_s3_ghost.erase(it);
+                    }
+                    g_stream_s3_ghost_fifo.pop_front();
+                }
+            } catch (...) {
+                /* The ghost is advisory; a failed insertion only loses history. */
+            }
+            return cuda_stream_resident_evict_at(victim);
+        }
+        if (e.freq > 0) {
+            e.freq--;
+            e.queued = ++g_stream_resident_clock;
+            continue;
+        }
+        return cuda_stream_resident_evict_at(victim);
+    }
+    return 0;
+}
+
 static int cuda_stream_resident_evict_one(
         uint32_t layer,
         const int32_t *selected_ids,
         uint32_t n_selected) {
+    if (cuda_stream_cache_policy_s3fifo() &&
+        cuda_stream_s3fifo_evict_one(layer, selected_ids, n_selected)) {
+        return 1;
+    }
     size_t victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
     if (cuda_stream_evict_past_layers_first()) {
@@ -1825,6 +1945,18 @@ static int cuda_stream_resident_alloc(
     e.down = e.base + 2u * gate_expert_bytes;
     e.bytes = bytes;
     e.last_used = ++g_stream_resident_clock;
+    e.queued = e.last_used;
+    e.touch_step = g_stream_resident_step;
+    e.main_queue = 1;
+    if (cuda_stream_cache_policy_s3fifo()) {
+        const auto ghost = g_stream_s3_ghost.find(cuda_stream_resident_entry_key(e));
+        if (ghost != g_stream_s3_ghost.end()) {
+            g_stream_s3_ghost.erase(ghost);
+        } else {
+            e.main_queue = 0;
+            g_stream_s3_small_count++;
+        }
+    }
     e.pooled = pooled;
     g_stream_resident_experts.push_back(e);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
@@ -1851,6 +1983,12 @@ typedef struct cuda_stream_read_job {
     int count_reads;
     uint64_t read_bytes;
     uint64_t direct_bytes;
+    /* alt: read from fd/direct_fd (a second model file) instead of the
+     * model's own descriptors. */
+    int alt;
+    int fd;
+    int direct_fd;
+    uint64_t file_size;
 } cuda_stream_read_job;
 
 struct cuda_stream_batch_selected_pending {
@@ -1888,7 +2026,7 @@ struct cuda_stream_selected_pending {
     uint32_t resident_mask;
     uint32_t missing_mask;
     int32_t selected_ids[DS4_ROCM_N_EXPERT_USED];
-    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 3u];
+    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 6u];
     uint32_t read_job_count;
 };
 
@@ -2074,7 +2212,10 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
     job->direct = 0;
     job->read_bytes = 0;
     job->direct_bytes = 0;
-    if (!stage || job->bytes == 0 || g_model_fd < 0) {
+    const int read_fd = job->alt ? job->fd : g_model_fd;
+    const int direct_fd = job->alt ? job->direct_fd : g_model_direct_fd;
+    const uint64_t file_size = job->alt ? job->file_size : g_model_file_size;
+    if (!stage || job->bytes == 0 || read_fd < 0) {
         job->errnum = EINVAL;
         return;
     }
@@ -2089,18 +2230,18 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
      * alone so concurrent workers are unaffected.
      */
     if (!cuda_stream_read_direct_disabled() &&
-        g_model_direct_fd >= 0 &&
+        direct_fd >= 0 &&
         g_model_direct_align > 1 &&
-        g_model_file_size != 0) {
+        file_size != 0) {
         const uint64_t aligned_off =
             cuda_round_down(job->offset, g_model_direct_align);
         const uint64_t delta = job->offset - aligned_off;
         const uint64_t read_size =
             cuda_round_up(delta + job->bytes, g_model_direct_align);
         if (read_size <= stage_bytes &&
-            aligned_off <= g_model_file_size &&
-            read_size <= g_model_file_size - aligned_off &&
-            cuda_stream_read_counted(job, g_model_direct_fd, stage, read_size, aligned_off, true)) {
+            aligned_off <= file_size &&
+            read_size <= file_size - aligned_off &&
+            cuda_stream_read_counted(job, direct_fd, stage, read_size, aligned_off, true)) {
             job->host_buf = (char *)stage + delta;
             job->direct = 1;
             job->ok = 1;
@@ -2108,7 +2249,7 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
         }
     }
 #endif
-    if (cuda_stream_read_counted(job, g_model_fd, job->host_buf, job->bytes, job->offset, false)) {
+    if (cuda_stream_read_counted(job, read_fd, job->host_buf, job->bytes, job->offset, false)) {
         job->ok = 1;
     } else {
         job->errnum = errno ? errno : EIO;
@@ -2138,7 +2279,7 @@ static int cuda_stream_read_job_upload(
         return 0;
     }
     job->uploaded = 1;
-    if (!job->direct) cuda_model_drop_file_pages(job->offset, job->bytes);
+    if (!job->direct && !job->alt) cuda_model_drop_file_pages(job->offset, job->bytes);
     return 1;
 }
 
@@ -2613,7 +2754,7 @@ static int cuda_stream_selected_upload_read_jobs(
             (void)cudaGetLastError();
             return 0;
         }
-        if (!jobs[i].direct) {
+        if (!jobs[i].direct && !jobs[i].alt) {
             cuda_model_drop_file_pages(jobs[i].offset, jobs[i].bytes);
         }
     }
@@ -3395,8 +3536,7 @@ static int cuda_stream_resident_seed_experts(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             loaded++;
             continue;
         }
@@ -3565,7 +3705,7 @@ static int cuda_stream_selected_compact_mask(
         }
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
-        entry.last_used = ++g_stream_resident_clock;
+        cuda_stream_resident_touch(entry);
         err = cudaMemcpyAsync(g_stream_selected_cache.gate +
                                   (uint64_t)i * gate_expert_bytes,
                               entry.gate,
@@ -3642,7 +3782,7 @@ static int cuda_stream_selected_prepare_ptrs(
         }
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
-        entry.last_used = ++g_stream_resident_clock;
+        cuda_stream_resident_touch(entry);
         gate_ptrs[i] = entry.gate;
         up_ptrs[i] = entry.up;
         down_ptrs[i] = entry.down;
@@ -3715,6 +3855,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         const char ***down_ptrs,
         uint32_t *unique_out,
         int begin_pending) {
+    g_stream_resident_step++;
     if (!g_ssd_streaming_mode ||
         !model_map ||
         !ids ||
@@ -3937,7 +4078,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         if (idx >= 0) {
             cuda_stream_resident_expert &entry =
                 g_stream_resident_experts[(size_t)idx];
-            entry.last_used = ++g_stream_resident_clock;
+            cuda_stream_resident_touch(entry);
             gate_host[u] = entry.gate;
             up_host[u] = entry.up;
             down_host[u] = entry.down;
@@ -4551,8 +4692,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             continue;
         }
 
@@ -4628,6 +4768,235 @@ static int cuda_stream_layer_expert_cache_seed_selected(
     return ok;
 }
 
+/* Q2 tier: a decode step may compute some selected experts from a second,
+ * lower-precision model file. Those experts live in a pool of fixed slots
+ * (planar gate | up | down regions), keyed by layer and expert and evicted
+ * least recently used. The caller registers a step's Q2 experts with
+ * ds4_gpu_q2tier_request() before the selected load; pool misses are read
+ * into their slots as part of the same read-job set, and
+ * ds4_gpu_q2tier_moe_one() computes the step's experts from the pool after
+ * the regular routed MoE. Pool slots are rewritten only after the GPU has
+ * passed the next router, so a queued Q2 launch never sees them change. */
+static struct {
+    int fd;
+    int direct_fd;
+    uint64_t file_size;
+    uint32_t want_slots;
+    uint32_t n_slots;
+    char *buf;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    std::unordered_map<uint64_t, uint32_t> *index;
+    uint64_t *slot_key;
+    uint64_t *slot_used;
+    uint64_t clock;
+    uint32_t free_next;
+    /* the current step */
+    uint32_t step_n;
+    uint32_t step_slots[DS4_ROCM_N_EXPERT_USED];
+    uint32_t read_n;
+    uint32_t read_slots[DS4_ROCM_N_EXPERT_USED];
+    int32_t read_ids[DS4_ROCM_N_EXPERT_USED];
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint32_t loaded_n;
+    uint64_t hits;
+    uint64_t misses;
+} g_q2tier = { -1, -1, 0, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0, {0}, 0, {0}, {0}, 0, 0, 0, 0, 0, 0 };
+
+static void cuda_q2tier_report(void) {
+    if (g_q2tier.hits + g_q2tier.misses == 0) return;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "Q2 tier pool: %u slots (%.2f GiB), %llu hits, %llu misses (%.1f%% hit rate)\n",
+            g_q2tier.n_slots,
+            (double)g_q2tier.n_slots * (double)(2u * g_q2tier.gate_expert_bytes + g_q2tier.down_expert_bytes) /
+                1073741824.0,
+            (unsigned long long)g_q2tier.hits, (unsigned long long)g_q2tier.misses,
+            100.0 * (double)g_q2tier.hits / (double)(g_q2tier.hits + g_q2tier.misses));
+}
+
+extern "C" int ds4_gpu_q2tier_open(const char *path, uint32_t pool_slots) {
+    if (!path || !path[0]) return 0;
+    if (g_q2tier.fd >= 0) return 1;
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "cannot open Q2 tier file %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        (void)close(fd);
+        return 0;
+    }
+    g_q2tier.fd = fd;
+    g_q2tier.file_size = (uint64_t)st.st_size;
+#if defined(__linux__) && defined(O_DIRECT)
+    g_q2tier.direct_fd = open(path, O_RDONLY | O_DIRECT);
+#endif
+    g_q2tier.want_slots = pool_slots < DS4_ROCM_N_EXPERT_USED ? DS4_ROCM_N_EXPERT_USED : pool_slots;
+    atexit(cuda_q2tier_report);
+    return 1;
+}
+
+/* Allocates the pool on first use, halving the size until it fits. */
+static int cuda_q2tier_ensure_pool(uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (g_q2tier.buf) {
+        return g_q2tier.gate_expert_bytes == gate_expert_bytes &&
+               g_q2tier.down_expert_bytes == down_expert_bytes;
+    }
+    const uint64_t slot_bytes = 2u * gate_expert_bytes + down_expert_bytes;
+    for (uint32_t n = g_q2tier.want_slots; n >= DS4_ROCM_N_EXPERT_USED; n /= 2u) {
+        if (cudaMalloc((void **)&g_q2tier.buf, (size_t)((uint64_t)n * slot_bytes)) == cudaSuccess) {
+            g_q2tier.n_slots = n;
+            break;
+        }
+        (void)cudaGetLastError();
+        g_q2tier.buf = NULL;
+        if (n == DS4_ROCM_N_EXPERT_USED) break;
+        if (n / 2u < DS4_ROCM_N_EXPERT_USED) n = DS4_ROCM_N_EXPERT_USED * 2u;
+    }
+    if (!g_q2tier.buf) return 0;
+    if (g_q2tier.n_slots < g_q2tier.want_slots) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "Q2 tier pool reduced to %u slots (asked %u)\n",
+                g_q2tier.n_slots, g_q2tier.want_slots);
+    }
+    g_q2tier.gate_expert_bytes = gate_expert_bytes;
+    g_q2tier.down_expert_bytes = down_expert_bytes;
+    g_q2tier.slot_key = (uint64_t *)calloc(g_q2tier.n_slots, sizeof(uint64_t));
+    g_q2tier.slot_used = (uint64_t *)calloc(g_q2tier.n_slots, sizeof(uint64_t));
+    g_q2tier.index = new (std::nothrow) std::unordered_map<uint64_t, uint32_t>();
+    if (!g_q2tier.slot_key || !g_q2tier.slot_used || !g_q2tier.index) return 0;
+    g_q2tier.index->reserve(g_q2tier.n_slots * 2u);
+    return 1;
+}
+
+/* Returns the slot for key, reusing a free or the least recently used slot
+ * that the current step does not hold; *miss tells whether it must be read. */
+static int cuda_q2tier_slot(uint64_t key, uint32_t *slot, int *miss) {
+    auto &idx = *g_q2tier.index;
+    const auto it = idx.find(key);
+    if (it != idx.end()) {
+        *slot = it->second;
+        *miss = 0;
+    } else {
+        uint32_t victim = UINT32_MAX;
+        if (g_q2tier.free_next < g_q2tier.n_slots) {
+            victim = g_q2tier.free_next++;
+        } else {
+            uint64_t oldest = UINT64_MAX;
+            for (uint32_t s = 0; s < g_q2tier.n_slots; s++) {
+                bool held = false;
+                for (uint32_t j = 0; j < g_q2tier.step_n; j++) held |= g_q2tier.step_slots[j] == s;
+                if (!held && g_q2tier.slot_used[s] < oldest) {
+                    oldest = g_q2tier.slot_used[s];
+                    victim = s;
+                }
+            }
+            if (victim == UINT32_MAX) return 0;
+            idx.erase(g_q2tier.slot_key[victim]);
+        }
+        try {
+            idx[key] = victim;
+        } catch (...) {
+            return 0;
+        }
+        g_q2tier.slot_key[victim] = key;
+        *slot = victim;
+        *miss = 1;
+    }
+    g_q2tier.slot_used[*slot] = ++g_q2tier.clock;
+    return 1;
+}
+
+extern "C" int ds4_gpu_q2tier_request(
+        const int32_t *ids,
+        uint32_t n,
+        uint32_t layer,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    g_q2tier.step_n = 0;
+    g_q2tier.read_n = 0;
+    g_q2tier.loaded_n = 0;
+    if (n == 0) return 1;
+    if (g_q2tier.fd < 0 || !ids || n > DS4_ROCM_N_EXPERT_USED ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        !cuda_q2tier_ensure_pool(gate_expert_bytes, down_expert_bytes)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t key = ((uint64_t)layer << 32) | (uint32_t)ids[i];
+        uint32_t slot = 0;
+        int miss = 0;
+        if (!cuda_q2tier_slot(key, &slot, &miss)) {
+            g_q2tier.step_n = 0;
+            g_q2tier.read_n = 0;
+            return 0;
+        }
+        g_q2tier.step_slots[g_q2tier.step_n++] = slot;
+        if (miss) {
+            g_q2tier.read_slots[g_q2tier.read_n] = slot;
+            g_q2tier.read_ids[g_q2tier.read_n] = ids[i];
+            g_q2tier.read_n++;
+            g_q2tier.misses++;
+        } else {
+            g_q2tier.hits++;
+        }
+    }
+    g_q2tier.gate_offset = gate_offset;
+    g_q2tier.up_offset = up_offset;
+    g_q2tier.down_offset = down_offset;
+    return 1;
+}
+
+/* Appends read jobs for the current step's pool misses and marks the step
+ * loaded; returns the number of jobs added (0 when nothing is pending). */
+static uint32_t cuda_q2tier_append_jobs(cuda_stream_read_job *jobs,
+                                        uint32_t count,
+                                        uint32_t capacity,
+                                        int *ok) {
+    *ok = 1;
+    if (g_q2tier.step_n == 0) return 0;
+    const uint32_t n = g_q2tier.read_n;
+    if (count + 3u * n > capacity) {
+        *ok = 0;
+        return 0;
+    }
+    const uint64_t geb = g_q2tier.gate_expert_bytes;
+    const uint64_t deb = g_q2tier.down_expert_bytes;
+    char *gate_base = g_q2tier.buf;
+    char *up_base = gate_base + (uint64_t)g_q2tier.n_slots * geb;
+    char *down_base = up_base + (uint64_t)g_q2tier.n_slots * geb;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t e = (uint64_t)(uint32_t)g_q2tier.read_ids[i];
+        const uint64_t s = g_q2tier.read_slots[i];
+        const uint64_t offs[3] = {
+            g_q2tier.gate_offset + e * geb,
+            g_q2tier.up_offset + e * geb,
+            g_q2tier.down_offset + e * deb,
+        };
+        char *dsts[3] = { gate_base + s * geb, up_base + s * geb, down_base + s * deb };
+        const uint64_t sizes[3] = { geb, geb, deb };
+        for (uint32_t t = 0; t < 3u; t++) {
+            cuda_stream_read_job job;
+            memset(&job, 0, sizeof(job));
+            job.dst = dsts[t];
+            job.offset = offs[t];
+            job.bytes = sizes[t];
+            job.alt = 1;
+            job.fd = g_q2tier.fd;
+            job.direct_fd = g_q2tier.direct_fd;
+            job.file_size = g_q2tier.file_size;
+            jobs[count++] = job;
+        }
+    }
+    g_q2tier.loaded_n = g_q2tier.step_n;
+    g_q2tier.read_n = 0;
+    return 3u * n;
+}
+
 static int cuda_stream_selected_load(
         const void *model_map,
         uint64_t model_size,
@@ -4641,6 +5010,7 @@ static int cuda_stream_selected_load(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
     g_stream_selected_cache.loaded = 0;
+    g_stream_resident_step++;
     if (g_stream_selected_pending.active) {
         cuda_stream_selected_abort_pending();
     }
@@ -4689,7 +5059,7 @@ static int cuda_stream_selected_load(
         ls->selected_slots += n_selected;
     }
 
-    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 3u];
+    cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 6u];
     memset(read_jobs, 0, sizeof(read_jobs));
     uint32_t read_job_count = 0;
     uint32_t resident_mask = 0;
@@ -4761,8 +5131,7 @@ static int cuda_stream_selected_load(
             }
         }
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             resident_mask |= 1u << i;
             continue;
         }
@@ -4824,7 +5193,20 @@ static int cuda_stream_selected_load(
         }
     }
 
-    if (resident_mask != 0 && missing_mask == 0) {
+    uint32_t q2_jobs = 0;
+    if (g_q2tier.step_n != 0) {
+        int q2_ok = 0;
+        if (!use_fd) {
+            g_q2tier.step_n = 0;
+            return 0;
+        }
+        q2_jobs = cuda_q2tier_append_jobs(read_jobs, read_job_count,
+                                          DS4_ROCM_N_EXPERT_USED * 6u, &q2_ok);
+        if (!q2_ok) return 0;
+        read_job_count += q2_jobs;
+    }
+
+    if (resident_mask != 0 && missing_mask == 0 && q2_jobs == 0) {
         g_stream_selected_pending.active = 1;
         g_stream_selected_pending.model_map = model_map;
         g_stream_selected_pending.layer = layer;
@@ -5147,6 +5529,46 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     if (owned) return owned;
     if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
     return (const char *)model_map + offset;
+}
+
+/* One-token Q4_K decode without the compact copy: wait for the pending
+ * selected-expert reads, then hand out the per-slot pointer tables that
+ * cuda_stream_selected_load already uploaded. Kernels read each selected
+ * expert in place from its streaming-cache slot, which saves copying all
+ * selected experts (~113 MiB per layer at Q4_K) device-to-device.
+ *
+ * In-place reads are safe for decode: the next layer's reads start only after
+ * its router ran on the default stream, i.e. after this layer's kernels.
+ * Returns 0 without consuming the pending load when it does not match, so the
+ * caller can fall back to cuda_stream_selected_apply. */
+static int cuda_stream_selected_apply_ptrs(
+        const void *model_map,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const char * const **gate_slots,
+        const char * const **up_slots,
+        const char * const **down_slots) {
+    if (!g_ssd_streaming_mode ||
+        !gate_slots || !up_slots || !down_slots ||
+        !g_stream_selected_cache.gate_ptrs ||
+        !g_stream_selected_cache.up_ptrs ||
+        !g_stream_selected_cache.down_ptrs ||
+        !cuda_stream_selected_pending_matches(model_map,
+                                              layer,
+                                              n_total_expert,
+                                              n_selected,
+                                              gate_expert_bytes,
+                                              down_expert_bytes)) {
+        return 0;
+    }
+    if (!cuda_stream_selected_finish_pending_missing(0u)) return 0;
+    *gate_slots = g_stream_selected_cache.gate_ptrs;
+    *up_slots = g_stream_selected_cache.up_ptrs;
+    *down_slots = g_stream_selected_cache.down_ptrs;
+    return 1;
 }
 
 static const char *cuda_model_range_copy_uncached(

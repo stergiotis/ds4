@@ -181,6 +181,25 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
     return ds4_gpu_stream_expert_cache_configured_count();
 }
 
+extern "C" int ds4_gpu_stream_expert_cache_resident_mask(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *ids,
+        uint32_t                           n,
+        uint8_t                           *resident) {
+    if (!table || (n != 0u && (!ids || !resident))) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        resident[i] = cuda_stream_resident_find(table->model_map,
+                                                table->layer,
+                                                ids[i],
+                                                table->gate_offset,
+                                                table->up_offset,
+                                                table->down_offset,
+                                                table->gate_expert_bytes,
+                                                table->down_expert_bytes) >= 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,

@@ -23581,6 +23581,96 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
 #endif
 }
 
+#ifdef DS4_ROCM_BUILD
+/* Q2 tier (DS4_GLM_Q2_FILE=path to a Q2 GGUF of the same model,
+ * DS4_GLM_Q2_WEIGHT_MAX=w > 0): during one-token decode, a selected expert
+ * that is not in the streaming cache and whose gate weight is below w (never
+ * the heaviest of the step) is read from the Q2 file at half the bytes and
+ * computed from that copy, kept in a pool of DS4_GLM_Q2_POOL_EXPERTS Q2
+ * experts (default 1000), instead of being read and cached at full
+ * precision. The regular routed launch sees it with weight 0 and the
+ * heaviest expert's id; the Q2 partial is added afterwards. */
+static struct {
+    int enabled;
+    float weight_max;
+    ds4_model q2;
+    bool layer_ok[DS4_MAX_LAYER];
+    uint64_t gate_offset[DS4_MAX_LAYER];
+    uint64_t up_offset[DS4_MAX_LAYER];
+    uint64_t down_offset[DS4_MAX_LAYER];
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *out;
+    uint64_t steps;
+    uint64_t experts;
+    uint64_t q2_experts;
+    double weight_mass;
+    double q2_weight_mass;
+} g_glm_q2tier = { .enabled = -1 };
+
+static void glm_q2tier_report(void) {
+    if (g_glm_q2tier.steps == 0) return;
+    fprintf(stderr,
+            "ds4: GLM Q2 tier (weight < %.4f): %llu of %llu expert uses at Q2 (%.2f%%), "
+            "%.2f%% of the gate-weight mass\n",
+            g_glm_q2tier.weight_max,
+            (unsigned long long)g_glm_q2tier.q2_experts,
+            (unsigned long long)g_glm_q2tier.experts,
+            100.0 * (double)g_glm_q2tier.q2_experts / (double)g_glm_q2tier.experts,
+            g_glm_q2tier.weight_mass > 0.0 ?
+                100.0 * g_glm_q2tier.q2_weight_mass / g_glm_q2tier.weight_mass : 0.0);
+}
+
+static bool glm_q2tier_enabled(void) {
+    if (g_glm_q2tier.enabled >= 0) return g_glm_q2tier.enabled == 1;
+    g_glm_q2tier.enabled = 0;
+    const char *path = getenv("DS4_GLM_Q2_FILE");
+    const char *wmax = getenv("DS4_GLM_Q2_WEIGHT_MAX");
+    if (!path || !path[0] || !wmax || !wmax[0]) return false;
+    g_glm_q2tier.weight_max = strtof(wmax, NULL);
+    if (!(g_glm_q2tier.weight_max > 0.0f)) return false;
+    model_open(&g_glm_q2tier.q2, path, false, false);
+    uint32_t n_ok = 0;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER && il < DS4_MAX_LAYER; il++) {
+        const ds4_tensor *gate = tensor_by_namef(&g_glm_q2tier.q2, "blk.%u.ffn_gate_exps.weight", il);
+        const ds4_tensor *up = tensor_by_namef(&g_glm_q2tier.q2, "blk.%u.ffn_up_exps.weight", il);
+        const ds4_tensor *down = tensor_by_namef(&g_glm_q2tier.q2, "blk.%u.ffn_down_exps.weight", il);
+        if (!gate || !up || !down ||
+            gate->type != DS4_TENSOR_IQ2_XXS || up->type != DS4_TENSOR_IQ2_XXS ||
+            down->type != DS4_TENSOR_Q2_K) {
+            continue;
+        }
+        uint64_t in = 0, gout = 0, grow = 0, dout = 0, drow = 0;
+        (void)tensor_expert_bytes(&g_glm_q2tier.q2, gate, 0, &in, &gout, &grow);
+        (void)tensor_expert_bytes(&g_glm_q2tier.q2, down, 0, &in, &dout, &drow);
+        g_glm_q2tier.gate_expert_bytes = gout * grow;
+        g_glm_q2tier.gate_row_bytes = grow;
+        g_glm_q2tier.down_expert_bytes = dout * drow;
+        g_glm_q2tier.down_row_bytes = drow;
+        g_glm_q2tier.gate_offset[il] = gate->abs_offset;
+        g_glm_q2tier.up_offset[il] = up->abs_offset;
+        g_glm_q2tier.down_offset[il] = down->abs_offset;
+        g_glm_q2tier.layer_ok[il] = true;
+        n_ok++;
+    }
+    const char *pool = getenv("DS4_GLM_Q2_POOL_EXPERTS");
+    const uint32_t pool_slots = pool && pool[0] ? (uint32_t)strtoul(pool, NULL, 10) : 1000u;
+    if (n_ok == 0 || !ds4_gpu_q2tier_open(path, pool_slots)) {
+        fprintf(stderr, "ds4: GLM Q2 tier disabled: no usable IQ2_XXS/Q2_K expert tensors in %s\n", path);
+        return false;
+    }
+    fprintf(stderr, "ds4: GLM Q2 tier on: %u layers from %s, gate weight < %.4f, %.2f MiB per Q2 expert\n",
+            n_ok, path, g_glm_q2tier.weight_max,
+            (double)(2u * g_glm_q2tier.gate_expert_bytes + g_glm_q2tier.down_expert_bytes) / 1048576.0);
+    atexit(glm_q2tier_report);
+    g_glm_q2tier.enabled = 1;
+    return true;
+}
+#endif
+
 typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
@@ -23595,6 +23685,13 @@ typedef struct metal_graph_selected_async_load {
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
+    /* Q2 tier decision for this step (ROCm). */
+    bool                      q2_eval;
+    uint32_t                  q2_n;
+    uint32_t                  q2_mask;
+    int32_t                   q2_ids[DS4_MAX_EXPERT_USED];
+    float                     q2_weights[DS4_MAX_EXPERT_USED];
+    float                     weights[DS4_MAX_EXPERT_USED];
 } metal_graph_selected_async_load;
 
 static pthread_mutex_t g_metal_graph_selected_async_load_mutex =
@@ -23662,6 +23759,44 @@ static void metal_graph_selected_async_load_run(
                                        job->il,
                                        job->gate_expert_bytes,
                                        job->down_expert_bytes);
+#ifdef DS4_ROCM_BUILD
+    job->q2_n = 0;
+    job->q2_mask = 0;
+    job->q2_eval = false;
+    if (g_glm_q2tier.enabled == 1 && job->il < DS4_MAX_LAYER &&
+        g_glm_q2tier.layer_ok[job->il] && g_glm_q2tier.router_weights &&
+        ds4_gpu_tensor_read_after_selected_event(
+                g_glm_q2tier.router_weights, 0, job->weights,
+                (uint64_t)DS4_N_EXPERT_USED * sizeof(job->weights[0]),
+                job->event_value, "q2 tier weights") != 0) {
+        job->q2_eval = true;
+        uint8_t resident[DS4_MAX_EXPERT_USED] = {0};
+        (void)ds4_gpu_stream_expert_cache_resident_mask(&table, job->selected_ids,
+                                                        DS4_N_EXPERT_USED, resident);
+        uint32_t top = 0;
+        for (uint32_t i = 1; i < DS4_N_EXPERT_USED; i++) {
+            if (job->weights[i] > job->weights[top]) top = i;
+        }
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            if (i == top || resident[i] || !(job->weights[i] < g_glm_q2tier.weight_max)) continue;
+            job->q2_ids[job->q2_n] = job->selected_ids[i];
+            job->q2_weights[job->q2_n] = job->weights[i];
+            job->q2_n++;
+            job->q2_mask |= 1u << i;
+            job->selected_ids[i] = job->selected_ids[top];
+            job->weights[i] = 0.0f;
+        }
+        const uint32_t il = job->il;
+        if (ds4_gpu_q2tier_request(job->q2_ids, job->q2_n, il,
+                                   g_glm_q2tier.gate_offset[il],
+                                   g_glm_q2tier.up_offset[il],
+                                   g_glm_q2tier.down_offset[il],
+                                   g_glm_q2tier.gate_expert_bytes,
+                                   g_glm_q2tier.down_expert_bytes) == 0) {
+            return;
+        }
+    }
+#endif
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
                 &table,
                 job->selected_ids,
@@ -49898,6 +50033,295 @@ static bool glm_graph_profile_router_selection(
     return true;
 }
 
+/* Routing trace (DS4_GLM_ROUTE_TRACE=FILE, one-token decode only): appends
+ * one line per token and layer, "pos layer e0 .. e7 ; w0 .. w7", with the
+ * experts the router selected and their gate weights, for replaying
+ * expert-cache policies offline. It synchronizes at every layer, so it is a
+ * measurement tool. */
+static struct {
+    int enabled;
+    FILE *fp;
+} g_glm_route_trace = { .enabled = -1 };
+
+static bool glm_graph_route_trace(ds4_glm_gpu_graph *g, uint32_t il, uint32_t pos) {
+    if (g_glm_route_trace.enabled < 0) {
+        const char *path = getenv("DS4_GLM_ROUTE_TRACE");
+        g_glm_route_trace.enabled = 0;
+        if (path && path[0]) {
+            g_glm_route_trace.fp = fopen(path, "a");
+            if (!g_glm_route_trace.fp) {
+                fprintf(stderr, "ds4: cannot open GLM route trace %s: %s\n", path, strerror(errno));
+                return false;
+            }
+            g_glm_route_trace.enabled = 1;
+        }
+    }
+    if (!g_glm_route_trace.enabled) return true;
+    const uint32_t k = DS4_N_EXPERT_USED;
+    int32_t selected[DS4_MAX_EXPERT_USED] = {0};
+    float weights[DS4_MAX_EXPERT_USED] = {0};
+    if (k > DS4_MAX_EXPERT_USED || ds4_gpu_end_commands() == 0) return false;
+    const bool ok = ds4_gpu_tensor_read(g->router_selected, 0, selected,
+                                        (uint64_t)k * sizeof(int32_t)) != 0 &&
+                    ds4_gpu_tensor_read(g->router_weights, 0, weights,
+                                        (uint64_t)k * sizeof(float)) != 0;
+    if (ds4_gpu_begin_commands() == 0) return false;
+    if (!ok) return false;
+    fprintf(g_glm_route_trace.fp, "%u %u", pos, il);
+    for (uint32_t i = 0; i < k; i++) fprintf(g_glm_route_trace.fp, " %d", selected[i]);
+    fputs(" ;", g_glm_route_trace.fp);
+    for (uint32_t i = 0; i < k; i++) fprintf(g_glm_route_trace.fp, " %.5f", weights[i]);
+    fputc('\n', g_glm_route_trace.fp);
+    if (il + 1u == DS4_N_LAYER) fflush(g_glm_route_trace.fp);
+    return true;
+}
+
+/* Next-layer routing probe (DS4_GLM_PREDICT_PROBE=1, one-token decode only).
+ * At layer il it runs layer il+1's router on layer il's FFN input and ranks
+ * the top 16 experts by the same score the router uses. When layer il+1
+ * routes, it scores that ranking against the real selection and against the
+ * streaming expert cache: of the experts that are not resident (the ones
+ * decode waits for), how many would a top-8/12/16 prefetch have covered, and
+ * how many predicted experts would it have read in vain. It synchronizes at
+ * every layer, so it is a measurement tool, not a runtime feature. */
+#define GLM_PREDICT_PROBE_MAX_LAYERS 128
+#define GLM_PREDICT_PROBE_MAX_EXPERT 1024
+#define GLM_PREDICT_PROBE_TOP 16
+#define GLM_PREDICT_PROBE_NW 3
+static const uint32_t g_glm_predict_probe_width[GLM_PREDICT_PROBE_NW] = {8, 12, 16};
+static struct {
+    int enabled;
+    ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *probs;
+    ds4_gpu_tensor *selected;
+    ds4_gpu_tensor *weights;
+    int32_t pred[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_TOP];
+    bool have[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t hist[DS4_MAX_EXPERT_USED + 1];
+    uint64_t rank_mismatch;
+    uint64_t layer_steps[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t layer_actual[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t layer_missing[GLM_PREDICT_PROBE_MAX_LAYERS];
+    uint64_t layer_hits[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_NW];
+    uint64_t layer_covered[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_NW];
+    uint64_t layer_extra[GLM_PREDICT_PROBE_MAX_LAYERS][GLM_PREDICT_PROBE_NW];
+} g_glm_predict_probe = { .enabled = -1 };
+
+static void glm_predict_probe_report(void) {
+    uint64_t steps = 0, actual = 0, missing = 0;
+    uint64_t hits[GLM_PREDICT_PROBE_NW] = {0};
+    uint64_t covered[GLM_PREDICT_PROBE_NW] = {0};
+    uint64_t extra[GLM_PREDICT_PROBE_NW] = {0};
+    for (uint32_t i = 0; i < GLM_PREDICT_PROBE_MAX_LAYERS; i++) {
+        steps += g_glm_predict_probe.layer_steps[i];
+        actual += g_glm_predict_probe.layer_actual[i];
+        missing += g_glm_predict_probe.layer_missing[i];
+        for (uint32_t w = 0; w < GLM_PREDICT_PROBE_NW; w++) {
+            hits[w] += g_glm_predict_probe.layer_hits[i][w];
+            covered[w] += g_glm_predict_probe.layer_covered[i][w];
+            extra[w] += g_glm_predict_probe.layer_extra[i][w];
+        }
+    }
+    if (steps == 0 || actual == 0) return;
+    fprintf(stderr, "ds4: GLM next-layer prediction: %llu layer steps, %.2f of %.0f experts not resident per step (%.1f%%), rank mismatches %llu\n",
+            (unsigned long long)steps, (double)missing / (double)steps,
+            (double)actual / (double)steps, 100.0 * (double)missing / (double)actual,
+            (unsigned long long)g_glm_predict_probe.rank_mismatch);
+    for (uint32_t w = 0; w < GLM_PREDICT_PROBE_NW; w++) {
+        fprintf(stderr, "ds4: GLM next-layer prediction top-%u: recall %.4f, missing covered %.4f (%.2f per step), useless reads %.2f per step\n",
+                g_glm_predict_probe_width[w],
+                (double)hits[w] / (double)actual,
+                missing ? (double)covered[w] / (double)missing : 0.0,
+                (double)covered[w] / (double)steps,
+                (double)extra[w] / (double)steps);
+    }
+    fprintf(stderr, "ds4: GLM next-layer prediction top-8 hits histogram:");
+    for (uint32_t k = 0; k <= DS4_MAX_EXPERT_USED; k++) {
+        if (g_glm_predict_probe.hist[k]) {
+            fprintf(stderr, " %u:%llu", k, (unsigned long long)g_glm_predict_probe.hist[k]);
+        }
+    }
+    fprintf(stderr, "\nds4: GLM next-layer prediction by layer (missing per step / top-12 missing covered):");
+    for (uint32_t i = 0; i < GLM_PREDICT_PROBE_MAX_LAYERS; i++) {
+        const uint64_t n = g_glm_predict_probe.layer_steps[i];
+        const uint64_t m = g_glm_predict_probe.layer_missing[i];
+        if (n) {
+            fprintf(stderr, " %u:%.1f/%.2f", i, (double)m / (double)n,
+                    m ? (double)g_glm_predict_probe.layer_covered[i][1] / (double)m : 0.0);
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
+static bool glm_predict_probe_contains(const int32_t *ids, uint32_t n, int32_t id) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] == id) return true;
+    }
+    return false;
+}
+
+/* Ranks the top GLM_PREDICT_PROBE_TOP experts by sigmoid probability plus
+ * selection bias, ties to the lower index, as the router kernel does. */
+static bool glm_predict_probe_rank(
+        const ds4_model         *model,
+        const ds4_layer_weights *next,
+        int32_t                 *out) {
+    const uint32_t n_expert = DS4_N_EXPERT;
+    static float probs[GLM_PREDICT_PROBE_MAX_EXPERT];
+    if (n_expert > GLM_PREDICT_PROBE_MAX_EXPERT || n_expert < GLM_PREDICT_PROBE_TOP) return false;
+    if (ds4_gpu_tensor_read(g_glm_predict_probe.probs, 0, probs,
+                            (uint64_t)n_expert * sizeof(float)) == 0) {
+        return false;
+    }
+    const float *bias = (const float *)((const char *)model->map + next->ffn_exp_probs_b->abs_offset);
+    float best[GLM_PREDICT_PROBE_TOP];
+    for (uint32_t k = 0; k < GLM_PREDICT_PROBE_TOP; k++) {
+        best[k] = -INFINITY;
+        out[k] = -1;
+    }
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float s = probs[e] + bias[e];
+        uint32_t k = GLM_PREDICT_PROBE_TOP;
+        while (k > 0 && (s > best[k - 1] || (s == best[k - 1] && (int32_t)e < out[k - 1]))) k--;
+        if (k == GLM_PREDICT_PROBE_TOP) continue;
+        for (uint32_t j = GLM_PREDICT_PROBE_TOP - 1; j > k; j--) {
+            best[j] = best[j - 1];
+            out[j] = out[j - 1];
+        }
+        best[k] = s;
+        out[k] = (int32_t)e;
+    }
+    return true;
+}
+
+static bool glm_graph_predict_probe(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        const ds4_gpu_tensor    *ffn_norm,
+        uint64_t                 gate_expert_bytes,
+        uint64_t                 down_expert_bytes) {
+    if (g_glm_predict_probe.enabled < 0) {
+        const char *env = getenv("DS4_GLM_PREDICT_PROBE");
+        g_glm_predict_probe.enabled = env && env[0] && strcmp(env, "0") != 0;
+        if (g_glm_predict_probe.enabled) atexit(glm_predict_probe_report);
+    }
+    if (!g_glm_predict_probe.enabled) return true;
+    if (il + 1u >= GLM_PREDICT_PROBE_MAX_LAYERS || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED ||
+        DS4_N_EXPERT_USED > g_glm_predict_probe_width[0]) {
+        return true;
+    }
+    const uint32_t k = DS4_N_EXPERT_USED;
+    if (!g_glm_predict_probe.logits) {
+        g_glm_predict_probe.logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_glm_predict_probe.probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_glm_predict_probe.selected = ds4_gpu_tensor_alloc((uint64_t)k * sizeof(int32_t));
+        g_glm_predict_probe.weights = ds4_gpu_tensor_alloc((uint64_t)k * sizeof(float));
+        if (!g_glm_predict_probe.logits || !g_glm_predict_probe.probs ||
+            !g_glm_predict_probe.selected || !g_glm_predict_probe.weights) {
+            fprintf(stderr, "ds4: GLM prediction probe allocation failed\n");
+            return false;
+        }
+    }
+    if (ds4_gpu_end_commands() == 0) return false;
+
+    /* Score this layer's real routing and cache state against the ranking
+     * made one layer earlier for the same token. */
+    int32_t actual[DS4_MAX_EXPERT_USED] = {0};
+    bool ok = ds4_gpu_tensor_read(g->router_selected, 0, actual, (uint64_t)k * sizeof(int32_t)) != 0;
+    if (ok && g_glm_predict_probe.have[il]) {
+        const int32_t *pred = g_glm_predict_probe.pred[il];
+        uint8_t actual_res[DS4_MAX_EXPERT_USED] = {0};
+        uint8_t pred_res[GLM_PREDICT_PROBE_TOP] = {0};
+#ifdef DS4_ROCM_BUILD
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = model->map,
+            .model_size = model->size,
+            .layer = il,
+            .n_total_expert = DS4_N_EXPERT,
+            .gate_offset = layer->ffn_gate_exps->abs_offset,
+            .up_offset = layer->ffn_up_exps->abs_offset,
+            .down_offset = layer->ffn_down_exps->abs_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+        };
+        if (g->ssd_streaming) {
+            (void)ds4_gpu_stream_expert_cache_resident_mask(&table, actual, k, actual_res);
+            (void)ds4_gpu_stream_expert_cache_resident_mask(&table, pred, GLM_PREDICT_PROBE_TOP, pred_res);
+        }
+#else
+        (void)gate_expert_bytes;
+        (void)down_expert_bytes;
+#endif
+        uint32_t n_missing = 0;
+        for (uint32_t i = 0; i < k; i++) n_missing += !actual_res[i];
+        g_glm_predict_probe.layer_steps[il]++;
+        g_glm_predict_probe.layer_actual[il] += k;
+        g_glm_predict_probe.layer_missing[il] += n_missing;
+        for (uint32_t w = 0; w < GLM_PREDICT_PROBE_NW; w++) {
+            const uint32_t n = g_glm_predict_probe_width[w];
+            uint32_t hits = 0, covered = 0, extra = 0;
+            for (uint32_t i = 0; i < k; i++) {
+                if (glm_predict_probe_contains(pred, n, actual[i])) {
+                    hits++;
+                    covered += !actual_res[i];
+                }
+            }
+            for (uint32_t j = 0; j < n; j++) {
+                extra += !pred_res[j] && !glm_predict_probe_contains(actual, k, pred[j]);
+            }
+            if (w == 0) g_glm_predict_probe.hist[hits]++;
+            g_glm_predict_probe.layer_hits[il][w] += hits;
+            g_glm_predict_probe.layer_covered[il][w] += covered;
+            g_glm_predict_probe.layer_extra[il][w] += extra;
+        }
+    }
+    g_glm_predict_probe.have[il] = false;
+
+    /* Rank layer il+1's experts from this layer's FFN input. */
+    const ds4_layer_weights *next = layer + 1;
+    if (ok && il + 1u < DS4_N_LAYER && next->ffn_gate_inp && next->ffn_exp_probs_b) {
+        if (ds4_gpu_begin_commands() == 0) return false;
+        ok = ds4_gpu_matmul_f32_tensor(g_glm_predict_probe.logits,
+                                       model->map,
+                                       model->size,
+                                       next->ffn_gate_inp->abs_offset,
+                                       DS4_N_EMBD,
+                                       DS4_N_EXPERT,
+                                       ffn_norm,
+                                       1) != 0 &&
+             ds4_gpu_glm_router_select_tensor(g_glm_predict_probe.selected,
+                                              g_glm_predict_probe.weights,
+                                              g_glm_predict_probe.probs,
+                                              model->map,
+                                              model->size,
+                                              next->ffn_exp_probs_b->abs_offset,
+                                              g_glm_predict_probe.logits,
+                                              DS4_N_EXPERT,
+                                              DS4_N_EXPERT_USED,
+                                              DS4_EXPERT_WEIGHT_SCALE) != 0;
+        if (ds4_gpu_end_commands() == 0) return false;
+        int32_t *pred = g_glm_predict_probe.pred[il + 1u];
+        if (ok) ok = glm_predict_probe_rank(model, next, pred);
+        if (ok) {
+            int32_t gpu_sel[DS4_MAX_EXPERT_USED] = {0};
+            ok = ds4_gpu_tensor_read(g_glm_predict_probe.selected, 0, gpu_sel,
+                                     (uint64_t)k * sizeof(int32_t)) != 0;
+            for (uint32_t i = 0; ok && i < k; i++) {
+                if (!glm_predict_probe_contains(pred, k, gpu_sel[i])) {
+                    g_glm_predict_probe.rank_mismatch++;
+                    break;
+                }
+            }
+        }
+        g_glm_predict_probe.have[il + 1u] = ok;
+    }
+    if (ds4_gpu_begin_commands() == 0) return false;
+    if (!ok) fprintf(stderr, "ds4: GLM prediction probe failed at layer %u\n", il);
+    return ok;
+}
+
 static bool glm_graph_profile_router_selection_batch(
         ds4_glm_gpu_graph       *g,
         const ds4_layer_weights *layer,
@@ -50519,6 +50943,10 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          1,
                                          stage_t0);
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
+    if (ok) ok = glm_graph_route_trace(g, il, pos);
+    if (ok) ok = glm_graph_predict_probe(g, model, l, il, ffn_norm,
+                                             gate_out * gate_row_bytes,
+                                             down_out * down_row_bytes);
     const bool resident_decode_layer =
         g->ssd_streaming && glm_stream_resident_decode_layer_enabled(l, il);
     const bool streaming_expert_cache =
@@ -50569,6 +50997,11 @@ static bool glm_graph_encode_sparse_ffn_one(
             glm_graph_use_streaming_selected_async_load(g);
         async_path_profiled = false;
         uint64_t selected_event = 0;
+#ifdef DS4_ROCM_BUILD
+        if (async_selected_load && glm_q2tier_enabled()) {
+            g_glm_q2tier.router_weights = g->router_weights;
+        }
+#endif
         if (async_selected_load) {
             if (ds4_gpu_signal_selected_readback_ready(&selected_event) != 0) {
                 async_load_started = metal_graph_selected_async_load_start_tensor(
@@ -50671,6 +51104,12 @@ static bool glm_graph_encode_sparse_ffn_one(
         }
         const bool finish_ok = metal_graph_selected_async_load_finish(&async_load);
         ok = ok && flush_ok && finish_ok;
+#ifdef DS4_ROCM_BUILD
+        if (ok && async_load.q2_n > 0) {
+            ok = ds4_gpu_q2tier_zero_weights(g->router_weights, async_load.q2_mask,
+                                             DS4_N_EXPERT_USED) != 0;
+        }
+#endif
         if (async_profile) {
             g_glm_streaming_async_profile.async_finish_ms +=
                 glm_graph_streaming_async_profile_ms() - stream_t0;
@@ -50707,6 +51146,38 @@ static bool glm_graph_encode_sparse_ffn_one(
             ffn_norm,
             g->ssd_streaming && !streaming_selected_cache) != 0;
     }
+#ifdef DS4_ROCM_BUILD
+    if (ok && async_load_started && async_load.ok && async_load.q2_eval) {
+        g_glm_q2tier.steps++;
+        g_glm_q2tier.experts += DS4_N_EXPERT_USED;
+        g_glm_q2tier.q2_experts += async_load.q2_n;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) g_glm_q2tier.weight_mass += async_load.weights[i];
+        for (uint32_t i = 0; i < async_load.q2_n; i++) {
+            g_glm_q2tier.weight_mass += async_load.q2_weights[i];
+            g_glm_q2tier.q2_weight_mass += async_load.q2_weights[i];
+        }
+    }
+    if (ok && async_load_started && async_load.ok && async_load.q2_n > 0) {
+        if (!g_glm_q2tier.out) {
+            g_glm_q2tier.out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        }
+        ok = g_glm_q2tier.out &&
+             ds4_gpu_q2tier_moe_one(g_glm_q2tier.out,
+                                    ffn_norm,
+                                    async_load.q2_weights,
+                                    async_load.q2_n,
+                                    g_glm_q2tier.gate_expert_bytes,
+                                    g_glm_q2tier.gate_row_bytes,
+                                    g_glm_q2tier.down_expert_bytes,
+                                    g_glm_q2tier.down_row_bytes,
+                                    DS4_N_EMBD,
+                                    DS4_N_FF_EXP,
+                                    DS4_N_EMBD,
+                                    g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f) != 0 &&
+             ds4_gpu_add_tensor(routed_dst, routed_dst, g_glm_q2tier.out, DS4_N_EMBD) != 0;
+        if (!ok) fprintf(stderr, "ds4: GLM Q2 tier compute failed at layer %u\n", il);
+    }
+#endif
     if (ok && g->imatrix &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = imatrix_collect_glm_one(g->imatrix, g, il);

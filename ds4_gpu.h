@@ -466,6 +466,28 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
 #endif
+#ifdef DS4_ROCM_BUILD
+/* Sets resident[i] to 1 when expert ids[i] of the table's layer is in the
+ * streaming expert cache, else 0. Returns 0 on bad arguments. */
+/* Q2 tier: open the second model file, register this decode step's Q2
+ * experts before the selected load, and compute them afterwards. */
+int ds4_gpu_q2tier_open(const char *path, uint32_t pool_slots);
+int ds4_gpu_q2tier_request(const int32_t *ids, uint32_t n, uint32_t layer,
+                           uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                           uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+int ds4_gpu_q2tier_zero_weights(ds4_gpu_tensor *weights, uint32_t mask, uint32_t n);
+int ds4_gpu_q2tier_moe_one(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                           const float *weights, uint32_t n,
+                           uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+                           uint64_t down_expert_bytes, uint64_t down_row_bytes,
+                           uint32_t expert_in_dim, uint32_t expert_mid_dim,
+                           uint32_t out_dim, float clamp);
+int ds4_gpu_stream_expert_cache_resident_mask(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *ids,
+        uint32_t                           n,
+        uint8_t                           *resident);
+#endif
 void ds4_gpu_print_memory_report(const char *label);
 
 #include "ds4_gpu_tp.h"

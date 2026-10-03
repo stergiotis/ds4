@@ -36,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <algorithm>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -174,6 +175,7 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "rocm/ds4_rocm_moe.cuh"
 
 #include "rocm/ds4_rocm_moe_launch.cuh"
+#include "rocm/ds4_rocm_q2tier.cuh"
 
 #include "rocm/ds4_rocm_glm.cuh"
 

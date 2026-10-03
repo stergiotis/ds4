@@ -1147,17 +1147,35 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     }
     ds4_tokens_free(&prefix);
 
+    /* DS4_PPL_DUMP=FILE writes one line per scored token: "target logprob"
+     * followed by the top-20 "id:logprob" pairs, for comparing two runs
+     * token by token (KL, top-1 agreement). */
+    FILE *dump = NULL;
+    const char *dump_path = getenv("DS4_PPL_DUMP");
+    if (dump_path && dump_path[0]) {
+        dump = fopen(dump_path, "w");
+        if (!dump) fprintf(stderr, "ds4: cannot open DS4_PPL_DUMP %s\n", dump_path);
+    }
+
     double nll = 0.0;
     for (int j = 0; j < scored; j++) {
         const int i = prefix_len + j;
         ds4_token_score score;
         if (!ds4_session_token_logprob(session, tokens.v[i], &score)) {
             fprintf(stderr, "ds4: failed to score token %d\n", i);
+            if (dump) fclose(dump);
             ds4_session_free(session);
             ds4_tokens_free(&tokens);
             return 1;
         }
         nll -= (double)score.logprob;
+        if (dump) {
+            ds4_token_score top[20];
+            const int n = ds4_session_top_logprobs(session, top, 20);
+            fprintf(dump, "%d %.6f", tokens.v[i], score.logprob);
+            for (int t = 0; t < n; t++) fprintf(dump, " %d:%.6f", top[t].id, top[t].logprob);
+            fputc('\n', dump);
+        }
 
         if (((j + 1) % 256) == 0 || j + 1 == scored) {
             fprintf(stderr, "ds4: perplexity scored %d/%d\r", j + 1, scored);
@@ -1166,12 +1184,14 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
 
         if (j + 1 < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "\nds4: perplexity decode failed at token %d: %s\n", i, err);
+            if (dump) fclose(dump);
             ds4_session_free(session);
             ds4_tokens_free(&tokens);
             return 1;
         }
     }
     fputc('\n', stderr);
+    if (dump) fclose(dump);
 
     const double avg_nll = nll / (double)scored;
     printf("tokens=%d scored=%d nll=%.9f avg_nll=%.9f ppl=%.9f\n",
