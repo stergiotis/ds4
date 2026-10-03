@@ -244,7 +244,7 @@ static uint64_t row_bytes(uint32_t type, uint64_t n) {
     case 10: return n % 256 ? 0 : n / 256 * 84;
     case 12: return n % 256 ? 0 : n / 256 * 144;
     case 16: return n % 256 ? 0 : n / 256 * 66;
-    case 200: return n % 128 ? 0 : n / 128 * 132;
+    case 200: return n % 512 ? 0 : n / 512 * 528;
     default: return 0;
     }
 }
@@ -316,8 +316,8 @@ __device__ __forceinline__ float value(const char *row, unsigned i,
         const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
     if (TYPE == 0) return ((const float *)row)[i];
     if (TYPE == 200) {
-        const char *b = row + (i / 128) * 132;
-        return *(const float *)b * 256.0f * f8_e4m3_x256((uint8_t)b[4 + i % 128]);
+        const char *b = row + (i / 512) * 528;
+        return ((const float *)b)[i % 512 / 128] * 256.0f * f8_e4m3_x256((uint8_t)b[16 + i % 512]);
     }
     if (TYPE == 1) return __half2float(((const __half *)row)[i]);
     if (TYPE == 30) return (float)((const hip_bfloat16 *)row)[i];
@@ -395,6 +395,12 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
         out = make_float4(a.x,a.y,b.x,b.y);
     } else if (TYPE == 0) {
         out = *(const float4 *)(row+i*4);
+    } else if (TYPE == 200) {
+        const char *b = row+(i/512)*528;
+        const float scale = ((const float *)b)[i%512/128]*256.0f;
+        const unsigned q = *(const unsigned *)(b+16+i%512);
+        out = make_float4(f8_e4m3_x256(q&255)*scale, f8_e4m3_x256((q>>8)&255)*scale,
+                          f8_e4m3_x256((q>>16)&255)*scale, f8_e4m3_x256(q>>24)*scale);
     } else if (TYPE == 8) {
         const char *b = row+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
@@ -552,7 +558,7 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
             const uint64_t off = ((uint64_t)e * M + row) * rb;
-            if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39) && !((uintptr_t)xt&15)) {
+            if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39 || TYPE == 200) && !((uintptr_t)xt&15)) {
                 for (unsigned i = (threadIdx.x&31)*4; i < K; i += 128) {
                     const float4 xv = *(const float4 *)(xt+i);
                     const float4 av = value4<TYPE>(w0+off,i,grid_table,sign_table);
@@ -976,7 +982,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
-        if (ds4_rocm_is_gfx1151() && lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
+        if (ds4_rocm_is_gfx1151() && lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39 || type == 200)) {
             // Keep bulk Q2 prefetch and wide down tiles; group the remaining
             // matrix work by actual expert occupancy instead of padding every
             // expert to the same tile width.
@@ -1009,7 +1015,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
                 else if (nt == 16) matrix_half_tile<TYPE,DOWN,16,64,4><<<blocks,128,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
                 else matrix_half_tile<TYPE,DOWN,32><<<blocks,256,0,0>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
 #define QWEN_HALF_TYPE(TYPE) case TYPE: if (down) { QWEN_HALF(TYPE,true); } else { QWEN_HALF(TYPE,false); } break
-                switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
+                switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); QWEN_HALF_TYPE(200); }
 #undef QWEN_HALF_TYPE
 #undef QWEN_HALF
                 if (!launched()) return 0;
@@ -1033,7 +1039,8 @@ template<unsigned TYPE>
 __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n,
         const uint64_t *grid, const uint8_t *signs) {
     float acc = 0;
-    if (TYPE == 1 && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) {
+    if ((TYPE == 1 && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) ||
+        (TYPE == 200 && !((uintptr_t)x&15))) {
         for (unsigned i = (threadIdx.x&31)*4; i < n; i += 128) {
             const float4 w = value4<TYPE>(row,i,grid,signs), v = *(const float4 *)(x+i);
             acc += w.x*v.x; acc += w.y*v.y; acc += w.z*v.z; acc += w.w*v.w;
@@ -1424,7 +1431,7 @@ __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
 
 /* Read Q8 blocks directly for gfx1151 bulk projections.  Shape-specific tiles
  * keep the WMMA work resident across the Qwen dense projection dimensions. */
-template<unsigned WAVES, unsigned NT, unsigned KT, unsigned PAD, unsigned VEC>
+template<unsigned WAVES, unsigned NT, unsigned KT, unsigned PAD, unsigned VEC, unsigned WT = 8>
 __launch_bounds__(WAVES*32u,1)
 __global__ void qwen_q8_direct(float *out,
         const unsigned char *w, const __half *x, const float *xs, const float *ws,
@@ -1435,7 +1442,8 @@ __global__ void qwen_q8_direct(float *out,
     const unsigned tid=threadIdx.x, wave=tid>>5, lane=tid&31, lane16=lane&15;
     const unsigned row0=block_m+wave*16, my_row=row0+lane16;
     const unsigned safe_row=my_row<M ? my_row : M-1;
-    const uint64_t rb=(uint64_t)(K/32)*34;
+    /* WT 8: Q8_0 blocks of 32; WT 200: F8_B128 blocks of 512 */
+    const uint64_t rb=WT==200 ? (uint64_t)(K/512)*528 : (uint64_t)(K/32)*34;
     const unsigned char *wr=w+(uint64_t)safe_row*rb;
     const float winv=1.0f/ws[safe_row];
     __shared__ _Float16 sx[NT][KT+PAD];
@@ -1453,15 +1461,27 @@ __global__ void qwen_q8_direct(float *out,
         #pragma unroll
         for (unsigned kb=0;kb<KT/32;kb++) {
             if (k0+kb*32>=length) break;
-            const unsigned char *bp=wr+(uint64_t)((begin+k0)/32+kb)*34;
-            uint16_t sb; __builtin_memcpy(&sb,bp,2);
-            const float sc=qwen_f16_to_f32(sb)*winv;
-            const int8_t *q=(const int8_t *)(bp+2);
             half16 a0,a1;
-            #pragma unroll
-            for (unsigned i=0;i<16;i++) {
-                a0[i]=(_Float16)(sc*(float)(int)q[i]);
-                a1[i]=(_Float16)(sc*(float)(int)q[16+i]);
+            if (WT==200) {
+                const unsigned kk=begin+k0+kb*32;
+                const unsigned char *bp=wr+(uint64_t)(kk/512)*528;
+                const float sc=((const float *)bp)[kk%512/128]*256.0f*winv;
+                const uint8_t *q=bp+16+kk%512;
+                #pragma unroll
+                for (unsigned i=0;i<16;i++) {
+                    a0[i]=(_Float16)(sc*f8_e4m3_x256(q[i]));
+                    a1[i]=(_Float16)(sc*f8_e4m3_x256(q[16+i]));
+                }
+            } else {
+                const unsigned char *bp=wr+(uint64_t)((begin+k0)/32+kb)*34;
+                uint16_t sb; __builtin_memcpy(&sb,bp,2);
+                const float sc=qwen_f16_to_f32(sb)*winv;
+                const int8_t *q=(const int8_t *)(bp+2);
+                #pragma unroll
+                for (unsigned i=0;i<16;i++) {
+                    a0[i]=(_Float16)(sc*(float)(int)q[i]);
+                    a1[i]=(_Float16)(sc*(float)(int)q[16+i]);
+                }
             }
             #pragma unroll
             for (unsigned f=0;f<NF;f++) {
@@ -1490,36 +1510,37 @@ __global__ void qwen_q8_direct(float *out,
     }
 }
 
+template<unsigned WT = 8>
 static int launch_qwen_q8_direct(float *out, const unsigned char *w,
         const __half *x, const float *xs, const float *ws, unsigned T,
         unsigned K, unsigned M, unsigned begin, unsigned length) {
     if (T<=64) {
         if (M<=2560) {
-            qwen_q8_direct<8,16,64,8,4><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
+            qwen_q8_direct<8,16,64,8,4,WT><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
                 out,w,x,xs,ws,T,K,M,begin,length);
         } else if (M==6144 || M==10240 || M==12288) {
-            qwen_q8_direct<24,32,256,8,4><<<dim3((M+383)/384,(T+31)/32),768,0,0>>>(
+            qwen_q8_direct<24,32,256,8,4,WT><<<dim3((M+383)/384,(T+31)/32),768,0,0>>>(
                 out,w,x,xs,ws,T,K,M,begin,length);
         } else {
-            qwen_q8_direct<16,64,128,8,4><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
+            qwen_q8_direct<16,64,128,8,4,WT><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
                 out,w,x,xs,ws,T,K,M,begin,length);
         }
     } else if (M<=640 && T<=128) {
-        qwen_q8_direct<8,16,64,8,4><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
+        qwen_q8_direct<8,16,64,8,4,WT><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
             out,w,x,xs,ws,T,K,M,begin,length);
     } else if ((M==640 && T>=768 && T<1536) ||
             (M==2560 && !(T>=256 && T<768))) {
-        qwen_q8_direct<16,64,256,8,8><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
+        qwen_q8_direct<16,64,256,8,8,WT><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
             out,w,x,xs,ws,T,K,M,begin,length);
     } else if ((M==640 && T>=1536) || (M==6144 && T>=256) ||
             ((M==10240 || M==12288) && T>=128 && T<1536)) {
-        qwen_q8_direct<16,128,128,8,8><<<dim3((M+255)/256,(T+127)/128),512,0,0>>>(
+        qwen_q8_direct<16,128,128,8,8,WT><<<dim3((M+255)/256,(T+127)/128),512,0,0>>>(
             out,w,x,xs,ws,T,K,M,begin,length);
     } else if ((M==10240 || M==12288) && T>=1536) {
-        qwen_q8_direct<24,128,128,8,8><<<dim3((M+383)/384,(T+127)/128),768,0,0>>>(
+        qwen_q8_direct<24,128,128,8,8,WT><<<dim3((M+383)/384,(T+127)/128),768,0,0>>>(
             out,w,x,xs,ws,T,K,M,begin,length);
     } else {
-        qwen_q8_direct<16,64,128,8,4><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
+        qwen_q8_direct<16,64,128,8,4,WT><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
             out,w,x,xs,ws,T,K,M,begin,length);
     }
     return launched();
@@ -1544,6 +1565,30 @@ __global__ void qwen_dense_row_scales(float *scales, const char *x,
     }
 }
 
+template<unsigned TYPE>
+static int dense_half_tiles(float *out, const float *x, const char *w,
+        unsigned T, unsigned K, unsigned M);
+
+/* F8_B128 projections on gfx1151: the Q8 direct WMMA kernel with the FP8
+ * block decode (weights read once, no packed copy). */
+static int dense_f8_direct(float *out, const float *x, const char *w,
+        unsigned T, unsigned K, unsigned M) {
+    const uint64_t xn=(uint64_t)T*K;
+    const uint64_t xbytes=(xn*sizeof(__half)+15)&~UINT64_C(15);
+    __half *xh=(__half *)cuda_tmp_alloc(xbytes+((uint64_t)T+M)*sizeof(float), "Kolibri F8 projection scratch");
+    if (!xh) return 0;
+    float *xs=(float *)((char *)xh+xbytes), *ws=xs+T;
+    pack_half_rows<0><<<T,256,0,0>>>(xs,xh,(const char *)x,K,(uint64_t)K*4);
+    qwen_dense_row_scales<200><<<M,256,0,0>>>(ws,w,K,row_bytes(200,K));
+    if (!launched()) return 0;
+    const unsigned segment=K>4096 ? 1024 : K;
+    for (unsigned begin=0;begin<K;begin+=segment) {
+        const unsigned length=std::min(segment,K-begin);
+        if (!launch_qwen_q8_direct<200>(out,(const unsigned char *)w,xh,xs,ws,T,K,M,begin,length)) return 0;
+    }
+    return 1;
+}
+
 static int dense_q8_blas(float *out, const float *x, const char *w,
         unsigned T, unsigned K, unsigned M) {
     if (T>=32 && !(K%128) && ds4_rocm_is_gfx1151()) {
@@ -1564,6 +1609,14 @@ static int dense_q8_blas(float *out, const float *x, const char *w,
         }
         return 1;
     }
+    return dense_half_tiles<8>(out,x,w,T,K,M);
+}
+
+/* Rows of any reader type packed to F16 with a power-of-two row scale, an
+ * F16 GEMM with F32 accumulation, then the scales applied. */
+template<unsigned TYPE>
+static int dense_half_tiles(float *out, const float *x, const char *w,
+        unsigned T, unsigned K, unsigned M) {
     // Retain the measured row tiling with a 16 MiB packed-weight budget.
     const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(16)<<20)/((uint64_t)K*sizeof(__half)));
     const unsigned tile = std::min(M,bound >= 64 ? bound/64*64 : bound);
@@ -1577,10 +1630,10 @@ static int dense_q8_blas(float *out, const float *x, const char *w,
     pack_half_rows<0><<<T,256,0,0>>>(xs,xh,(const char *)x,K,(uint64_t)K*4);
     if (!launched()) return 0;
     const float zero = 0, one = 1;
-    const uint64_t rb = row_bytes(8,K);
+    const uint64_t rb = row_bytes(TYPE,K);
     for (unsigned r = 0; r < M; r += tile) {
         const unsigned n = std::min(tile,M-r);
-        pack_half_rows<8><<<n,256,0,0>>>(ws,wh,w+(uint64_t)r*rb,K,rb);
+        pack_half_rows<TYPE><<<n,256,0,0>>>(ws,wh,w+(uint64_t)r*rb,K,rb);
         if (!launched()) return 0;
         // Round both scaled Q8 weights and activations to F16.
         if (!dense_half_product(out+r,wh,xh,n,T,K,M,one,zero,"Qwen Q8 projection")) return 0;
@@ -2299,6 +2352,12 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (type == 8 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode)
         return dense_q8_blas((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
+    if (type == 200 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
+        g_cublas_ready && !g_quality_mode) {
+        if (ds4_rocm_is_gfx1151() && !(K%512))
+            return dense_f8_direct((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
+        return dense_half_tiles<200>((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
+    }
     if (g_cublas_ready && T >= 32 && K <= INT_MAX && M <= INT_MAX && T <= INT_MAX)
         return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,

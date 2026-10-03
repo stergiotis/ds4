@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "gguf-tools"))
 from kolibri_convert import Source  # noqa: E402
 
-TYPE_SIZES = {0: (1, 4), 8: (32, 34), 12: (256, 144), 30: (1, 2), 200: (128, 132)}
+TYPE_SIZES = {0: (1, 4), 8: (32, 34), 12: (256, 144), 30: (1, 2), 200: (512, 528)}
 
 
 def read_gguf(path):
@@ -79,10 +79,10 @@ def _deq(raw, typ, n0, nr):
         return (q * d).reshape(nr, n0)
     if typ == 200:
         import ml_dtypes
-        b = raw.reshape(nr, n0 // 128, 132)
-        d = b[:, :, :4].copy().view("<f4")
-        q = b[:, :, 4:].copy().view(ml_dtypes.float8_e4m3fn).astype(np.float32)
-        return (q * d).reshape(nr, n0)
+        b = raw.reshape(nr, n0 // 512, 528)
+        d = b[:, :, :16].copy().view("<f4")                                  # [nr, blocks, 4]
+        q = b[:, :, 16:].copy().view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+        return (q.reshape(nr, -1, 4, 128) * d[..., None]).reshape(nr, n0)
     raise ValueError(typ)
 
 

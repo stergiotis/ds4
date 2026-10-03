@@ -3,80 +3,80 @@
   "prompt": "The capital of France is",
   "n_prompt": 5,
   "gen_ids": [
-   95873,
-   119973,
-   60482,
-   105422,
-   23812,
-   12294,
-   10201,
-   78665
+   123249,
+   73777,
+   110715,
+   35743,
+   34126,
+   42984,
+   36726,
+   120651
   ],
-  "gen_text": " Ravens blackberries Genesung trembled Sche friinftySPR",
+  "gen_text": ".Textureiliencyлайн recount Providing-Jahr admiration-Q",
   "act_quant": false
  },
  "de_story": {
   "prompt": "Es war einmal ein kleiner Kolibri, der",
   "n_prompt": 10,
   "gen_ids": [
-   93584,
-   93570,
-   2554,
-   65226,
-   120166,
-   21420,
-   87143,
-   11456
+   103349,
+   2142,
+   84318,
+   9978,
+   65373,
+   121361,
+   101354,
+   13915
   ],
-  "gen_text": "hampton speeding question Rückmeldung-\n\nANNEL UAV puzz",
+  "gen_text": " Cullenash strukturellenchocoldarstellung;;iak Represent",
   "act_quant": false
  },
  "count": {
   "prompt": "1, 2, 3, 4, 5,",
   "n_prompt": 14,
   "gen_ids": [
-   48034,
-   83271,
-   83271,
-   13965,
-   28116,
-   103665,
-   67825,
-   46332
+   62305,
+   41556,
+   37443,
+   116734,
+   120112,
+   126567,
+   44632,
+   49973
   ],
-  "gen_text": " lefto engraving engraving� substringbeyregendesBlank",
+  "gen_text": " TÜV statewideindividu portugiesischen te_person dragged isotope",
   "act_quant": false
  },
  "chat_en_default": {
   "prompt": "<|im_start|>system\n# Reasoning effort\n\nReasoning effort is set to high. Think carefully through the task in the user's language, validate key assumptions, consider plausible alternatives, and prioritize correctness and clarity.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
   "n_prompt": 57,
   "gen_ids": [
-   54851,
-   110104,
-   92536,
-   100902,
-   31233,
-   113638,
-   81179,
-   100526
+   71893,
+   119919,
+   72042,
+   72581,
+   48675,
+   61002,
+   20212,
+   107456
   ],
-  "gen_text": "baijan Toolbar Antip Reiner Mechanical OpenStreetMap HülsenTurning",
+  "gen_text": " attribution ses Scorpio Betrachten Vorurteileenzie Decision.Contains",
   "act_quant": false
  },
  "chat_de_nothink": {
   "prompt": "<|im_start|>system\n# Reasoning effort\n\nReasoning is disabled. Proceed straight to answering according to the user's instructions.<|im_end|>\n<|im_start|>user\nErkläre kurz, was ein Kolibri ist.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
   "n_prompt": 48,
   "gen_ids": [
-   60715,
-   22377,
-   31644,
-   29776,
-   104202,
-   82618,
-   108909,
-   66304
+   73998,
+   61997,
+   39165,
+   89261,
+   79139,
+   88303,
+   45348,
+   110088
   ],
-  "gen_text": " DHLomatic erzielte scholarly finalists zebraahndung Jong",
+  "gen_text": " Enthalten Koordinaten Licöchtest exoplanet�ン Ahmad slows",
   "act_quant": false
  }
 }

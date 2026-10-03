@@ -36,8 +36,9 @@ from glm53_quantize import (GGUF_ALIGNMENT, GGUF_ARRAY, GGUF_STRING, GGUF_VERSIO
 
 ARCH = "kolibri1"
 # F8_B128 is ds4's own type (no ggml equivalent): the release's FP8 weights
-# kept bit-exact, row-local.  Each 128-element block is the fp32 scale of
-# its 128x128 source block followed by the 128 e4m3 bytes (132 bytes).
+# kept bit-exact, row-local.  Each 512-element block holds the fp32 scales of
+# its four 128-wide source blocks, then the 512 e4m3 bytes (528 bytes, so the
+# payload stays 16-byte aligned).
 QTYPES = {"F32": 0, "Q8_0": 8, "Q4_K": 12, "BF16": 30, "F8_B128": 200}
 SRC_DTYPES = {"F8_E4M3": 1, "BF16": 2, "F32": 4}
 
@@ -87,10 +88,12 @@ class Source:
             fail(f"{key}: F8_B128 needs an F8_E4M3 source, got {dtype}")
         _, sshape, sdata = self.raw(key + "_scale_inv")
         o, i = shape
-        s = sdata.view("<f4").reshape(sshape)
-        out = np.empty((o, i // 128, 132), np.uint8)
-        out[:, :, :4] = np.repeat(s, 128, axis=0).reshape(o, i // 128, 1).view(np.uint8)
-        out[:, :, 4:] = data.reshape(o, i // 128, 128)
+        if i % 512:
+            fail(f"{key}: F8_B128 rows must be a multiple of 512, got {i}")
+        s = np.repeat(sdata.view("<f4").reshape(sshape), 128, axis=0)      # [o, i/128]
+        out = np.empty((o, i // 512, 528), np.uint8)
+        out[:, :, :16] = s.reshape(o, i // 512, 4).view(np.uint8)
+        out[:, :, 16:] = data.reshape(o, i // 512, 512)
         return out.tobytes()
 
     def raw(self, key):
@@ -145,7 +148,7 @@ class Quantizer:
 
     def row_size(self, qtype, n):
         if qtype == "F8_B128":
-            return n // 128 * 132
+            return n // 512 * 528
         if qtype == "F32":
             return 4 * n
         if qtype == "BF16":
@@ -248,6 +251,7 @@ def model_records(cfg, args, n_tensors):
         kv_u32(p + "expert_feed_forward_length", cfg["moe_intermediate_size"]),
         kv_u32(p + "expert_shared_feed_forward_length", cfg["shared_expert_intermediate_size"]),
         kv_bool(p + "expert_weights_norm", bool(cfg["norm_topk_prob"])),
+        kv_u32(p + "f8_block", 512),        # F8_B128 layout: 512 values per block
         kv_f32(p + "expert_weights_scale", 1.0),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
     ]

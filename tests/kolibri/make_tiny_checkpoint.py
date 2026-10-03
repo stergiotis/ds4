@@ -7,7 +7,7 @@ numpy reference and the ds4 code paths without the 79 GB download.
     uv run make_tiny_checkpoint.py --tokenizer-dir HF_SNAPSHOT --out DIR
 
 Shapes keep everything the kernels care about (head_dim 128, GQA 4:1 ... here
-8:2, top-6 sigmoid routing, intermediate 256, hidden a multiple of 256) and
+8:2, top-6 sigmoid routing, intermediate 512, hidden a multiple of 512) and
 shrink the rest. The window is 9 so short prompts cross it.
 """
 
@@ -35,8 +35,8 @@ TINY = {
     "rope_theta": 10000.0,
     "num_experts": 16,
     "num_experts_per_tok": 6,
-    "moe_intermediate_size": 256,
-    "shared_expert_intermediate_size": 256,
+    "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512,
     "norm_topk_prob": False,
     "attention_bias": False,
     "attention_dropout": 0.0,

@@ -929,7 +929,7 @@ static const ds4_shape DS4_SHAPE_KOLIBRI_MINI = {
     .n_expert = 16,
     .n_expert_used = 6,
     .n_expert_shared = 1,
-    .n_ff_exp = 256,
+    .n_ff_exp = 512,
     .n_sliding_window = 9,
     .rms_eps = 1.0e-6f,
     .expert_weight_scale = 1.0f,
@@ -1088,6 +1088,8 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
 }
 
 static bool g_ds4_kolibri_sliding[DS4_MAX_LAYER];
+/* kolibri1.f8_block: values per F8_B128 block in this file (0 = none) */
+static uint32_t g_ds4_kolibri_f8_block;
 
 static bool ds4_model_is_kolibri(void) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI;
@@ -2425,7 +2427,7 @@ static const gguf_type_info gguf_types[] = {
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
     /* ds4's own: FP8 e4m3 with one fp32 scale per 128 (see DS4_TENSOR_F8_B128) */
-    [200] = {"f8_b128", 128, 132},
+    [200] = {"f8_b128", 512, 528},
 };
 
 enum {
@@ -2445,8 +2447,9 @@ enum {
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
     /* FP8 e4m3 weights kept exactly as released block-scaled checkpoints
-     * store them, made row-local: each block of 128 values is the fp32 scale
-     * followed by 128 e4m3 bytes.  No ggml equivalent. */
+     * store them, made row-local: each block of 512 values is the fp32
+     * scales of its four 128-wide source blocks followed by 512 e4m3 bytes.
+     * No ggml equivalent. */
     DS4_TENSOR_F8_B128  = 200,
 };
 
@@ -6068,12 +6071,22 @@ static void weights_validate_glm_dsa_layout(
 
 /* Dense projections Q8_0/BF16/F16/F32 (the qwen4 set), routed experts any
  * routed type; norms, router and selection bias are F32. */
+/* An F8_B128 tensor is only trusted with the converter's layout marker:
+ * an earlier 128-value layout had the same size per weight. */
+static void kolibri_expect_f8_layout(const ds4_tensor *t) {
+    if (t && t->type == DS4_TENSOR_F8_B128 && g_ds4_kolibri_f8_block != 512) {
+        ds4_die("Kolibri F8_B128 tensors need kolibri1.f8_block = 512; reconvert with gguf-tools/kolibri_convert.py");
+    }
+}
+
 static void kolibri_expect_dense(const ds4_tensor *t, uint64_t d0, uint64_t d1) {
+    kolibri_expect_f8_layout(t);
     if (t && t->type == DS4_TENSOR_F8_B128) tensor_expect_layout(t, t->type, 2, d0, d1, 0);
     else tensor_expect_qwen4_dense_layout(t, 2, d0, d1, 0);
 }
 
 static void kolibri_expect_experts(const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
+    kolibri_expect_f8_layout(t);
     if (t && t->type == DS4_TENSOR_F8_B128) tensor_expect_layout(t, t->type, 3, d0, d1, d2);
     else tensor_expect_qwen4_expert_layout(t, d0, d1, d2);
 }
@@ -7448,6 +7461,8 @@ static void config_validate_kolibri_model(const ds4_model *m) {
     if (n != DS4_N_LAYER) ds4_die("kolibri1.attention.sliding_window_pattern length != block_count");
     memset(g_ds4_kolibri_sliding, 0, sizeof(g_ds4_kolibri_sliding));
     for (uint32_t il = 0; il < n; il++) g_ds4_kolibri_sliding[il] = pattern[il] != 0;
+    g_ds4_kolibri_f8_block = 0;
+    (void)model_get_u32(m, "kolibri1.f8_block", &g_ds4_kolibri_f8_block);
 }
 
 static void config_validate_model(const ds4_model *m) {
@@ -62692,6 +62707,14 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
     }
     if (!ds4_gpu_tensor_write(g->x, 0, g->host_x, (uint64_t)T * E * sizeof(float))) return false;
     if (!glm_graph_begin_commands_if_needed()) return false;
+    /* DS4_KOLIBRI_TIMING=1: GPU ms per stage group, summed over layers
+     * (syncs after every stage; diagnostics only). */
+    static int timing = -1;
+    if (timing < 0) timing = getenv("DS4_KOLIBRI_TIMING") != NULL;
+    double prof[5] = {0}, prof_last = timing ? now_sec() : 0.0;
+#define KOLIBRI_PROF(i_) do { if (timing && ok) { ok = ds4_gpu_end_commands() != 0; \
+        const double now_ = now_sec(); prof[i_] += now_ - prof_last; prof_last = now_; \
+        ok = ok && glm_graph_begin_commands_if_needed(); } } while (0)
     bool ok = ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, NULL, NULL, NULL, NULL, 0, 0, 0,
                                               m->map, m->size, 0, w->layer[0].attn_norm->abs_offset,
                                               T, E, DS4_RMS_EPS) != 0;
@@ -62702,18 +62725,23 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
                                                     : w->output_norm->abs_offset;
         ok = qwen4_gemv(g->q, m, l->attn_q, g->xn, T) &&
              qwen4_gemv(g->k, m, l->attn_k, g->xn, T) &&
-             qwen4_gemv(g->v, m, l->attn_v, g->xn, T) &&
+             qwen4_gemv(g->v, m, l->attn_v, g->xn, T);
+        KOLIBRI_PROF(0);
+        ok = ok &&
              ds4_gpu_kolibri_qk_prep_tensor(g->q, g->k, g->v, g->kc[il], g->vc[il], m->map, m->size,
                                             l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                             T, H, Hkv, D, pos0, g->cache_rows[il], sliding,
                                             DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
              ds4_gpu_kolibri_attention_tensor(g->attn, g->q, g->kc[il], g->vc[il], T, H, Hkv, D, pos0,
-                                              g->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u) &&
-             qwen4_gemv(g->h, m, l->attn_output, g->attn, T) &&
+                                              g->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u);
+        KOLIBRI_PROF(1);
+        ok = ok && qwen4_gemv(g->h, m, l->attn_output, g->attn, T) &&
              ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, g->h, NULL, NULL, NULL, 0, 0, 0,
                                              m->map, m->size, l->attn_post_norm->abs_offset,
-                                             l->ffn_norm->abs_offset, T, E, DS4_RMS_EPS) &&
-             kolibri_graph_moe(g, m, l, T, next);
+                                             l->ffn_norm->abs_offset, T, E, DS4_RMS_EPS);
+        KOLIBRI_PROF(2);
+        ok = ok && kolibri_graph_moe(g, m, l, T, next);
+        KOLIBRI_PROF(3);
     }
     /* xn now holds the final-normed rows. */
     if (ok && logits_out) {
@@ -62726,7 +62754,13 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
             ds4_gpu_tensor_free(last);
         }
     }
+    KOLIBRI_PROF(4);
+#undef KOLIBRI_PROF
     if (!ds4_gpu_end_commands()) ok = false;
+    if (timing) {
+        fprintf(stderr, "ds4: Kolibri forward pos=%u T=%u ms: qkv %.1f attn %.1f o+norm %.1f moe %.1f head %.1f\n",
+                pos0, T, 1e3 * prof[0], 1e3 * prof[1], 1e3 * prof[2], 1e3 * prof[3], 1e3 * prof[4]);
+    }
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out,
                                  (uint64_t)(all_rows ? T : 1u) * DS4_N_VOCAB * sizeof(float)) != 0;
@@ -69606,12 +69640,12 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
     const uint64_t n = t->dim[0];
     switch (t->type) {
     case DS4_TENSOR_F8_B128: {
-        const uint64_t blocks = n / 128u;
-        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 132u;
-        for (uint64_t b = 0; b < blocks; b++, p += 132u) {
-            float d;
-            memcpy(&d, p, sizeof(d));
-            for (uint32_t j = 0; j < 128u; j++) out[b * 128u + j] = d * f8_e4m3_to_f32(p[4 + j]);
+        const uint64_t blocks = n / 512u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 528u;
+        for (uint64_t b = 0; b < blocks; b++, p += 528u) {
+            float d[4];
+            memcpy(d, p, sizeof(d));
+            for (uint32_t j = 0; j < 512u; j++) out[b * 512u + j] = d[j / 128u] * f8_e4m3_to_f32(p[16 + j]);
         }
         break;
     }
