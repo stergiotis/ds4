@@ -2359,8 +2359,9 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
-    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
-        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
+    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine) &&
+        !ds4_engine_is_kolibri(engine)) {
+        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 or Kolibri 1 model\n");
         ds4_engine_close(engine);
         ds4_dist_options_free(cfg.dist);
         ds4_prompt_prefix_free(&cfg.gen.prefix);

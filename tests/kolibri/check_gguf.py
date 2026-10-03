@@ -101,7 +101,7 @@ def main():
          "ffn_gate_shexp": "mlp.shared_experts.gate_proj.weight",
          "ffn_up_shexp": "mlp.shared_experts.up_proj.weight",
          "ffn_down_shexp": "mlp.shared_experts.down_proj.weight"}
-    worst = {}
+    worst, rms = {}, {}
     skipped = 0
     for name, (ne, typ, off) in tensors.items():
         if typ not in TYPE_SIZES or typ == 12:
@@ -120,6 +120,7 @@ def main():
                     got = get(e * per, (e + 1) * per, off)
                     err = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
                     worst[kind] = max(worst.get(kind, 0), err)
+                    rms[kind] = max(rms.get(kind, 0), float(np.linalg.norm(got - ref) / max(np.linalg.norm(ref), 1e-30)))
                 continue
             ref = src.f32(f"model.layers.{l}.{m[kind]}")
         else:
@@ -133,8 +134,9 @@ def main():
         err = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
         key = parts[2] if parts[0] == "blk" else name
         worst[key] = max(worst.get(key, 0), err)
+        rms[key] = max(rms.get(key, 0), float(np.linalg.norm(got - ref) / max(np.linalg.norm(ref), 1e-30)))
     for k, v in sorted(worst.items()):
-        print(f"  {k:28s} max |err| / max |w| = {v:.2e}")
+        print(f"  {k:28s} max |err| / max |w| = {v:.2e}   |err| / |w| (rms) = {rms[k]:.2e}")
     print(f"checked {len(tensors) - skipped} tensors, skipped {skipped} (Q4_K)")
     bad = {k: v for k, v in worst.items() if v > 5e-3}
     if bad:
