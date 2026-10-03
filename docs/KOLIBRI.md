@@ -2,10 +2,31 @@
 
 [README](../README.md) | [Models](MODELS.md) | [Strix Halo](STRIX_HALO.md)
 
-Work-in-progress notes for running
 [Aleph-Alpha/Kolibri-1](https://huggingface.co/Aleph-Alpha/Kolibri-1)
-(Apache-2.0, released 2026-10-03) on ROCm, first target Strix Halo
-(`gfx1151`, 128 GB unified memory).
+(Apache-2.0, released 2026-10-03) on ROCm, tested on Strix Halo (`gfx1151`,
+Radeon 8060S, 128 GB unified memory). Single GPU, resident weights; no SSD
+streaming, tensor parallelism or MTP.
+
+## Quick start
+
+```sh
+make strix-halo                      # see STRIX_HALO.md for rocWMMA headers
+make -C gguf-tools quants-shared
+hf download Aleph-Alpha/Kolibri-1    # 78.9 GB FP8 checkpoint
+python3 gguf-tools/kolibri_convert.py --hf-dir <snapshot> \
+    --dense f8_b128 --experts f8_b128 --out gguf/Kolibri-1-F8.gguf   # 75.7 GiB, lossless
+# or, 42.8 GiB:  --dense f8_b128 --experts q4_k --out gguf/Kolibri-1-Q4_K.gguf
+./ds4 --rocm -m gguf/Kolibri-1-F8.gguf --nothink -p "Was ist ein Kolibri?"
+./ds4 --rocm -m gguf/Kolibri-1-F8.gguf --think-level 20 -p "..."    # low effort
+./ds4-server --rocm -m gguf/Kolibri-1-F8.gguf --ctx 32768          # model id kolibri-1
+```
+
+The converter needs `numpy`; `tests/kolibri/pyproject.toml` has the harness
+environment (`uv run --project tests/kolibri python gguf-tools/...`).
+`--think-level` maps 1-33/34-66/67-100 to the template's low/medium/high
+sentences and 0 to none; the server takes `reasoning_effort` (none, minimal,
+low, medium, high, xhigh, max) or `chat_template_kwargs.enable_thinking`, and
+the aliases `kolibri-1-nothink` / `kolibri-1-reasoner`.
 
 ## Model, as implemented by the reference
 
@@ -75,76 +96,166 @@ Tools are listed as JSON lines inside `<tools></tools>`; calls are Hermes
 style `<tool_call>\n{"name": ..., "arguments": ...}\n</tool_call>`, and tool
 results go back in a user turn as `<tool_response>...</tool_response>`.
 
-## Plan
+## Design
 
 ### Base
 
-The `kolibri` branch is antirez/ds4#1070 (Qwen3.8 Flash Next on ROCm, not yet
-merged upstream) plus the Strix Halo `prefetch` work. #1070 matters because it
-is the only ROCm "island" for a GQA model: f16 K/V cache, `attention<D>` with
-key-split partials, type-templated decode MoE (`moe_mv<TYPE>`), expert prefill
-(`matrix<TYPE>` and the WMMA `matrix_half_tile` for Q2/Q4/MXFP4), dense
-matvec/BLAS paths, argmax. Qwen3.8 Flash Next also has hidden size 2560.
+The `kolibri` branch is antirez/ds4#1070 (Qwen3.8 Flash Next on ROCm, not
+merged upstream) plus the Strix Halo `prefetch` work. #1070 provides the only
+ROCm "island" for a GQA MoE model, whose type-templated projection and expert
+kernels Kolibri reuses. Kolibri has its own family/variant/shape profile, one
+graph (`ds4_kolibri_gpu_graph`, `forward_tokens(T)` for prefill and decode)
+and family branches only at engine open, session sync/eval/rewind, payload
+save/load and the server renderer.
 
-Kolibri follows the qwen4 pattern rather than threading through the
-DeepSeek/GLM graph: its own family/variant/shape profile, one graph struct
-with `forward_tokens(T)` serving prefill and decode, and family branches only
-at engine open, session sync/eval, payload save/load and the server renderer.
+### Weight formats
 
-### Weight format
+| GGUF | Size | Linear layers | Agreement with the reference (below) |
+| --- | ---: | --- | --- |
+| `--dense f8_b128 --experts f8_b128` | 75.7 GiB | the release's FP8, bit-exact | top-1 0.975, KL 0.008 |
+| `--dense f8_b128 --experts q4_k` | 42.8 GiB | FP8 dense, Q4_K routed experts | top-1 0.903, KL 0.206 |
+| `--dense q8_0 --experts q8_0` | 78.0 GiB | requantized Q8_0 | top-1 0.929, KL 0.097 |
 
-ds4 has no FP8 weight type, and gfx1151 has no FP8 WMMA or FP8 conversion
-instructions. The converter (`gguf-tools/kolibri_convert.py`) dequantizes the
-FP8 blocks (`e4m3 * scale_inv`) and requantizes with `libds4quants`:
+`F8_B128` (GGUF type 200, ds4's own; no ggml equivalent) keeps the
+checkpoint's e4m3 bytes and fp32 128×128 block scales row-local: per 512
+values the four scales of its 128-wide source blocks, then 512 bytes (528
+bytes, 8.25 bits per weight, payload 16-byte aligned). The converter writes
+`kolibri1.f8_block = 512`; ds4 refuses F8 tensors without it. gfx1151 has no
+FP8 instructions, but e4m3 → f16 is a shift and a mask into an f16 pattern
+times 2^8, folded into the scale, so decoding costs about as much as Q8_0.
 
-1. **Q8_0** for every linear layer including the experts (about 83 GB), BF16
-   embeddings, F32 norms, router and expert bias, LM head Q8_0 or BF16
-   (decided by the logit comparison). Q8_0 (32-element blocks, f16 scale)
-   adds at most half a step, 0.4% of the block maximum, to each FP8 value;
-   this is the fidelity baseline. #1070 decodes Q8_0 experts with `moe_mv<8>`; Q8_0
-   prefill uses the generic `matrix<8>` until a WMMA tile is added.
-2. **Q4_K experts** + Q8_0 dense (about 47 GB): fits next to other resident
-   workloads and uses #1070's WMMA prefill tiles.
+Q8_0 was the first plan and is supported, but requantization moves this
+model visibly (each FP8 value gains up to half a Q8_0 step, 1% RMS): the raw
+prompt "1, 2, 3, 4, 5," continues " 5, 5, 5" instead of " 6, 7, 8", and
+numpy with Q8_0-rounded weights reproduces exactly that. Use F8_B128 for
+fidelity and Q4_K for memory.
 
-Native FP8 in GGUF stays an option for later: e4m3 → f16 is a shift, a mask
-and one multiply folded into the block scale, and it would save ~4.5 GB over
-Q8_0, but needs its own kernels in every path.
+Embeddings and LM head stay BF16, norms, router and expert bias F32.
 
-### Reused vs new
+### Kernels
 
-| Piece | Source |
+| Piece | Implementation |
 | --- | --- |
-| Q8_0 / Q4_K / BF16 matvec and prefill GEMM | #1070 `qwen4_rocm::matvec_dispatch`, `dense_blas` |
-| Routed experts, decode and prefill | #1070 `moe_mv_dispatch`, `expert_lists`, `matrix_dispatch` (K=2560, M=512, top-6) |
-| Shared expert | same kernels, as the (NS+1)-th expert slot, weight 1 |
-| RMSNorm (input, sandwich, final) | existing ROCm `rms_norm_weight` / `add_rms_norm_weight` |
-| Argmax / sampling | existing |
-| **New:** QK prep | q/k/v split, weighted per-head RMSNorm, neox RoPE on sliding layers only, f16 K/V store (ring of 513+chunk rows for sliding layers, linear for full layers) |
-| **New:** attention | GQA 48/4, D=128, sliding window or full causal, no output gate (#1070's kernel multiplies by `sigmoid(gate)`) |
-| **New:** router | fp32 logits, top-6 on `logits + bias`, weight `sigmoid(logit)`, no renormalisation (#1070's router is softmax + renorm, GLM's renormalises) |
-| **New:** tokenizer | the Kolibri split regex (close to qwen35's, without `\p{M}`), single-digit numbers |
-| **New:** chat / server | ChatML renderer with reasoning sentences, Hermes JSON `<tool_call>` parser |
+| Dense projections | #1070 matvec (decode); prefill: the gfx1151 direct WMMA kernel templated on the weight format (F8 decode in the fragment load), F16-tile BLAS elsewhere |
+| Routed experts | #1070 `moe_mv` (decode; the shared expert rides as an extra slot with weight 1) and the WMMA `matrix_half_tile` (prefill, F8 and Q4_K) |
+| F8 reads | `value`/`value4` and a 16-bytes-per-lane `dot_f8` in the #1070 readers |
+| QK prep (new) | weighted per-head RMSNorm, neox RoPE on sliding layers only, f16 K/V store |
+| Attention (new) | prefill: WMMA flash attention, 16 queries × 4 heads per block sharing K/V tiles, S^T = K Q^T so softmax is lane-local; decode: one wave per (KV head, key split) serving all 12 query heads of the group |
+| Router (new) | top-6 on `logits + bias`, weight `sigmoid(logit)`, no renormalisation |
+| Sandwich norm (new) | fused `x += rms(h)·w_post; xn = rms(x)·w_next`, also folding the MoE reduce |
 
 ### KV cache
 
-40 sliding layers need only 513 positions each; a ring buffer per layer (plus
-room for one prefill chunk) keeps them at about 1 MB/layer in f16. The 10 full
-layers grow with context: 4 KV heads × 128 × 2 (K, V) × 2 bytes = 4 KB per
-token per layer, 40 KB per token, 10 GB at 256K. An FP8 (e4m3) KV cache for
-the full layers halves that, after the f16 path is correct.
+f16. Sliding layers keep a ring of `window - 1 + chunk` rows (position p in row
+p % rows); full layers one row per position: 4 KV heads × 128 × 2 × 2 bytes =
+2 KiB per token per full layer, 20 KiB per token for the 10 full layers,
+5 GiB at the native 262144 context. Rewind stays on the live KV when it goes
+back at most one prefill chunk (the sliding rings' slack), otherwise the
+session re-prefills.
 
-### Correctness harness
+## Correctness
 
-- `tests/kolibri/make_tokenizer_goldens.py` → `tests/golden/kolibri/tokenizer.json`:
-  ids from HF `tokenizers` for raw strings and rendered chats (thinking on/off,
-  reasoning efforts, multi-turn, a tool-call round trip).
-- `tests/kolibri/kolibri_ref.py`: numpy forward pass from the FP8 safetensors
-  (mmap, dequantized one layer at a time, fp32 math, optional vLLM-style FP8
-  activation quantization), prefill plus cached greedy decode.
-- `tests/kolibri/make_golden.py` → `tests/golden/kolibri/*.npz`: per-layer
-  residuals, routing, top logits and greedy continuations for short prompts.
-- The C side compares against these: the CPU reference first, then ROCm.
+Harness (`tests/kolibri/`, fixtures in `tests/golden/kolibri*/`):
 
-The reference cannot be cross-checked against vLLM here (vLLM's FP8 MoE needs
-CUDA or MI300-class ROCm); the numpy code is checked by its own consistency
-(cached decode = full recompute), sensible greedy text and low perplexity.
+- `make_tokenizer_goldens.py`: HF `tokenizers` ids for 15 raw strings
+  (digits, contractions, whitespace, code, combining marks, CJK, emoji) and 7
+  rendered chats (thinking on/off, efforts, multi-turn, tool round trip).
+  ds4 matches all 22 (`test_tokenizer.py`); the CLI renders the chats to the
+  same ids, and `./ds4_test --server` checks the server renderer against
+  HF's `apply_chat_template` text and parses Hermes calls.
+- `kolibri_ref.py`: numpy forward from the FP8 safetensors (mmap, one layer at
+  a time, fp32, optional vLLM-style FP8 activations, optional Q8_0-rounded
+  weights), with prefill and cached greedy decode; `test_ref_consistency.py`
+  checks cached decode against full recompute.
+- `make_golden.py`: per-layer residuals, routing, logits and 16-token greedy
+  continuations for 5 prompts (raw English, German and digits, an English chat
+  with thinking, a German chat without). The reference's own text is sensible
+  ("The capital of France is" → " Paris. The capital of Germany is Berlin.",
+  the German chat → "Ein Kolibri ist ein kleiner, farbenprächtiger Vogel ...").
+- `compare_golden.py`: runs `ds4 --first-token-test` with `DS4_KOLIBRI_*`
+  settings on the C CPU reference or the ROCm graph.
+- `make_tiny_checkpoint.py`: a random 10-layer Kolibri in the release format
+  (window 9) for fast checks of every code path.
+
+Results:
+
+- C CPU reference vs numpy (tiny model, F32 or F8 weights): 2e-6 on every layer,
+  identical routing and greedy output.
+- ROCm vs numpy, real Kolibri-1, F8 GGUF: all 5 prompts give identical
+  16-token greedy continuations, top-1 agreement 1.000 at every prompt position
+  (0.982 on the chat with thinking), residual error ≤ 8e-3.
+- Teacher-forced over `tf_text.txt` (196 tokens, German, English, Python)
+  against the fp32 reference (`teacher_forced.py`):
+
+  | | top-1 | KL (nats) | perplexity |
+  | --- | ---: | ---: | ---: |
+  | reference, fp32 | - | - | 7.04 |
+  | reference with vLLM-style FP8 activations | 0.903 | 0.157 | 7.00 |
+  | ds4 F8, prefill paths | 0.975 | 0.008 | 7.11 |
+  | ds4 F8, token-by-token decode | 0.975 | 0.008 | 7.10 |
+  | ds4 Q8_0 | 0.929 | 0.097 | 6.93 |
+  | ds4 Q4_K experts | 0.903 | 0.206 | 6.75 |
+
+  ds4's F8 path sits 20× closer to the fp32 reference than the reference's
+  own FP8-activation execution. Exact greedy agreement over long generations
+  is not a meaningful target beyond that: the router has many near-ties among
+  384 experts (a 6th/7th selection gap of 5e-4 flips under f16 rounding), so
+  any two FP8 implementations, vLLM included, part ways on some prompts.
+- Serving (`server_smoke.py`): German chat without reasoning ("Die Hauptstadt
+  von Bayern ist München."), English with low reasoning (reasoning and
+  content separate, also streamed), and a `get_weather` tool round trip.
+
+The reference could not be cross-checked against vLLM itself on this machine
+(vLLM's FP8 MoE targets CUDA and MI300-class ROCm).
+
+## Performance
+
+Strix Halo (Radeon 8060S, 128 GB), `tests/kolibri/bench.sh`: `ds4-bench`
+on `speed-bench/promessi_sposi.txt`, cold prefill of the given context, then
+128 greedy tokens at that context; median of three runs (spread under 2%
+except the first, cold 512 run). Memory is the peak GPU allocation (GTT +
+VRAM) above idle; host RSS stays under 0.8 GiB.
+
+| GGUF | context | prefill t/s | decode t/s | GPU memory |
+| --- | ---: | ---: | ---: | ---: |
+| F8 (75.7 GiB) | 512 | 674 | 36.5 | 76.2 GiB |
+| F8 | 8192 | 922 | 36.1 | 76.9 GiB |
+| F8 | 32768 | 776 | 31.8 | 77.4 GiB |
+| Q4_K experts (42.8 GiB) | 512 | 611 | 36.8 | 43.2 GiB |
+| Q4_K experts | 8192 | 918 | 35.6 | 43.9 GiB |
+| Q4_K experts | 32768 | 773 | 31.4 | 44.4 GiB |
+
+Starting point (first correct version, F8, 2K context): 210 t/s prefill,
+21 t/s decode. Decode at 2K spends per token about 4.8 ms on QKV, 4.2 ms on
+attention, 4.6 ms on the output projection and norms, 10.6 ms on the experts
+and 3.9 ms on the LM head (`DS4_KOLIBRI_TIMING=1`, which syncs per stage).
+Bandwidth would allow roughly 50 t/s for F8; see known gaps.
+
+Q4_K saves 33 GiB at the same speed, so it fits next to other resident
+workloads (the machine's other 65 GB service, for example).
+
+## Known gaps
+
+- **FP8 KV cache for the full layers** is not implemented (f16; 5 GiB at
+  262144 tokens fits next to the 76 GiB model).
+- **Disk KV checkpoints** (`--kv-disk-dir`) and session payload save/load
+  refuse Kolibri sessions with an error; live KV reuse works.
+- **Decode is launch-bound**: ~12 kernels per layer, 600 per token; F8 and
+  Q4_K decode at the same speed although Q4_K reads half the bytes. GPU graph
+  capture is the next step but ds4's ROCm runtime launches on the legacy
+  default stream, which cannot be captured; kernel fusion (QKV + prep,
+  router + expert dispatch) is the alternative.
+- **Prefill**: the routed experts (~60% at 2K) and, at 32K, attention dominate.
+  The WMMA expert tiles are generic #1070 code; an F8-specific tile and a
+  wider attention block are the obvious next steps.
+- **Thinking prefill**: the server prefills `<think>\n` when thinking is on
+  (the template leaves it to the model) so Qwen's reasoning machinery applies;
+  the reference's own first output in that position is `<think>\n`. The CLI
+  follows the template exactly.
+- **Streamed content** after reasoning starts with the template's `\n\n`
+  separator (the non-streamed response trims it); shared with the Qwen path.
+- **No top-k in the CLI** (the release recommends top-k 128); the server
+  accepts `top_k`.
+- **llama.cpp** has no Kolibri support yet (no issue or PR as of 2026-10-03),
+  so there is no comparison.
+- Batched multi-session decode runs sessions one at a time.
