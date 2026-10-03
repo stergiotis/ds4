@@ -15441,6 +15441,12 @@ static bool send_models(server *s, int fd) {
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    } else if (ds4_engine_is_kolibri(s->engine)) {
+        append_model_json(&b, s, "kolibri-1");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "kolibri-1-nothink");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "kolibri-1-reasoner");
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
         buf_putc(&b, ',');
