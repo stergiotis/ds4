@@ -190,6 +190,7 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "rocm/ds4_rocm_deepseek4_vision.cuh"
 
 #include "rocm/ds4_rocm_qwen4.cuh"
+#include "rocm/ds4_rocm_kolibri.cuh"
 
 #include "rocm/ds4_rocm_tp.cuh"
 

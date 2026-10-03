@@ -3584,6 +3584,26 @@ int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *p
                                 const ds4_qwen4_vision_weights *w);
 /* prefill dense GEMM (f32/f16/q8_0 rows, 32x32 tiles) and the batched hc mix
  * pieces */
+/* Kolibri 1 (ROCm only, rocm/ds4_rocm_kolibri.cuh). Q/K/V rows are f32
+ * [T][heads*D]; caches are f16 [cache_rows][Hkv*D] with position p in row
+ * p % cache_rows.  window 0 means full causal attention. */
+int ds4_gpu_kolibri_qk_prep_tensor(ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v, ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
+        const void *map, uint64_t size, uint64_t qn_off, uint64_t kn_off,
+        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, uint32_t cache_rows,
+        int rope, float freq_base, float eps);
+int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc, uint32_t T, uint32_t H, uint32_t Hkv,
+        uint32_t D, uint32_t pos0, uint32_t cache_rows, uint32_t window);
+int ds4_gpu_kolibri_router_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const void *map, uint64_t size, uint64_t bias_off,
+        uint32_t T, uint32_t NE, uint32_t NS, uint32_t stride, float scale);
+int ds4_gpu_kolibri_norm_add_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *xn,
+        const ds4_gpu_tensor *h, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *shared, uint32_t NS, uint32_t pstride, uint32_t wstride,
+        const void *map, uint64_t size, uint64_t post_off, uint64_t next_off,
+        uint32_t T, uint32_t D, float eps);
+
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
