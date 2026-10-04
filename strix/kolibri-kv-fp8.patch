@@ -1,0 +1,414 @@
+diff --git a/ds4.c b/ds4.c
+index a267a81..f74a297 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -62577,6 +62577,7 @@ typedef struct {
+     ds4_gpu_tensor *sh_gate, *sh_up, *sh_mid, *sh_out, *logits;
+     ds4_gpu_tensor *kc[DS4_MAX_LAYER], *vc[DS4_MAX_LAYER];
+     uint32_t cache_rows[DS4_MAX_LAYER];
++    bool kv_fp8[DS4_MAX_LAYER];   /* E4M3 rows with per-row scales */
+     float *host_x;
+ } ds4_kolibri_gpu_graph;
+ 
+@@ -62635,11 +62636,15 @@ static bool kolibri_graph_alloc(ds4_kolibri_gpu_graph *g, uint32_t ctx_cap, uint
+         (g->sh_gate = qwen4_graph_alloc_f32(T * F)) && (g->sh_up = qwen4_graph_alloc_f32(T * F)) &&
+         (g->sh_mid = qwen4_graph_alloc_f32(T * F)) && (g->sh_out = qwen4_graph_alloc_f32(T * E)) &&
+         (g->logits = qwen4_graph_alloc_f32((uint64_t)g->n_logit_rows * DS4_N_VOCAB));
++    /* DS4_KOLIBRI_KV_FP8=1: the full-attention layers keep K/V as E4M3 with a
++     * scale per row and KV head (lossy; the sliding rings stay f16). */
++    const bool fp8 = getenv("DS4_KOLIBRI_KV_FP8") && strcmp(getenv("DS4_KOLIBRI_KV_FP8"), "0") != 0;
+     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+         const uint64_t rows = kolibri_kv_rows(il, ctx_cap, cap_tokens);
+         g->cache_rows[il] = (uint32_t)rows;
+-        ok = (g->kc[il] = ds4_gpu_tensor_alloc(rows * kv_dim * 2u)) &&
+-             (g->vc[il] = ds4_gpu_tensor_alloc(rows * kv_dim * 2u));
++        g->kv_fp8[il] = fp8 && !ds4_kolibri_layer_is_sliding(il);
++        const uint64_t bytes = g->kv_fp8[il] ? rows * (kv_dim + DS4_N_HEAD_KV * 4u) : rows * kv_dim * 2u;
++        ok = (g->kc[il] = ds4_gpu_tensor_alloc(bytes)) && (g->vc[il] = ds4_gpu_tensor_alloc(bytes));
+     }
+     if (ok) ok = (g->host_x = malloc(T * E * sizeof(float))) != NULL;
+     if (!ok) {
+@@ -62817,12 +62822,13 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
+              ds4_gpu_kolibri_qk_prep_tensor(q, k, v, g->kc[il], g->vc[il], m->map, m->size,
+                                             l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                                             T, H, Hkv, D, pos0, g->cache_rows[il], sliding,
+-                                            DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
++                                            DS4_ROPE_FREQ_BASE, DS4_RMS_EPS, g->kv_fp8[il]) &&
+              kolibri_mark("qk norm+rope+store", 0) &&
+              ds4_gpu_kolibri_attention_tensor(g->attn, q, g->kc[il], g->vc[il], T, H, Hkv, D, pos0,
+-                                              g->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u) &&
++                                              g->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u,
++                                              g->kv_fp8[il]) &&
+              kolibri_mark(sliding ? "attention sliding" : "attention full",
+-                          keys * Hkv * D * 2u * sizeof(uint16_t));
++                          keys * Hkv * 2u * (g->kv_fp8[il] ? D + 4u : D * sizeof(uint16_t)));
+         KOLIBRI_PROF(1);
+         ok = ok && qwen4_gemv(g->h, m, l->attn_output, g->attn, T) &&
+              kolibri_mark("o matvec", l->attn_output->bytes) &&
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index 1e6e7ed..ace81b7 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -3586,15 +3586,16 @@ int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *p
+  * pieces */
+ /* Kolibri 1 (ROCm only, rocm/ds4_rocm_kolibri.cuh). Q/K/V rows are f32
+  * [T][heads*D]; caches are f16 [cache_rows][Hkv*D] with position p in row
+- * p % cache_rows.  window 0 means full causal attention. */
++ * p % cache_rows, or with fp8 E4M3 codes [cache_rows][Hkv*D] followed by a
++ * float scale per (row, KV head).  window 0 means full causal attention. */
+ int ds4_gpu_kolibri_qk_prep_tensor(ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+         const ds4_gpu_tensor *v, ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
+         const void *map, uint64_t size, uint64_t qn_off, uint64_t kn_off,
+         uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, uint32_t cache_rows,
+-        int rope, float freq_base, float eps);
++        int rope, float freq_base, float eps, int fp8);
+ int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+         const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc, uint32_t T, uint32_t H, uint32_t Hkv,
+-        uint32_t D, uint32_t pos0, uint32_t cache_rows, uint32_t window);
++        uint32_t D, uint32_t pos0, uint32_t cache_rows, uint32_t window, int fp8);
+ int ds4_gpu_kolibri_router_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+         const ds4_gpu_tensor *logits, const void *map, uint64_t size, uint64_t bias_off,
+         uint32_t T, uint32_t NE, uint32_t NS, uint32_t stride, float scale);
+diff --git a/rocm/ds4_rocm_kolibri.cuh b/rocm/ds4_rocm_kolibri.cuh
+index d7d6b79..914f233 100644
+--- a/rocm/ds4_rocm_kolibri.cuh
++++ b/rocm/ds4_rocm_kolibri.cuh
+@@ -30,13 +30,47 @@ using qwen4_rocm::weight;
+ 
+ static int launched(void) { return cuda_ok(cudaGetLastError(), "Kolibri kernel"); }
+ 
++/* FP8 KV rows (opt-in, full-attention layers): each (row, KV head) holds D
++ * E4M3 codes, and a float per (row, head) after all codes holds
++ * max|x| / 448 * 256, so that the code's bits shifted into f16 (value / 256,
++ * exact) times it give the value back. */
++__device__ __forceinline__ unsigned f32_to_e4m3(float f) {
++    const unsigned sign = f < 0 ? 0x80u : 0u;
++    const float a = fminf(fabsf(f), 448.0f);
++    if (a < 0.015625f) return sign | (unsigned)rintf(a * 512.0f);   /* subnormal; 8 rounds up to 2^-6 */
++    int e;
++    const float fr = frexpf(a, &e);                                  /* a = fr * 2^e, fr in [0.5, 1) */
++    unsigned m = (unsigned)rintf((fr * 2.0f - 1.0f) * 8.0f);
++    int ex = e - 1;
++    if (m == 8) { m = 0; ex++; }
++    return sign | min(((unsigned)(ex + 7) << 3) | m, 0x7Eu);
++}
++
++__device__ __forceinline__ _Float16 e4m3_to_half(unsigned c) {
++    return __builtin_bit_cast(_Float16, (unsigned short)(((c & 0x80u) << 8) | ((c & 0x7fu) << 7)));
++}
++
++/* Quantises this wave's D values (lane owns dims lane + 32 j) into an FP8 row. */
++template<unsigned J>
++__device__ __forceinline__ void store_fp8_row(uint8_t *codes, float *scale, const float *x, unsigned lane) {
++    float mx = 0;
++    #pragma unroll
++    for (unsigned j = 0; j < J; j++) mx = fmaxf(mx, fabsf(x[j]));
++    #pragma unroll
++    for (int d = 16; d; d >>= 1) mx = fmaxf(mx, __shfl_xor(mx, d, 32));
++    const float sc = mx > 0 ? mx / 448.0f : 1.0f;
++    #pragma unroll
++    for (unsigned j = 0; j < J; j++) codes[lane + 32 * j] = (uint8_t)f32_to_e4m3(x[j] / sc);
++    if (!lane) *scale = sc * 256.0f;
++}
++
+ /* One wave per (token, head): heads [0, H) are queries, [H, H + Hkv) keys,
+  * whose value row is stored alongside.  Lane l owns dims l + 32 j, so the
+  * RoPE pair (i, i + D/2) sits in the same lane. */
+ template<unsigned D>
+-__global__ void qk_prep(float *q, const float *k, const float *v, __half *kc, __half *vc,
++__global__ void qk_prep(float *q, const float *k, const float *v, void *kc_, void *vc_,
+         const float *qn, const float *kn, unsigned H, unsigned Hkv, unsigned pos0,
+-        unsigned cache_rows, bool rope, float freq_base, float eps) {
++        unsigned cache_rows, bool rope, float freq_base, float eps, bool fp8) {
+     constexpr unsigned J = D / 32;
+     const unsigned head = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+     const unsigned t = blockIdx.y, lane = threadIdx.x & 31;
+@@ -65,7 +99,15 @@ __global__ void qk_prep(float *q, const float *k, const float *v, __half *kc, __
+     if (is_q) {
+         float *dst = q + ((uint64_t)t * H + h) * D;
+         for (unsigned j = 0; j < J; j++) dst[lane + 32 * j] = x[j];
++    } else if (fp8) {
++        const uint64_t slot = (uint64_t)(pos % cache_rows) * Hkv + h, scales = (uint64_t)cache_rows * Hkv * D;
++        const float *vs = v + ((uint64_t)t * Hkv + h) * D;
++        float y[J];
++        for (unsigned j = 0; j < J; j++) y[j] = vs[lane + 32 * j];
++        store_fp8_row<J>((uint8_t *)kc_ + slot * D, (float *)((uint8_t *)kc_ + scales) + slot, x, lane);
++        store_fp8_row<J>((uint8_t *)vc_ + slot * D, (float *)((uint8_t *)vc_ + scales) + slot, y, lane);
+     } else {
++        __half *kc = (__half *)kc_, *vc = (__half *)vc_;
+         const uint64_t row = ((uint64_t)(pos % cache_rows) * Hkv + h) * D;
+         const float *vs = v + ((uint64_t)t * Hkv + h) * D;
+         for (unsigned j = 0; j < J; j++) {
+@@ -145,16 +187,18 @@ __device__ __forceinline__ unsigned wave_min_u32(unsigned x) {
+  * tile's V rows.  The tile slots' states are merged in LDS and written as
+  * one split partial in attention_merge's layout, or as the output when there
+  * is one split. */
+-template<unsigned D, unsigned G, unsigned GH>
++template<unsigned D, unsigned G, unsigned GH, bool FP8 = false>
+ __launch_bounds__(32 * 4 * (G / GH))
+-__global__ void attention_decode(float *out, float *partial, const float *q, const __half *kc,
+-        const __half *vc, unsigned H, unsigned Hkv, unsigned pos0, unsigned cache_rows,
++__global__ void attention_decode(float *out, float *partial, const float *q, const void *kc,
++        const void *vc, unsigned H, unsigned Hkv, unsigned pos0, unsigned cache_rows,
+         unsigned window, unsigned splits, unsigned per, float scale) {
+     static_assert(D == 128 && G % GH == 0, "each lane owns four dims");
+     constexpr unsigned W = 4, TILE = 32;
+     __shared__ float4 qs[G][D / 4];
+     __shared__ float ps[W][G][TILE];
++    __shared__ float vsc[W][FP8 ? TILE : 1];
+     __shared__ float ms[W][G], ls[W][G];
++    const uint64_t scales = (uint64_t)cache_rows * Hkv * D;   /* FP8: bytes before the scales */
+     __shared__ float accs[W][G][D];
+     const unsigned kh = blockIdx.x, split = blockIdx.y, t = blockIdx.z;
+     const unsigned wave = threadIdx.x / 32, lane = threadIdx.x & 31;
+@@ -182,8 +226,29 @@ __global__ void attention_decode(float *out, float *partial, const float *q, con
+             float s[GH];
+             #pragma unroll
+             for (unsigned g = 0; g < GH; g++) s[g] = 0;
+-            if (valid) {
+-                const uint4 *kr = (const uint4 *)(kc + ((uint64_t)(p % cache_rows) * Hkv + kh) * D);
++            if (valid && FP8) {
++                const uint64_t slot = (uint64_t)(p % cache_rows) * Hkv + kh;
++                const uint4 *kr = (const uint4 *)((const uint8_t *)kc + slot * D);
++                #pragma unroll 2
++                for (unsigned c = 0; c < D / 16; c++) {
++                    const uint4 raw = kr[c];
++                    const unsigned w[4] = {raw.x, raw.y, raw.z, raw.w};
++                    #pragma unroll
++                    for (unsigned u = 0; u < 4; u++) {
++                        const float k0 = (float)e4m3_to_half(w[u] & 255), k1 = (float)e4m3_to_half((w[u] >> 8) & 255);
++                        const float k2 = (float)e4m3_to_half((w[u] >> 16) & 255), k3 = (float)e4m3_to_half(w[u] >> 24);
++                        #pragma unroll
++                        for (unsigned g = 0; g < GH; g++) {
++                            const float4 a = qs[g0 + g][4 * c + u];
++                            s[g] += a.x * k0 + a.y * k1 + a.z * k2 + a.w * k3;
++                        }
++                    }
++                }
++                const float ks = ((const float *)((const uint8_t *)kc + scales))[slot];
++                #pragma unroll
++                for (unsigned g = 0; g < GH; g++) s[g] *= ks;
++            } else if (valid) {
++                const uint4 *kr = (const uint4 *)((const __half *)kc + ((uint64_t)(p % cache_rows) * Hkv + kh) * D);
+                 #pragma unroll 4
+                 for (unsigned c = 0; c < D / 8; c++) {
+                     const uint4 raw = kr[c];
+@@ -211,6 +276,8 @@ __global__ void attention_decode(float *out, float *partial, const float *q, con
+                 m[g] = nm;
+                 ps[slot][g0 + g][lane] = pg;
+             }
++            if (FP8 && g0 == 0)
++                vsc[slot][lane] = valid ? ((const float *)((const uint8_t *)vc + scales))[(uint64_t)(p % cache_rows) * Hkv + kh] : 0.0f;
+         }
+         __syncthreads();
+         if (active) {
+@@ -221,14 +288,31 @@ __global__ void attention_decode(float *out, float *partial, const float *q, con
+                 float4 w4[GH];
+                 #pragma unroll
+                 for (unsigned g = 0; g < GH; g++) w4[g] = *(const float4 *)&ps[slot][g0 + g][i0];
++                if (FP8) {
++                    const float4 sv = *(const float4 *)&vsc[slot][i0];
++                    #pragma unroll
++                    for (unsigned g = 0; g < GH; g++) {
++                        w4[g].x *= sv.x; w4[g].y *= sv.y; w4[g].z *= sv.z; w4[g].w *= sv.w;
++                    }
++                }
+                 uint2 raw[4];
+                 #pragma unroll
+-                for (unsigned u = 0; u < 4; u++)
+-                    raw[u] = *(const uint2 *)(vc + ((uint64_t)((base + min(i0 + u, n - 1)) % cache_rows) * Hkv + kh) * D + 4 * lane);
++                for (unsigned u = 0; u < 4; u++) {
++                    const uint64_t slotv = (uint64_t)((base + min(i0 + u, n - 1)) % cache_rows) * Hkv + kh;
++                    if (FP8) raw[u].x = *(const unsigned *)((const uint8_t *)vc + slotv * D + 4 * lane);
++                    else raw[u] = *(const uint2 *)((const __half *)vc + slotv * D + 4 * lane);
++                }
+                 #pragma unroll
+                 for (unsigned u = 0; u < 4; u++) {
+-                    const float2 v0 = __half22float2(*(const __half2 *)&raw[u].x);
+-                    const float2 v1 = __half22float2(*(const __half2 *)&raw[u].y);
++                    float2 v0, v1;
++                    if (FP8) {
++                        const unsigned c = raw[u].x;
++                        v0 = make_float2((float)e4m3_to_half(c & 255), (float)e4m3_to_half((c >> 8) & 255));
++                        v1 = make_float2((float)e4m3_to_half((c >> 16) & 255), (float)e4m3_to_half(c >> 24));
++                    } else {
++                        v0 = __half22float2(*(const __half2 *)&raw[u].x);
++                        v1 = __half22float2(*(const __half2 *)&raw[u].y);
++                    }
+                     #pragma unroll
+                     for (unsigned g = 0; g < GH; g++) {
+                         const float w = u == 0 ? w4[g].x : u == 1 ? w4[g].y : u == 2 ? w4[g].z : w4[g].w;
+@@ -657,13 +741,14 @@ typedef float float8 __attribute__((ext_vector_type(8)));
+ 
+ constexpr unsigned FA_D = 128, FA_LD = FA_D + 8;
+ 
+-template<unsigned HPB>
++template<unsigned HPB, bool FP8 = false>
+ __launch_bounds__(HPB * 32)
+-__global__ void attention_wmma(float *out, const float *q, const __half *kc, const __half *vc,
++__global__ void attention_wmma(float *out, const float *q, const void *kc, const void *vc,
+         unsigned T, unsigned H, unsigned Hkv, unsigned pos0, unsigned cache_rows,
+         unsigned window, float scale_log2) {
+     constexpr unsigned KT = 32;
+     __shared__ _Float16 ks[KT][FA_LD], vs[KT][FA_LD];
++    __shared__ float kscl[FP8 ? KT : 1], vscl[FP8 ? KT : 1];   /* FP8: per-key scales */
+     const unsigned tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, col = lane & 15, half = lane >> 4;
+     const unsigned t0 = blockIdx.x * 16, h = blockIdx.y * HPB + wave, kh = h / (H / Hkv);
+     const unsigned tq = t0 + col, qpos = pos0 + (tq < T ? tq : T - 1);
+@@ -680,16 +765,43 @@ __global__ void attention_wmma(float *out, const float *q, const __half *kc, con
+     const unsigned lo = window && first_q + 1 > window ? first_q + 1 - window : 0;
+     for (unsigned kt = lo & ~15u; kt <= last_q; kt += KT) {
+         __syncthreads();
+-        for (unsigned i = tid; i < KT * (FA_D / 8); i += HPB * 32) {
+-            const unsigned r = i / (FA_D / 8), c = (i % (FA_D / 8)) * 8, p = kt + r;
+-            uint4 kv = {}, vv = {};
+-            if (p <= last_q) {
+-                const uint64_t base = ((uint64_t)(p % cache_rows) * Hkv + kh) * FA_D + c;
+-                kv = *(const uint4 *)(kc + base);
+-                vv = *(const uint4 *)(vc + base);
++        if (FP8) {
++            /* Codes widen exactly to f16 (value / 256); the scales are applied per key. */
++            const uint64_t scales = (uint64_t)cache_rows * Hkv * FA_D;
++            for (unsigned i = tid; i < KT * (FA_D / 16); i += HPB * 32) {
++                const unsigned r = i / (FA_D / 16), c = (i % (FA_D / 16)) * 16, p = kt + r;
++                uint4 kv = {}, vv = {};
++                if (p <= last_q) {
++                    const uint64_t slot = (uint64_t)(p % cache_rows) * Hkv + kh;
++                    kv = *(const uint4 *)((const uint8_t *)kc + slot * FA_D + c);
++                    vv = *(const uint4 *)((const uint8_t *)vc + slot * FA_D + c);
++                    if (!c) {
++                        kscl[r] = ((const float *)((const uint8_t *)kc + scales))[slot];
++                        vscl[r] = ((const float *)((const uint8_t *)vc + scales))[slot];
++                    }
++                } else if (!c) {
++                    kscl[r] = 0.0f;
++                    vscl[r] = 0.0f;
++                }
++                const unsigned kw[4] = {kv.x, kv.y, kv.z, kv.w}, vw[4] = {vv.x, vv.y, vv.z, vv.w};
++                #pragma unroll
++                for (unsigned b = 0; b < 16; b++) {
++                    ks[r][c + b] = e4m3_to_half((kw[b / 4] >> (8 * (b % 4))) & 255);
++                    vs[r][c + b] = e4m3_to_half((vw[b / 4] >> (8 * (b % 4))) & 255);
++                }
++            }
++        } else {
++            for (unsigned i = tid; i < KT * (FA_D / 8); i += HPB * 32) {
++                const unsigned r = i / (FA_D / 8), c = (i % (FA_D / 8)) * 8, p = kt + r;
++                uint4 kv = {}, vv = {};
++                if (p <= last_q) {
++                    const uint64_t base = ((uint64_t)(p % cache_rows) * Hkv + kh) * FA_D + c;
++                    kv = *(const uint4 *)((const __half *)kc + base);
++                    vv = *(const uint4 *)((const __half *)vc + base);
++                }
++                *(uint4 *)&ks[r][c] = kv;
++                *(uint4 *)&vs[r][c] = vv;
+             }
+-            *(uint4 *)&ks[r][c] = kv;
+-            *(uint4 *)&vs[r][c] = vv;
+         }
+         __syncthreads();
+         #pragma unroll
+@@ -708,6 +820,7 @@ __global__ void attention_wmma(float *out, const float *q, const __half *kc, con
+             for (unsigned j = 0; j < 8; j++) {
+                 const unsigned p = kb + 2 * j + half;
+                 const bool ok = p <= qpos && (!window || p + window > qpos);
++                if (FP8) s[j] *= kscl[16 * sub + 2 * j + half];
+                 s[j] = ok ? s[j] : -INFINITY;
+                 mx = fmaxf(mx, s[j]);
+             }
+@@ -728,8 +841,10 @@ __global__ void attention_wmma(float *out, const float *q, const __half *kc, con
+             #pragma unroll
+             for (unsigned j = 0; j < 8; j++) {
+                 const float other = __shfl_xor(ps[j], 16, 32);
+-                pb[2 * j + half] = (_Float16)ps[j];
+-                pb[2 * j + 1 - half] = (_Float16)other;
++                const float vm = FP8 ? vscl[16 * sub + 2 * j + half] : 1.0f;
++                const float vo = FP8 ? vscl[16 * sub + 2 * j + 1 - half] : 1.0f;
++                pb[2 * j + half] = (_Float16)(ps[j] * vm);
++                pb[2 * j + 1 - half] = (_Float16)(other * vo);
+             }
+             #pragma unroll
+             for (unsigned dt = 0; dt < FA_D / 16; dt++) {
+@@ -865,41 +980,40 @@ extern "C" int ds4_gpu_kolibri_qk_prep_tensor(ds4_gpu_tensor *q, const ds4_gpu_t
+         const ds4_gpu_tensor *v, ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
+         const void *map, uint64_t size, uint64_t qn_off, uint64_t kn_off,
+         uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, uint32_t cache_rows,
+-        int rope, float freq_base, float eps) {
++        int rope, float freq_base, float eps, int fp8) {
+     using namespace kolibri_rocm;
++    const uint64_t cache_bytes = (uint64_t)cache_rows * Hkv * (fp8 ? D + 4 : D * 2);
+     if (!T || !H || !Hkv || D != 128 || !cache_rows || T > cache_rows ||
+         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(k, (uint64_t)T * Hkv * D * 4) ||
+-        !tensor(v, (uint64_t)T * Hkv * D * 4) || !tensor(kc, (uint64_t)cache_rows * Hkv * D * 2) ||
+-        !tensor(vc, (uint64_t)cache_rows * Hkv * D * 2)) return 0;
++        !tensor(v, (uint64_t)T * Hkv * D * 4) || !tensor(kc, cache_bytes) ||
++        !tensor(vc, cache_bytes)) return 0;
+     const float *qn = f32_weight(map, size, qn_off, D), *kn = f32_weight(map, size, kn_off, D);
+     if (!qn || !kn) return 0;
+     const dim3 grid((H + Hkv + 3) / 4, T);
+     qk_prep<128><<<grid, 128, 0, 0>>>((float *)q->ptr, (const float *)k->ptr, (const float *)v->ptr,
+-        (__half *)kc->ptr, (__half *)vc->ptr, qn, kn, H, Hkv, pos0, cache_rows, rope != 0, freq_base, eps);
++        kc->ptr, vc->ptr, qn, kn, H, Hkv, pos0, cache_rows, rope != 0, freq_base, eps, fp8 != 0);
+     return launched();
+ }
+ 
+ extern "C" int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+         const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc, uint32_t T, uint32_t H, uint32_t Hkv,
+-        uint32_t D, uint32_t pos0, uint32_t cache_rows, uint32_t window) {
++        uint32_t D, uint32_t pos0, uint32_t cache_rows, uint32_t window, int fp8) {
+     using namespace kolibri_rocm;
++    const uint64_t cache_bytes = (uint64_t)cache_rows * Hkv * (fp8 ? D + 4 : D * 2);
+     if (!T || !H || !Hkv || H % Hkv || D != 128 || !cache_rows ||
+         !tensor(out, (uint64_t)T * H * D * 4) || !tensor(q, (uint64_t)T * H * D * 4) ||
+-        !tensor(kc, (uint64_t)cache_rows * Hkv * D * 2) || !tensor(vc, (uint64_t)cache_rows * Hkv * D * 2)) return 0;
++        !tensor(kc, cache_bytes) || !tensor(vc, cache_bytes)) return 0;
+     /* Prefill batches: WMMA tiles (heads per block must share a KV head). */
+     static int no_wmma = -1;
+     if (no_wmma < 0) no_wmma = getenv("DS4_KOLIBRI_ATTN_SCALAR") != NULL;
+     if (T >= 16 && !no_wmma && ds4_rocm_is_gfx1151() && (H / Hkv) % 4 == 0) {
+         /* One block per KV group when it has 12 heads, so K/V tiles load once. */
+         const float sl = 1.4426950408889634f / sqrtf((float)D);
+-        if (H / Hkv == 12)
+-            attention_wmma<12><<<dim3((T + 15) / 16, H / 12), 384, 0, 0>>>((float *)out->ptr,
+-                (const float *)q->ptr, (const __half *)kc->ptr, (const __half *)vc->ptr,
+-                T, H, Hkv, pos0, cache_rows, window, sl);
+-        else
+-            attention_wmma<4><<<dim3((T + 15) / 16, H / 4), 128, 0, 0>>>((float *)out->ptr,
+-                (const float *)q->ptr, (const __half *)kc->ptr, (const __half *)vc->ptr,
+-                T, H, Hkv, pos0, cache_rows, window, sl);
++#define KOLIBRI_WMMA(HPB, F8) attention_wmma<HPB, F8><<<dim3((T + 15) / 16, H / HPB), HPB * 32, 0, 0>>>( \
++            (float *)out->ptr, (const float *)q->ptr, kc->ptr, vc->ptr, T, H, Hkv, pos0, cache_rows, window, sl)
++        if (H / Hkv == 12) { if (fp8) KOLIBRI_WMMA(12, true); else KOLIBRI_WMMA(12, false); }
++        else { if (fp8) KOLIBRI_WMMA(4, true); else KOLIBRI_WMMA(4, false); }
++#undef KOLIBRI_WMMA
+         return launched();
+     }
+     /* Decode-sized batches read each KV head's cache once for all its query
+@@ -917,10 +1031,12 @@ extern "C" int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_g
+         }
+         const dim3 grid(Hkv, splits, T);
+         const float scale = 1.0f / sqrtf((float)D);
+-        if (G == 12) attention_decode<128, 12, 4><<<grid, 384, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
+-            (const __half *)kc->ptr, (const __half *)vc->ptr, H, Hkv, pos0, cache_rows, window, splits, per, scale);
+-        else attention_decode<128, 4, 4><<<grid, 128, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
+-            (const __half *)kc->ptr, (const __half *)vc->ptr, H, Hkv, pos0, cache_rows, window, splits, per, scale);
++#define KOLIBRI_DECODE(G_, F8) attention_decode<128, G_, 4, F8><<<grid, 32 * 4 * (G_ / 4), 0, 0>>>( \
++            (float *)out->ptr, partial, (const float *)q->ptr, kc->ptr, vc->ptr, H, Hkv, pos0, cache_rows, \
++            window, splits, per, scale)
++        if (G == 12) { if (fp8) KOLIBRI_DECODE(12, true); else KOLIBRI_DECODE(12, false); }
++        else { if (fp8) KOLIBRI_DECODE(4, true); else KOLIBRI_DECODE(4, false); }
++#undef KOLIBRI_DECODE
+         if (!launched()) return 0;
+         if (splits > 1) {
+             attention_merge<<<dim3(H, T), D, 0, 0>>>((float *)out->ptr, partial, H, D, splits);
+@@ -928,6 +1044,10 @@ extern "C" int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_g
+         }
+         return 1;
+     }
++    if (fp8) {
++        fprintf(stderr, "ds4: Kolibri FP8 KV needs the WMMA or decode attention kernels\n");
++        return 0;
++    }
+     /* The longest key range of the batch decides the split: short batches
+      * over long contexts split keys so the GPU has enough waves. */
+     const unsigned last = pos0 + T;

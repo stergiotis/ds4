@@ -101,7 +101,7 @@ tok/s.
 | 6 | ~~Q4_K expert decode kernels at bandwidth~~ done | Q4_K decode +15% | medium | float noise (summation order) |
 | 7 | ~~F8-specific WMMA expert tile for prefill~~ done | F8 prefill +37-49% | medium | none (more exact) |
 | 8 | Prefill tile tuning (o projection, router) and chunk size | prefill +10-15% | small | none |
-| 9 | FP8 KV cache for the full-attention layers | decode at 32K +10% | medium | small, measurable |
+| 9 | ~~FP8 KV cache for the full-attention layers~~ tried, rejected | decode at 32K none, prefill at 32K +6% | medium | measurable: KL vs fp32 x6-12 |
 | 10 | ~~Prefill attention shared across all 12 heads of a KV group~~ done | prefill at 32K +3% | medium | none (bit-identical) |
 | 11 | Speculative decoding with n-gram drafts | 1.3-1.8x on repetitive output | medium-large | none (exact verify) |
 | 12 | Q8_0 LM head | decode -2 ms (+7%) after 5 | small | small, measurable |
@@ -206,6 +206,24 @@ layer" item.
    rings stay f16. A per-row scale is needed; check with the long-context
    teacher-forced comparison. Worth more after 1, once attention is
    bandwidth-bound.
+
+   **Tried and rejected** (2026-10-04, patch in
+   [kolibri-kv-fp8.patch](kolibri-kv-fp8.patch), applies to `a51c78a`):
+   E4M3 codes with one scale per (row, KV head), widened exactly to f16 in
+   the kernels with the scales applied per key (K: on the score; V: on the
+   softmax weight), opt-in `DS4_KOLIBRI_KV_FP8=1`, sliding rings f16.
+   - Accuracy: teacher-forced KL against fp32 on tf_text.txt 0.104-0.107
+     (f16 cache 0.008-0.019), top-1 0.90 (0.97-0.98); on 3194 tokens of
+     promessi_sposi KL to the f16 run 0.063-0.067 where equally valid f16
+     variants differ by 0.023-0.036. Mean NLL unchanged (4.139 vs
+     4.125-4.141).
+   - Speed (F8): decode at 32K 42.2 -> 42.3 tok/s (full attention 381 ->
+     363 us per call: the E4M3 widening costs what the halved bytes save),
+     prefill at 32K 1090 -> 1158 tok/s, at 8K +2%. Memory -0.3 GiB at 32K,
+     about -2.4 GiB at 262K, where the f16 cache already fits.
+   - Finer scale groups would help accuracy but not the 3-bit mantissa;
+     a decode read that hides the widening might reach +5-7% at 32K. Not
+     worth the loss for now.
 10. **Prefill attention across a whole KV group.** The WMMA kernel processes
    16 queries × 4 query heads per block, so each K/V tile is loaded three times
    per KV head (12 query heads share it). A block of 12 waves, or a 4-head
