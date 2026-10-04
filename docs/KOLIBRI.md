@@ -183,7 +183,10 @@ Results:
   identical routing and greedy output.
 - ROCm vs numpy, real Kolibri-1, F8 GGUF: all 5 prompts give identical
   16-token greedy continuations, top-1 agreement 1.000 at every prompt position
-  (0.982 on the chat with thinking), residual error ≤ 8e-3.
+  (0.982 on the chat with thinking), residual error ≤ 8e-3, except `count`
+  since the tiled decode attention: one router near-tie at position 5 flips,
+  the final residual differs by 7e-2 from there on and `compare_golden.py`
+  reports it as FAIL, while greedy output and top-1 still match.
 - Teacher-forced over `tf_text.txt` (196 tokens, German, English, Python)
   against the fp32 reference (`teacher_forced.py`):
 
@@ -218,12 +221,12 @@ VRAM) above idle; host RSS stays under 0.8 GiB.
 
 | GGUF | context | prefill t/s | decode t/s | GPU memory |
 | --- | ---: | ---: | ---: | ---: |
-| F8 (75.7 GiB) | 512 | 674 | 36.5 | 76.2 GiB |
-| F8 | 8192 | 922 | 36.1 | 76.9 GiB |
-| F8 | 32768 | 776 | 31.8 | 77.4 GiB |
-| Q4_K experts (42.8 GiB) | 512 | 611 | 36.8 | 43.2 GiB |
-| Q4_K experts | 8192 | 918 | 35.6 | 43.9 GiB |
-| Q4_K experts | 32768 | 773 | 31.4 | 44.4 GiB |
+| F8 (75.7 GiB) | 512 | 706 | 41.4 | 76.2 GiB |
+| F8 | 8192 | 922 | 39.3 | 76.9 GiB |
+| F8 | 32768 | 776 | 36.1 | 77.4 GiB |
+| Q4_K experts (42.8 GiB) | 512 | 609 | 40.7 | 43.2 GiB |
+| Q4_K experts | 8192 | 916 | 38.6 | 43.9 GiB |
+| Q4_K experts | 32768 | 772 | 35.5 | 44.4 GiB |
 
 Starting point (first correct version, F8, 2K context): 210 t/s prefill,
 21 t/s decode. Decode at 2K spends per token about 4.8 ms on QKV, 4.2 ms on
@@ -246,8 +249,7 @@ The ranked ideas for making it faster are in
 - **Disk KV checkpoints** (`--kv-disk-dir`) and session payload save/load
   refuse Kolibri sessions with an error; live KV reuse works.
 - **Decode loses time in small calls**, not in launches (the host enqueues a
-  token in 1.4 ms of 28.4): attention takes ~70 us per call regardless of
-  context up to 8K, the F32 router reads at 84 GB/s and the norms run one
+  token in 1.4 ms): the F32 router reads at 84 GB/s and the norms run one
   block per token, while the large matvecs already read at ~210 GB/s.
   Q4_K experts read half the bytes of F8 but at half the bandwidth, so both
   GGUFs decode at the same speed. `DS4_KOLIBRI_TRACE=1` shows the per-call

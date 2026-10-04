@@ -5,9 +5,11 @@
  *   Each layer's cache has cache_rows rows and position p lives in row
  *   p % cache_rows: sliding layers use a ring of window - 1 + chunk rows,
  *   full layers one row per context position.
- * - attention: GQA, one wave per query head, online softmax over the keys a
- *   query may see (the last `window` positions, or all of them), optional
- *   key splits merged afterwards.  No output gate.
+ * - attention: GQA, online softmax over the keys a query may see (the last
+ *   `window` positions, or all of them), optional key splits merged
+ *   afterwards.  No output gate.  Prefill batches use WMMA tiles, decode
+ *   batches a block per KV head and key split that scores 32-key tiles
+ *   lane-per-key.
  * - router: top-k of logits + selection bias, weight sigmoid(logit), no
  *   renormalisation; an extra weight slot of 1.0 lets the shared expert ride
  *   as the last slot of the Qwen expert kernels.
@@ -107,75 +109,178 @@ __global__ void attention(float *out, float *partial, const float *q, const __ha
     }
 }
 
-/* Decode-sized batches: one wave per (KV head, key split, row) applies every
- * K/V row it loads to all G query heads of that KV head, so the cache is read
- * once per KV head instead of once per query head.  Writes split partials
- * in attention_merge's layout. */
-template<unsigned D, unsigned G>
-__launch_bounds__(32)
-__global__ void attention_gqa(float *out, float *partial, const float *q, const __half *kc,
+__device__ __forceinline__ float wave_max(float x) {
+#if defined(__gfx1151__)
+    x = fmaxf(x, __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(x), __float_as_int(x), 0x76543210, 0xFEDCBA98, true, false)));
+    x = fmaxf(x, qwen4_rocm::qwen_dpp_xor<8>(x));
+    x = fmaxf(x, qwen4_rocm::qwen_dpp_xor<4>(x));
+    x = fmaxf(x, qwen4_rocm::qwen_dpp_xor<2>(x));
+    x = fmaxf(x, qwen4_rocm::qwen_dpp_xor<1>(x));
+#else
+    for (int d = 16; d; d >>= 1) x = fmaxf(x, __shfl_xor(x, d, 32));
+#endif
+    return x;
+}
+
+/* Decode-sized batches: one block per (KV head, key split, row).  The
+ * block's waves form W tile slots × G/GH head groups: each wave takes 32-key
+ * tiles in turn and scores them against its GH query heads, lane i holding
+ * key i (q sits in LDS and is read as broadcasts).  The online softmax then
+ * needs one max and one sum per head and tile instead of a cross-lane
+ * reduction per key and head, and lane l accumulates dims 4l..4l+3 from the
+ * tile's V rows.  The tile slots' states are merged in LDS and written as
+ * one split partial in attention_merge's layout, or as the output when there
+ * is one split. */
+template<unsigned D, unsigned G, unsigned GH>
+__launch_bounds__(32 * 4 * (G / GH))
+__global__ void attention_decode(float *out, float *partial, const float *q, const __half *kc,
         const __half *vc, unsigned H, unsigned Hkv, unsigned pos0, unsigned cache_rows,
         unsigned window, unsigned splits, unsigned per, float scale) {
-    constexpr unsigned J = D / 32;
-    const unsigned kh = blockIdx.x, split = blockIdx.y, t = blockIdx.z, lane = threadIdx.x;
+    static_assert(D == 128 && G % GH == 0, "each lane owns four dims");
+    constexpr unsigned W = 4, TILE = 32;
+    __shared__ float4 qs[G][D / 4];
+    __shared__ float ps[W][G][TILE];
+    __shared__ float ms[W][G], ls[W][G];
+    __shared__ float accs[W][G][D];
+    const unsigned kh = blockIdx.x, split = blockIdx.y, t = blockIdx.z;
+    const unsigned wave = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const unsigned slot = wave % W, g0 = wave / W * GH;
     const unsigned pos = pos0 + t, lo = window && pos + 1 > window ? pos + 1 - window : 0;
     const unsigned begin = lo + split * per, end = min(pos + 1, begin + per);
-    float qv[G][J], acc[G][J], m[G], denom[G];
+    const float *qr = q + ((uint64_t)t * H + kh * G) * D;
+    for (unsigned i = threadIdx.x; i < G * D; i += blockDim.x) ((float *)qs)[i] = qr[i] * scale;
+    __syncthreads();
+    float m[GH], l[GH], acc[GH][4];
     #pragma unroll
-    for (unsigned g = 0; g < G; g++) {
-        const float *qr = q + ((uint64_t)t * H + kh * G + g) * D;
+    for (unsigned g = 0; g < GH; g++) {
+        m[g] = -3e38f; l[g] = 0;
         #pragma unroll
-        for (unsigned j = 0; j < J; j++) { qv[g][j] = qr[lane + 32 * j] * scale; acc[g][j] = 0; }
-        m[g] = -3e38f; denom[g] = 0;
+        for (unsigned c = 0; c < 4; c++) acc[g][c] = 0;
     }
-    for (unsigned p = begin; p < end; p++) {
-        const uint64_t row = ((uint64_t)(p % cache_rows) * Hkv + kh) * D;
-        float kv[J], vv[J];
-        #pragma unroll
-        for (unsigned j = 0; j < J; j++) {
-            kv[j] = __half2float(kc[row + lane + 32 * j]);
-            vv[j] = __half2float(vc[row + lane + 32 * j]);
-        }
-        #pragma unroll
-        for (unsigned g = 0; g < G; g++) {
-            float sc = 0;
+    /* Uniform trip count so the block can synchronize; a wave whose tile
+     * starts past the end only takes part in the barriers. */
+    for (unsigned tile0 = begin; tile0 < end; tile0 += W * TILE) {
+        const unsigned base = tile0 + slot * TILE;
+        const bool active = base < end;
+        const unsigned p = base + lane;
+        const bool valid = p < end;
+        if (active) {
+            float s[GH];
             #pragma unroll
-            for (unsigned j = 0; j < J; j++) sc += qv[g][j] * kv[j];
-            sc = sum(sc);
-            const float nm = fmaxf(m[g], sc), corr = expf(m[g] - nm), w = expf(sc - nm);
-            denom[g] = denom[g] * corr + w;
+            for (unsigned g = 0; g < GH; g++) s[g] = 0;
+            if (valid) {
+                const uint4 *kr = (const uint4 *)(kc + ((uint64_t)(p % cache_rows) * Hkv + kh) * D);
+                #pragma unroll 4
+                for (unsigned c = 0; c < D / 8; c++) {
+                    const uint4 raw = kr[c];
+                    const float2 k0 = __half22float2(*(const __half2 *)&raw.x);
+                    const float2 k1 = __half22float2(*(const __half2 *)&raw.y);
+                    const float2 k2 = __half22float2(*(const __half2 *)&raw.z);
+                    const float2 k3 = __half22float2(*(const __half2 *)&raw.w);
+                    #pragma unroll
+                    for (unsigned g = 0; g < GH; g++) {
+                        const float4 a = qs[g0 + g][2 * c], b = qs[g0 + g][2 * c + 1];
+                        s[g] += a.x * k0.x + a.y * k0.y + a.z * k1.x + a.w * k1.y +
+                                b.x * k2.x + b.y * k2.y + b.z * k3.x + b.w * k3.y;
+                    }
+                }
+            }
             #pragma unroll
-            for (unsigned j = 0; j < J; j++) acc[g][j] = acc[g][j] * corr + w * vv[j];
-            m[g] = nm;
+            for (unsigned g = 0; g < GH; g++) {
+                const float sv = valid ? s[g] : -3e38f;
+                const float nm = fmaxf(m[g], wave_max(sv));
+                const float corr = expf(m[g] - nm);
+                const float pg = valid ? expf(sv - nm) : 0.0f;
+                l[g] = l[g] * corr + sum(pg);
+                #pragma unroll
+                for (unsigned c = 0; c < 4; c++) acc[g][c] *= corr;
+                m[g] = nm;
+                ps[slot][g0 + g][lane] = pg;
+            }
         }
+        __syncthreads();
+        if (active) {
+            /* Keys past the end have weight 0 and read the last valid row. */
+            const unsigned n = min(TILE, end - base);
+            #pragma unroll 2
+            for (unsigned i0 = 0; i0 < TILE; i0 += 4) {
+                float4 w4[GH];
+                #pragma unroll
+                for (unsigned g = 0; g < GH; g++) w4[g] = *(const float4 *)&ps[slot][g0 + g][i0];
+                uint2 raw[4];
+                #pragma unroll
+                for (unsigned u = 0; u < 4; u++)
+                    raw[u] = *(const uint2 *)(vc + ((uint64_t)((base + min(i0 + u, n - 1)) % cache_rows) * Hkv + kh) * D + 4 * lane);
+                #pragma unroll
+                for (unsigned u = 0; u < 4; u++) {
+                    const float2 v0 = __half22float2(*(const __half2 *)&raw[u].x);
+                    const float2 v1 = __half22float2(*(const __half2 *)&raw[u].y);
+                    #pragma unroll
+                    for (unsigned g = 0; g < GH; g++) {
+                        const float w = u == 0 ? w4[g].x : u == 1 ? w4[g].y : u == 2 ? w4[g].z : w4[g].w;
+                        acc[g][0] += w * v0.x; acc[g][1] += w * v0.y;
+                        acc[g][2] += w * v1.x; acc[g][3] += w * v1.y;
+                    }
+                }
+            }
+        }
+        __syncthreads();
     }
+    /* Merge the tile slots: rescale each to the block's max per head. */
+    if (!lane) {
+        #pragma unroll
+        for (unsigned g = 0; g < GH; g++) { ms[slot][g0 + g] = m[g]; ls[slot][g0 + g] = l[g]; }
+    }
+    __syncthreads();
     #pragma unroll
-    for (unsigned g = 0; g < G; g++) {
+    for (unsigned g = 0; g < GH; g++) {
+        float bm = -3e38f;
+        for (unsigned w = 0; w < W; w++) if (ls[w][g0 + g] > 0) bm = fmaxf(bm, ms[w][g0 + g]);
+        const float f = l[g] > 0 ? expf(m[g] - bm) : 0.0f;
+        #pragma unroll
+        for (unsigned c = 0; c < 4; c++) accs[slot][g0 + g][4 * lane + c] = acc[g][c] * f;
+    }
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < G * D; i += blockDim.x) {
+        const unsigned g = i / D, d = i % D;
+        float bm = -3e38f, den = 0, a = 0;
+        for (unsigned w = 0; w < W; w++) if (ls[w][g] > 0) bm = fmaxf(bm, ms[w][g]);
+        for (unsigned w = 0; w < W; w++) {
+            if (ls[w][g] > 0) den += ls[w][g] * expf(ms[w][g] - bm);
+            a += accs[w][g][d];
+        }
         const uint64_t hq = (uint64_t)t * H + kh * G + g;
         if (splits == 1) {
-            #pragma unroll
-            for (unsigned j = 0; j < J; j++)
-                out[hq * D + lane + 32 * j] = denom[g] > 0 ? acc[g][j] / denom[g] : 0;
+            out[hq * D + d] = den > 0 ? a / den : 0;
         } else {
             float *dst = partial + (hq * splits + split) * (D + 2);
-            if (!lane) { dst[0] = m[g]; dst[1] = denom[g]; }
-            #pragma unroll
-            for (unsigned j = 0; j < J; j++) dst[2 + lane + 32 * j] = acc[g][j];
+            if (!d) { dst[0] = bm; dst[1] = den; }
+            dst[2 + d] = a;
         }
     }
 }
 
+/* One block of D threads per (head, row).  The splits' maxima and sums are
+ * loaded at once into LDS (splits <= 256), so only the accumulator column
+ * is read in a loop, with independent loads. */
 __global__ void attention_merge(float *out, const float *partial, unsigned H, unsigned D, unsigned splits) {
+    __shared__ float wsh[256], dsh[256];
     const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    if (d >= D) return;
     const float *p = partial + ((uint64_t)t * H + h) * splits * (D + 2);
-    float m = -3e38f, denom = 0, acc = 0;
-    for (unsigned s = 0; s < splits; s++) if (p[s * (D + 2) + 1] > 0) m = fmaxf(m, p[s * (D + 2)]);
+    for (unsigned s = d; s < splits; s += blockDim.x) { wsh[s] = p[s * (D + 2)]; dsh[s] = p[s * (D + 2) + 1]; }
+    __syncthreads();
+    float m = -3e38f;
+    for (unsigned s = 0; s < splits; s++) if (dsh[s] > 0) m = fmaxf(m, wsh[s]);
+    __syncthreads();
+    for (unsigned s = d; s < splits; s += blockDim.x) wsh[s] = dsh[s] > 0 ? expf(wsh[s] - m) : 0;
+    __syncthreads();
+    if (d >= D) return;
+    float denom = 0, acc = 0;
+    #pragma unroll 8
     for (unsigned s = 0; s < splits; s++) {
-        const float *row = p + s * (D + 2);
-        const float w = row[1] > 0 ? expf(row[0] - m) : 0;
-        denom += row[1] * w;
-        acc += row[2 + d] * w;
+        denom += dsh[s] * wsh[s];
+        acc += p[s * (D + 2) + 2 + d] * wsh[s];
     }
     out[((uint64_t)t * H + h) * D + d] = denom > 0 ? acc / denom : 0;
 }
@@ -415,9 +520,9 @@ extern "C" int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_g
         }
         const dim3 grid(Hkv, splits, T);
         const float scale = 1.0f / sqrtf((float)D);
-        if (G == 12) attention_gqa<128, 12><<<grid, 32, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
+        if (G == 12) attention_decode<128, 12, 4><<<grid, 384, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
             (const __half *)kc->ptr, (const __half *)vc->ptr, H, Hkv, pos0, cache_rows, window, splits, per, scale);
-        else attention_gqa<128, 4><<<grid, 32, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
+        else attention_decode<128, 4, 4><<<grid, 128, 0, 0>>>((float *)out->ptr, partial, (const float *)q->ptr,
             (const __half *)kc->ptr, (const __half *)vc->ptr, H, Hkv, pos0, cache_rows, window, splits, per, scale);
         if (!launched()) return 0;
         if (splits > 1) {

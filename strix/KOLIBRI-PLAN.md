@@ -17,6 +17,10 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 |---|---|---|
 | F8 | 674 / 922 / 776 | 36.5 / 36.1 / 31.8 |
 | Q4_K experts | 611 / 918 / 773 | 36.8 / 35.6 / 31.4 |
+| F8, after item 1 | 706 / 922 / 776 | 41.4 / 39.3 / 36.1 |
+| Q4_K experts, after item 1 | 609 / 916 / 772 | 40.7 / 38.6 / 35.5 |
+
+The per-call breakdown below predates item 1.
 
 ### Decode
 
@@ -78,7 +82,7 @@ tok/s.
 
 | # | Idea | Expected gain | Effort | Correctness risk |
 |---:|---|---|---|---|
-| 1 | Decode attention with enough waves | decode -2.6 ms (+10%) | small-medium | none (same arithmetic up to the split merge order) |
+| 1 | ~~Decode attention with enough waves~~ done | decode +13% at 512, +14% at 32K | small-medium | float noise (summation order) |
 | 2 | Router as BF16 at full bandwidth, top-k fused | decode -2.0 ms (+7%) | small | none (source is BF16) |
 | 3 | Norm and reduce kernels across more than one block per token | decode -1.5 ms (+5%) | small | float noise (reduction order) |
 | 4 | k and v (or q, k and v) in one launch | decode -0.6 ms (+2%) | small | none |
@@ -101,6 +105,12 @@ layer" item.
    query head group, split) give the GPU hundreds of waves; the merge kernel
    then folds more partials. Target: ~15 us per call at 512 keys
    and bandwidth-bound at 8K and beyond.
+
+   **Done:** a block per (KV head, 128-key split) of 12 waves, each scoring
+   32-key tiles lane-per-key for 4 of the 12 query heads, and a merge that
+   loads all split maxima at once. 71 -> 20 us per call at 512 context,
+   full layers at 32K read K/V at 178 GB/s (was 105 at 8K). Teacher-forced
+   decode: top-1 0.985, KL 0.0076 (was 0.975, 0.0082).
 2. **Router.** The converter widens the BF16 router gate to F32, and the
    F32 matvec reads at 84 GB/s: 2.35 ms for 0.2 GB. As BF16 at 200 GB/s it
    would take 0.5 ms; fusing the top-k selection (0.59 ms) into the same
