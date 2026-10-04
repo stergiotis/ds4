@@ -230,6 +230,7 @@ Starting point (first correct version, F8, 2K context): 210 t/s prefill,
 attention, 4.6 ms on the output projection and norms, 10.6 ms on the experts
 and 3.9 ms on the LM head (`DS4_KOLIBRI_TIMING=1`, which syncs per stage).
 Bandwidth would allow roughly 50 t/s for F8; see known gaps.
+`DS4_KOLIBRI_TRACE=1` gives per-call times without the per-stage syncs.
 
 Q4_K saves 33 GiB at the same speed, so it fits next to other resident
 workloads (the machine's other 65 GB service, for example).
@@ -244,11 +245,13 @@ The ranked ideas for making it faster are in
   262144 tokens fits next to the 76 GiB model).
 - **Disk KV checkpoints** (`--kv-disk-dir`) and session payload save/load
   refuse Kolibri sessions with an error; live KV reuse works.
-- **Decode is launch-bound**: ~12 kernels per layer, 600 per token; F8 and
-  Q4_K decode at the same speed although Q4_K reads half the bytes. GPU graph
-  capture is the next step but ds4's ROCm runtime launches on the legacy
-  default stream, which cannot be captured; kernel fusion (QKV + prep,
-  router + expert dispatch) is the alternative.
+- **Decode loses time in small calls**, not in launches (the host enqueues a
+  token in 1.4 ms of 28.4): attention takes ~70 us per call regardless of
+  context up to 8K, the F32 router reads at 84 GB/s and the norms run one
+  block per token, while the large matvecs already read at ~210 GB/s.
+  Q4_K experts read half the bytes of F8 but at half the bandwidth, so both
+  GGUFs decode at the same speed. `DS4_KOLIBRI_TRACE=1` shows the per-call
+  split.
 - **Prefill**: the routed experts (~60% at 2K) and, at 32K, attention dominate.
   The WMMA expert tiles are generic #1070 code; an F8-specific tile and a
   wider attention block are the obvious next steps.
