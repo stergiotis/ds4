@@ -426,49 +426,78 @@ __global__ __launch_bounds__(128) void router_decode(int *sel, float *weights, f
     }
 }
 
-/* One block of 256 threads per token row; D <= 256 * MAXV. */
-template<unsigned MAXV>
+/* One block of THREADS threads per token row; D <= THREADS * MAXV.  NSC is
+ * the slot count when known at compile time (decode: K routed + shared), so
+ * the partial loads unroll and go out together; 0 loops over NS.  x is read
+ * once and kept in registers for both reductions. */
+template<unsigned THREADS, unsigned MAXV, unsigned NSC>
+__launch_bounds__(THREADS)
 __global__ void norm_add(float *x, float *xn, const float *h, const float *part, const float *weights,
         const float *shared, unsigned NS, unsigned pstride, unsigned wstride, const float *w_post,
         const float *w_next, unsigned D, float eps) {
-    __shared__ float red[8];
+    __shared__ float red[THREADS / 32];
     const unsigned t = blockIdx.x, tid = threadIdx.x;
     float *xr = x + (uint64_t)t * D;
-    float v[MAXV];
+    float xv[MAXV];
+    #pragma unroll
+    for (unsigned i = 0; i < MAXV; i++) {
+        const unsigned d = tid + THREADS * i;
+        xv[i] = d < D ? xr[d] : 0;
+    }
     if (h || part) {
-        float ss = 0;
-        for (unsigned i = 0; i < MAXV; i++) {
-            const unsigned d = tid + 256 * i;
-            float a = 0;
-            if (d < D) {
-                if (part) {
-                    for (unsigned s = 0; s < NS; s++)
-                        a += weights[(uint64_t)t * wstride + s] * part[((uint64_t)t * pstride + s) * D + d];
+        float v[MAXV], ss = 0;
+        if (part && NSC) {
+            float ws[NSC ? NSC : 1];
+            #pragma unroll
+            for (unsigned s = 0; s < NSC; s++) ws[s] = weights[(uint64_t)t * wstride + s];
+            #pragma unroll
+            for (unsigned i = 0; i < MAXV; i++) {
+                const unsigned d = tid + THREADS * i;
+                float a = 0;
+                if (d < D) {
+                    #pragma unroll
+                    for (unsigned s = 0; s < NSC; s++) a += ws[s] * part[((uint64_t)t * pstride + s) * D + d];
                     if (shared) a += shared[(uint64_t)t * D + d];
-                } else {
-                    a = h[(uint64_t)t * D + d];
                 }
+                v[i] = a;
+                ss += a * a;
             }
-            v[i] = a;
-            ss += a * a;
+        } else {
+            #pragma unroll
+            for (unsigned i = 0; i < MAXV; i++) {
+                const unsigned d = tid + THREADS * i;
+                float a = 0;
+                if (d < D) {
+                    if (part) {
+                        for (unsigned s = 0; s < NS; s++)
+                            a += weights[(uint64_t)t * wstride + s] * part[((uint64_t)t * pstride + s) * D + d];
+                        if (shared) a += shared[(uint64_t)t * D + d];
+                    } else {
+                        a = h[(uint64_t)t * D + d];
+                    }
+                }
+                v[i] = a;
+                ss += a * a;
+            }
         }
         const float r = rsqrtf(block_sum(ss, red) / D + eps);
+        #pragma unroll
         for (unsigned i = 0; i < MAXV; i++) {
-            const unsigned d = tid + 256 * i;
-            if (d < D) xr[d] += v[i] * r * w_post[d];
+            const unsigned d = tid + THREADS * i;
+            if (d < D) {
+                xv[i] += v[i] * r * w_post[d];
+                xr[d] = xv[i];
+            }
         }
-        __syncthreads();
     }
     float ss = 0;
-    for (unsigned i = 0; i < MAXV; i++) {
-        const unsigned d = tid + 256 * i;
-        v[i] = d < D ? xr[d] : 0;
-        ss += v[i] * v[i];
-    }
+    #pragma unroll
+    for (unsigned i = 0; i < MAXV; i++) ss += xv[i] * xv[i];
     const float r = rsqrtf(block_sum(ss, red) / D + eps);
+    #pragma unroll
     for (unsigned i = 0; i < MAXV; i++) {
-        const unsigned d = tid + 256 * i;
-        if (d < D) xn[(uint64_t)t * D + d] = v[i] * r * w_next[d];
+        const unsigned d = tid + THREADS * i;
+        if (d < D) xn[(uint64_t)t * D + d] = xv[i] * r * w_next[d];
     }
 }
 
@@ -759,13 +788,18 @@ extern "C" int ds4_gpu_kolibri_norm_add_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor
     const float *w_post = (h || part) ? f32_weight(map, size, post_off, D) : NULL;
     const float *w_next = f32_weight(map, size, next_off, D);
     if (!w_next || ((h || part) && !w_post)) return 0;
-#define KOLIBRI_NORM_ADD(MAXV) norm_add<MAXV><<<T, 256, 0, 0>>>((float *)x->ptr, (float *)xn->ptr, \
-        h ? (const float *)h->ptr : NULL, part ? (const float *)part->ptr : NULL, \
-        part ? (const float *)weights->ptr : NULL, shared ? (const float *)shared->ptr : NULL, \
-        NS, pstride, wstride, w_post, w_next, D, eps)
-    if (D <= 256 * 4) KOLIBRI_NORM_ADD(4);
-    else if (D <= 256 * 10) KOLIBRI_NORM_ADD(10);
-    else KOLIBRI_NORM_ADD(16);
+#define KOLIBRI_NORM_ADD(THREADS, MAXV, NSC) norm_add<THREADS, MAXV, NSC><<<T, THREADS, 0, 0>>>( \
+        (float *)x->ptr, (float *)xn->ptr, h ? (const float *)h->ptr : NULL, \
+        part ? (const float *)part->ptr : NULL, part ? (const float *)weights->ptr : NULL, \
+        shared ? (const float *)shared->ptr : NULL, NS, pstride, wstride, w_post, w_next, D, eps)
+    /* Decode-sized batches have a block per row and little else to run:
+     * 1024 threads keep each thread's loads few and in flight. */
+    if (T <= 16 && D <= 1024 * 3) {
+        if (part && NS == 7) KOLIBRI_NORM_ADD(1024, 3, 7);
+        else KOLIBRI_NORM_ADD(1024, 3, 0);
+    } else if (D <= 256 * 4) KOLIBRI_NORM_ADD(256, 4, 0);
+    else if (D <= 256 * 10) KOLIBRI_NORM_ADD(256, 10, 0);
+    else KOLIBRI_NORM_ADD(256, 16, 0);
 #undef KOLIBRI_NORM_ADD
     return launched();
 }

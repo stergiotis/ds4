@@ -21,8 +21,10 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | Q4_K experts, after item 1 | 609 / 916 / 772 | 40.7 / 38.6 / 35.5 |
 | F8, after item 2 | 706 / 920 / 774 | 44.9 / 42.2 / 38.6 |
 | Q4_K experts, after item 2 | 612 / 919 / 773 | 43.7 / 41.2 / 37.7 |
+| F8, after item 3 | 707 / 921 / 774 | 46.7 / 44.0 / 40.0 |
+| Q4_K experts, after item 3 | 611 / 917 / 772 | 45.2 / 42.6 / 38.8 |
 
-The per-call breakdown below predates items 1 and 2.
+The per-call breakdown below predates items 1-3.
 
 ### Decode
 
@@ -86,7 +88,7 @@ tok/s.
 |---:|---|---|---|---|
 | 1 | ~~Decode attention with enough waves~~ done | decode +13% at 512, +14% at 32K | small-medium | float noise (summation order) |
 | 2 | ~~Router as BF16 at full bandwidth, top-k fused~~ done | decode +7-8% | small | float noise (summation order) |
-| 3 | Norm and reduce kernels across more than one block per token | decode -1.5 ms (+5%) | small | float noise (reduction order) |
+| 3 | ~~Norm and reduce kernels across more than one block per token~~ done | decode +4% | small | float noise (reduction order) |
 | 4 | k and v (or q, k and v) in one launch | decode -0.6 ms (+2%) | small | none |
 | 5 | LM head at full bandwidth | decode -0.8 ms (+3%) | small | none |
 | 6 | Q4_K expert decode kernels at bandwidth | Q4_K decode -3.1 ms (+11%) | medium | none |
@@ -131,6 +133,15 @@ layer" item.
    blocks (partial sums, then a second pass or the next kernel's prologue)
    brings each to a few microseconds. The FFN reduce reads 8 partial rows
    and is the larger of the two.
+
+   **Done** with one 1024-thread block per decode row instead of a split
+   across blocks: the slot count is a template parameter, so the 7 partial
+   loads per value unroll and go out together, and x stays in registers
+   between the two reductions. FFN reduce + norm 24.5 -> 10.6 us, attention
+   residual + norm 13.4 -> 9.7 us. About 10 us is the floor for one small
+   kernel here; going lower means folding the norms into the neighbouring
+   matvecs (o projection, expert down) with a last-block ticket, as the
+   router does. Prefill keeps 256 threads and is bit-identical.
 4. **k and v together.** Each is 1.3 MB and reaches 121 GB/s; one launch over
    both matrices (they share the input) halves the fixed cost.
 5. **LM head.** 0.66 GB of BF16 at 167 GB/s; the other large matvecs reach

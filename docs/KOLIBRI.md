@@ -183,10 +183,11 @@ Results:
   identical routing and greedy output.
 - ROCm vs numpy, real Kolibri-1, F8 GGUF: all 5 prompts give identical
   16-token greedy continuations, top-1 agreement 1.000 at every prompt position
-  (0.982 on the chat with thinking), residual error ≤ 8e-3, except `count`
-  since the tiled decode attention: one router near-tie at position 5 flips,
-  the final residual differs by 7e-2 from there on and `compare_golden.py`
-  reports it as FAIL, while greedy output and top-1 still match.
+  (0.982 on the chat with thinking), residual error ≤ 8e-3 except `count`
+  (3e-2): a router near-tie at its position 5 decides differently with
+  float-noise changes to the decode kernels, which moves the final residual
+  between 4e-4 and 7e-2 (above the 0.05 threshold, a FAIL, with one of the
+  kernel versions) while greedy output and top-1 still match.
 - Teacher-forced over `tf_text.txt` (196 tokens, German, English, Python)
   against the fp32 reference (`teacher_forced.py`):
 
@@ -221,12 +222,12 @@ VRAM) above idle; host RSS stays under 0.8 GiB.
 
 | GGUF | context | prefill t/s | decode t/s | GPU memory |
 | --- | ---: | ---: | ---: | ---: |
-| F8 (75.7 GiB) | 512 | 706 | 44.9 | 76.3 GiB |
-| F8 | 8192 | 920 | 42.2 | 77.0 GiB |
-| F8 | 32768 | 774 | 38.6 | 77.5 GiB |
-| Q4_K experts (42.8 GiB) | 512 | 612 | 43.7 | 43.3 GiB |
-| Q4_K experts | 8192 | 919 | 41.2 | 44.0 GiB |
-| Q4_K experts | 32768 | 773 | 37.7 | 44.5 GiB |
+| F8 (75.7 GiB) | 512 | 707 | 46.7 | 76.3 GiB |
+| F8 | 8192 | 921 | 44.0 | 77.0 GiB |
+| F8 | 32768 | 774 | 40.0 | 77.5 GiB |
+| Q4_K experts (42.8 GiB) | 512 | 611 | 45.2 | 43.3 GiB |
+| Q4_K experts | 8192 | 917 | 42.6 | 44.0 GiB |
+| Q4_K experts | 32768 | 772 | 38.8 | 44.5 GiB |
 
 Starting point (first correct version, F8, 2K context): 210 t/s prefill,
 21 t/s decode. Decode at 2K spends per token about 4.8 ms on QKV, 4.2 ms on
@@ -249,8 +250,9 @@ The ranked ideas for making it faster are in
 - **Disk KV checkpoints** (`--kv-disk-dir`) and session payload save/load
   refuse Kolibri sessions with an error; live KV reuse works.
 - **Decode loses time in small calls**, not in launches (the host enqueues a
-  token in 1.4 ms): the norms run one block per token and k/v are too small
-  to reach bandwidth, while the large matvecs already read at ~210 GB/s.
+  token in 1.4 ms): each remaining small kernel (norms ~10 us, k/v
+  projections ~11 us) costs about its launch-to-completion floor, while the
+  large matvecs already read at ~210 GB/s.
 - **Router**: decode batches (T <= 8) use a BF16 copy of the F32 router
   weights (exact, checked when the copy is made; 98 MB of GPU memory) with
   logits and top-k in one launch. `DS4_KOLIBRI_ROUTER_F32=1` keeps the F32
