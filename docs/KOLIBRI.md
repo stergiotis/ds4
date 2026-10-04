@@ -236,6 +236,10 @@ workloads (the machine's other 65 GB service, for example).
 
 ## Known gaps
 
+The ranked ideas for making it faster are in
+[strix/KOLIBRI-PLAN.md](../strix/KOLIBRI-PLAN.md).
+
+
 - **FP8 KV cache for the full layers** is not implemented (f16; 5 GiB at
   262144 tokens fits next to the 76 GiB model).
 - **Disk KV checkpoints** (`--kv-disk-dir`) and session payload save/load
