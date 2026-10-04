@@ -62650,44 +62650,64 @@ static void kolibri_graph_reset(ds4_kolibri_gpu_graph *g) {
 /* Routed experts plus the shared expert for T rows of g->xn, reduced into
  * the residual by the post-FFN norm update (next_off: the next layer's
  * attn_norm, or output_norm after the last layer). */
+/* DS4_KOLIBRI_TRACE=1 marks: the label names the work enqueued since the
+ * previous mark, bytes the weights (or KV rows) it reads. */
+static bool kolibri_mark(const char *label, uint64_t bytes) {
+    return ds4_gpu_kolibri_trace_mark(label, bytes) != 0;
+}
+
 static bool kolibri_graph_moe(ds4_kolibri_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                               uint32_t T, uint64_t next_off) {
     const uint32_t E = DS4_N_EMBD, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, F = DS4_N_FF_EXP;
+    /* Expert bytes per token: K routed slices plus the shared expert. */
+    const uint64_t gate_up_bytes = (l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes) / NE * K +
+                                   l->ffn_gate_shexp->bytes + l->ffn_up_shexp->bytes;
+    const uint64_t down_bytes = l->ffn_down_exps->bytes / NE * K + l->ffn_down_shexp->bytes;
     if (!qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, T) ||
+        !kolibri_mark("router matvec", l->ffn_gate_inp->bytes) ||
         !ds4_gpu_kolibri_router_tensor(g->sel, g->weights, g->router, m->map, m->size,
                                        l->ffn_exp_probs_b->abs_offset, T, NE, K, K + 1u,
-                                       DS4_EXPERT_WEIGHT_SCALE)) return false;
+                                       DS4_EXPERT_WEIGHT_SCALE) ||
+        !kolibri_mark("router top-k", 0)) return false;
     const bool mm = T > 8u && qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
                     qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
                     (E % 64u) == 0 && (F % 64u) == 0;
     if (mm) {
         return ds4_gpu_qwen4_moe_build_lists_tensor(g->lists, g->counts, g->sel, T, K, NE, g->cap_tokens) &&
+               kolibri_mark("expert lists", 0) &&
                ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->lists, g->counts, m->map, m->size,
                                                l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                                l->ffn_gate_exps->type, NE, T, K, K, E, F, g->cap_tokens) &&
+               kolibri_mark("experts gate/up", 0) &&
                ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->lists, g->counts, m->map, m->size,
                                                 l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
                                                 NE, T, K, K, F, E, g->cap_tokens) &&
+               kolibri_mark("experts down", 0) &&
                qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->xn, T) &&
                qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->xn, T) &&
                ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * F, 0.0f, 1.0f) &&
                qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
+               kolibri_mark("shared expert", 0) &&
                ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, NULL, g->part, g->weights, g->sh_out,
                                                K, K, K + 1u, m->map, m->size,
-                                               l->ffn_post_norm->abs_offset, next_off, T, E, DS4_RMS_EPS);
+                                               l->ffn_post_norm->abs_offset, next_off, T, E, DS4_RMS_EPS) &&
+               kolibri_mark("ffn reduce+norm", 0);
     }
     return ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->sel, m->map, m->size,
                                         l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                         l->ffn_gate_exps->type, NE, T, K, E, F,
                                         l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
                                         l->ffn_gate_shexp->type) &&
+           kolibri_mark("experts gate/up", gate_up_bytes) &&
            ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->sel, m->map, m->size,
                                          l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
                                          NE, T, K, F, E, l->ffn_down_shexp->abs_offset,
                                          l->ffn_down_shexp->type) &&
+           kolibri_mark("experts down", down_bytes) &&
            ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, NULL, g->part, g->weights, NULL,
                                            K + 1u, K + 1u, K + 1u, m->map, m->size,
-                                           l->ffn_post_norm->abs_offset, next_off, T, E, DS4_RMS_EPS);
+                                           l->ffn_post_norm->abs_offset, next_off, T, E, DS4_RMS_EPS) &&
+           kolibri_mark("ffn reduce+norm", 0);
 }
 
 /* Forward T tokens at g->pos.  logits_out (optional) receives the last row's
@@ -62715,30 +62735,42 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
 #define KOLIBRI_PROF(i_) do { if (timing && ok) { ok = ds4_gpu_end_commands() != 0; \
         const double now_ = now_sec(); prof[i_] += now_ - prof_last; prof_last = now_; \
         ok = ok && glm_graph_begin_commands_if_needed(); } } while (0)
-    bool ok = ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, NULL, NULL, NULL, NULL, 0, 0, 0,
+    bool ok = kolibri_mark(NULL, 0) &&
+              ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, NULL, NULL, NULL, NULL, 0, 0, 0,
                                               m->map, m->size, 0, w->layer[0].attn_norm->abs_offset,
-                                              T, E, DS4_RMS_EPS) != 0;
+                                              T, E, DS4_RMS_EPS) != 0 &&
+              kolibri_mark("input norm", 0);
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         const bool sliding = ds4_kolibri_layer_is_sliding(il);
         const uint64_t next = il + 1u < DS4_N_LAYER ? w->layer[il + 1u].attn_norm->abs_offset
                                                     : w->output_norm->abs_offset;
+        /* f16 K and V rows the last query reads. */
+        const uint64_t keys = sliding && pos0 + T > DS4_N_SLIDING_WINDOW ? DS4_N_SLIDING_WINDOW : pos0 + T;
         ok = qwen4_gemv(g->q, m, l->attn_q, g->xn, T) &&
+             kolibri_mark("q matvec", l->attn_q->bytes) &&
              qwen4_gemv(g->k, m, l->attn_k, g->xn, T) &&
-             qwen4_gemv(g->v, m, l->attn_v, g->xn, T);
+             kolibri_mark("k matvec", l->attn_k->bytes) &&
+             qwen4_gemv(g->v, m, l->attn_v, g->xn, T) &&
+             kolibri_mark("v matvec", l->attn_v->bytes);
         KOLIBRI_PROF(0);
         ok = ok &&
              ds4_gpu_kolibri_qk_prep_tensor(g->q, g->k, g->v, g->kc[il], g->vc[il], m->map, m->size,
                                             l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                             T, H, Hkv, D, pos0, g->cache_rows[il], sliding,
                                             DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
+             kolibri_mark("qk norm+rope+store", 0) &&
              ds4_gpu_kolibri_attention_tensor(g->attn, g->q, g->kc[il], g->vc[il], T, H, Hkv, D, pos0,
-                                              g->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u);
+                                              g->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u) &&
+             kolibri_mark(sliding ? "attention sliding" : "attention full",
+                          keys * Hkv * D * 2u * sizeof(uint16_t));
         KOLIBRI_PROF(1);
         ok = ok && qwen4_gemv(g->h, m, l->attn_output, g->attn, T) &&
+             kolibri_mark("o matvec", l->attn_output->bytes) &&
              ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, g->h, NULL, NULL, NULL, 0, 0, 0,
                                              m->map, m->size, l->attn_post_norm->abs_offset,
-                                             l->ffn_norm->abs_offset, T, E, DS4_RMS_EPS);
+                                             l->ffn_norm->abs_offset, T, E, DS4_RMS_EPS) &&
+             kolibri_mark("attn residual+norm", 0);
         KOLIBRI_PROF(2);
         ok = ok && kolibri_graph_moe(g, m, l, T, next);
         KOLIBRI_PROF(3);
@@ -62753,10 +62785,12 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
             ok = last && qwen4_gemv(g->logits, m, w->output, last, 1);
             ds4_gpu_tensor_free(last);
         }
+        ok = ok && kolibri_mark("lm head", w->output->bytes);
     }
     KOLIBRI_PROF(4);
 #undef KOLIBRI_PROF
     if (!ds4_gpu_end_commands()) ok = false;
+    if (ok) ds4_gpu_kolibri_trace_end(T);
     if (timing) {
         fprintf(stderr, "ds4: Kolibri forward pos=%u T=%u ms: qkv %.1f attn %.1f o+norm %.1f moe %.1f head %.1f\n",
                 pos0, T, 1e3 * prof[0], 1e3 * prof[1], 1e3 * prof[2], 1e3 * prof[3], 1e3 * prof[4]);

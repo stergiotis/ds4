@@ -491,3 +491,141 @@ extern "C" int ds4_gpu_kolibri_norm_add_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor
 #undef KOLIBRI_NORM_ADD
     return launched();
 }
+
+/* DS4_KOLIBRI_TRACE=1.  Each interval is stream time between two timing
+ * events, so it covers the kernels enqueued in between plus any gap where
+ * the GPU waited for the host to launch them; the host column (enqueue time
+ * per call) shows when that happens.  Events and records are preallocated;
+ * nothing synchronizes before the forward's own end_commands. */
+namespace kolibri_trace {
+
+enum { MAX_MARKS = 4096, MAX_LABELS = 48 };
+
+struct label_stat {
+    const char *label;
+    uint64_t calls;
+    double gpu_ms, host_ms, bytes;
+};
+
+struct bucket {
+    label_stat stat[MAX_LABELS];
+    unsigned n_stat;
+    uint64_t forwards, tokens, overflow;
+    double wall_ms, gpu_ms, host_ms;
+};
+
+static int enabled = -1;
+static cudaEvent_t ev[MAX_MARKS];
+static const char *label[MAX_MARKS];
+static uint64_t bytes[MAX_MARKS];
+static double host[MAX_MARKS];
+static unsigned n_ev, n_marks;
+static bool overflow;
+static bucket bk[2];   /* 0 decode, 1 prefill */
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+
+static label_stat *find(bucket *b, const char *name) {
+    for (unsigned i = 0; i < b->n_stat; i++)
+        if (strcmp(b->stat[i].label, name) == 0) return &b->stat[i];
+    if (b->n_stat == MAX_LABELS) return NULL;
+    label_stat *s = &b->stat[b->n_stat++];
+    memset(s, 0, sizeof(*s));
+    s->label = name;
+    return s;
+}
+
+static int by_gpu(const void *a, const void *b) {
+    const double x = ((const label_stat *)a)->gpu_ms, y = ((const label_stat *)b)->gpu_ms;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void report(void) {
+    static const char *name[2] = {"decode", "prefill"};
+    for (int k = 0; k < 2; k++) {
+        bucket *b = &bk[k];
+        if (!b->forwards) continue;
+        const double f = (double)b->forwards;
+        fprintf(stderr, "ds4: Kolibri trace, %s: %llu forwards, %llu tokens; per forward: "
+                "wall %.2f ms, GPU %.2f ms, host enqueue %.2f ms%s\n",
+                name[k], (unsigned long long)b->forwards, (unsigned long long)b->tokens,
+                b->wall_ms / f, b->gpu_ms / f, b->host_ms / f,
+                b->overflow ? " (some forwards had too many marks and were skipped)" : "");
+        fprintf(stderr, "ds4:   %-22s %8s %10s %6s %10s %8s %8s\n",
+                "call", "calls/fw", "GPU us/fw", "%", "host us/fw", "us/call", "GB/s");
+        qsort(b->stat, b->n_stat, sizeof(b->stat[0]), by_gpu);
+        for (unsigned i = 0; i < b->n_stat; i++) {
+            const label_stat *s = &b->stat[i];
+            char bw[16] = "";
+            if (s->bytes > 0 && s->gpu_ms > 0) snprintf(bw, sizeof(bw), "%.0f", s->bytes / s->gpu_ms * 1e-6);
+            fprintf(stderr, "ds4:   %-22s %8.1f %10.1f %6.1f %10.1f %8.1f %8s\n",
+                    s->label, s->calls / f, 1e3 * s->gpu_ms / f, 100.0 * s->gpu_ms / b->gpu_ms,
+                    1e3 * s->host_ms / f, 1e3 * s->gpu_ms / s->calls, bw);
+        }
+    }
+    for (unsigned i = 0; i < n_ev; i++) (void)cudaEventDestroy(ev[i]);
+    n_ev = n_marks = 0;
+}
+
+static bool on(void) {
+    if (enabled < 0) {
+        const char *v = getenv("DS4_KOLIBRI_TRACE");
+        enabled = v && v[0] && strcmp(v, "0") != 0;
+        if (enabled) atexit(report);
+    }
+    return enabled != 0;
+}
+
+}  // namespace kolibri_trace
+
+extern "C" int ds4_gpu_kolibri_trace_mark(const char *name, uint64_t nbytes) {
+    using namespace kolibri_trace;
+    if (!on()) return 1;
+    if (!name) n_marks = 0, overflow = false;
+    if (n_marks == MAX_MARKS) {
+        overflow = true;
+        return 1;
+    }
+    if (n_marks == n_ev) {
+        if (!cuda_ok(cudaEventCreate(&ev[n_ev]), "Kolibri trace event")) return 0;
+        n_ev++;
+    }
+    label[n_marks] = name;
+    bytes[n_marks] = nbytes;
+    host[n_marks] = now_ms();
+    if (!cuda_ok(cudaEventRecord(ev[n_marks], 0), "Kolibri trace record")) return 0;
+    n_marks++;
+    return 1;
+}
+
+extern "C" int ds4_gpu_kolibri_trace_end(uint32_t T) {
+    using namespace kolibri_trace;
+    if (!on() || n_marks < 2 || label[0]) return 1;
+    bucket *b = &bk[T > 1];
+    if (overflow) {
+        b->overflow++;
+        n_marks = 0;
+        return 1;
+    }
+    for (unsigned i = 1; i < n_marks; i++) {
+        float ms = 0.0f;
+        if (!cuda_ok(cudaEventElapsedTime(&ms, ev[i - 1], ev[i]), "Kolibri trace elapsed")) return 0;
+        label_stat *s = find(b, label[i]);
+        if (!s) continue;
+        s->calls++;
+        s->gpu_ms += ms;
+        s->host_ms += host[i] - host[i - 1];
+        s->bytes += (double)bytes[i];
+        b->gpu_ms += ms;
+    }
+    b->host_ms += host[n_marks - 1] - host[0];
+    b->wall_ms += now_ms() - host[0];
+    b->forwards++;
+    b->tokens += T;
+    n_marks = 0;
+    return 1;
+}

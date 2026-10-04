@@ -3603,6 +3603,14 @@ int ds4_gpu_kolibri_norm_add_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *xn,
         const ds4_gpu_tensor *shared, uint32_t NS, uint32_t pstride, uint32_t wstride,
         const void *map, uint64_t size, uint64_t post_off, uint64_t next_off,
         uint32_t T, uint32_t D, float eps);
+/* DS4_KOLIBRI_TRACE=1: GPU time per labelled call, from timing events
+ * recorded between calls without synchronizing.  mark(NULL, 0) starts a
+ * forward; mark(label, bytes) closes the interval since the previous mark;
+ * end(T) runs after the forward's final synchronize and adds the intervals
+ * to the decode (T == 1) or prefill totals, printed at exit.  Without the
+ * variable both return 1 and do nothing. */
+int ds4_gpu_kolibri_trace_mark(const char *label, uint64_t bytes);
+int ds4_gpu_kolibri_trace_end(uint32_t T);
 
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
