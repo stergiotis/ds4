@@ -19,8 +19,10 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | Q4_K experts | 611 / 918 / 773 | 36.8 / 35.6 / 31.4 |
 | F8, after item 1 | 706 / 922 / 776 | 41.4 / 39.3 / 36.1 |
 | Q4_K experts, after item 1 | 609 / 916 / 772 | 40.7 / 38.6 / 35.5 |
+| F8, after item 2 | 706 / 920 / 774 | 44.9 / 42.2 / 38.6 |
+| Q4_K experts, after item 2 | 612 / 919 / 773 | 43.7 / 41.2 / 37.7 |
 
-The per-call breakdown below predates item 1.
+The per-call breakdown below predates items 1 and 2.
 
 ### Decode
 
@@ -83,7 +85,7 @@ tok/s.
 | # | Idea | Expected gain | Effort | Correctness risk |
 |---:|---|---|---|---|
 | 1 | ~~Decode attention with enough waves~~ done | decode +13% at 512, +14% at 32K | small-medium | float noise (summation order) |
-| 2 | Router as BF16 at full bandwidth, top-k fused | decode -2.0 ms (+7%) | small | none (source is BF16) |
+| 2 | ~~Router as BF16 at full bandwidth, top-k fused~~ done | decode +7-8% | small | float noise (summation order) |
 | 3 | Norm and reduce kernels across more than one block per token | decode -1.5 ms (+5%) | small | float noise (reduction order) |
 | 4 | k and v (or q, k and v) in one launch | decode -0.6 ms (+2%) | small | none |
 | 5 | LM head at full bandwidth | decode -0.8 ms (+3%) | small | none |
@@ -117,6 +119,13 @@ layer" item.
    launch or the next saves the rest. The converter and Kolibri's layout
    check (which requires an F32 router) change; old GGUFs keep working
    through the F32 path.
+
+   **Done**, without touching the converter: the backend makes a BF16 copy
+   of each layer's F32 router on first use (exact; it checks that every low
+   half is zero, else that layer stays F32) and one launch per decode
+   batch computes the logits (one wave per expert, ~160 GB/s) and, in the
+   block that finishes last, the top-k. 2.9 ms -> 1.2 ms per token. Prefill
+   (T > 8) keeps the F32 matvec.
 3. **Norms.** `norm_add` runs one 256-thread block per token, so at T = 1
    one block works alone on the GPU for 14-25 us. Splitting the row across
    blocks (partial sums, then a second pass or the next kernel's prologue)

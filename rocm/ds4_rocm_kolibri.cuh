@@ -123,6 +123,19 @@ __device__ __forceinline__ float wave_max(float x) {
     return x;
 }
 
+__device__ __forceinline__ unsigned wave_min_u32(unsigned x) {
+#if defined(__gfx1151__)
+    x = min(x, (unsigned)__builtin_amdgcn_permlanex16((int)x, (int)x, 0x76543210, 0xFEDCBA98, true, false));
+    x = min(x, (unsigned)__builtin_amdgcn_update_dpp(0, (int)x, 0x160 | 8, 0xf, 0xf, true));
+    x = min(x, (unsigned)__builtin_amdgcn_update_dpp(0, (int)x, 0x160 | 4, 0xf, 0xf, true));
+    x = min(x, (unsigned)__builtin_amdgcn_update_dpp(0, (int)x, 0x160 | 2, 0xf, 0xf, true));
+    x = min(x, (unsigned)__builtin_amdgcn_update_dpp(0, (int)x, 0x160 | 1, 0xf, 0xf, true));
+#else
+    for (int d = 16; d; d >>= 1) x = min(x, (unsigned)__shfl_xor((int)x, d, 32));
+#endif
+    return x;
+}
+
 /* Decode-sized batches: one block per (KV head, key split, row).  The
  * block's waves form W tile slots × G/GH head groups: each wave takes 32-key
  * tiles in turn and scores them against its GH query heads, lane i holding
@@ -317,6 +330,100 @@ __global__ void router(int *sel, float *weights, const float *logits, const floa
         __syncthreads();
     }
     if (!tid) for (unsigned s = NS; s < stride; s++) weights[(uint64_t)t * stride + s] = 1.0f;
+}
+
+/* Router weights as BF16: the GGUF stores them as F32 widened from the
+ * source's BF16, so dropping the low half is exact.  pack also counts the
+ * values whose low half is not zero (then the copy is not used). */
+__global__ void router_pack(uint16_t *dst, const float *src, uint64_t n, unsigned *inexact) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned bits = __float_as_uint(src[i]);
+    dst[i] = (uint16_t)(bits >> 16);
+    if (bits & 0xffffu) atomicAdd(inexact, 1u);
+}
+
+__device__ unsigned router_ticket;
+
+/* Decode-sized router: logits for T <= 8 rows, then top-k selection, in one
+ * launch.  One wave per expert row loads its K BF16 weights (K % 256 == 0,
+ * K <= 4096) up front and applies them to every row; the block that
+ * finishes last (ticket) selects the experts, one wave per row with each
+ * lane holding experts lane + 32 j.  Selection matches router: highest
+ * logit + bias first, ties to the lower id, weight sigmoid(logit) * scale,
+ * slots NS..stride-1 get 1.0. */
+template<unsigned KC>
+__global__ __launch_bounds__(128) void router_decode(int *sel, float *weights, float *logits,
+        const float *x, const uint16_t *w, const float *bias, unsigned T, unsigned K, unsigned NE,
+        unsigned NS, unsigned stride, float scale) {
+    const unsigned wave = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const unsigned e = blockIdx.x * 4 + wave;
+    __shared__ float4 xs[KC * 64];
+    {
+        const uint4 *row = (const uint4 *)(w + (uint64_t)min(e, NE - 1) * K);
+        uint4 wv[KC];
+        #pragma unroll
+        for (unsigned c = 0; c < KC; c++) wv[c] = row[c * 32 + lane];
+        for (unsigned t = 0; t < T; t++) {
+            /* The block's four waves share each x row through LDS. */
+            if (t) __syncthreads();
+            const float4 *xg = (const float4 *)(x + (uint64_t)t * K);
+            for (unsigned i = threadIdx.x; i < K / 4; i += blockDim.x) xs[i] = xg[i];
+            __syncthreads();
+            const float4 *xr = xs;
+            float acc = 0;
+            #pragma unroll
+            for (unsigned c = 0; c < KC; c++) {
+                const float4 a = xr[(c * 32 + lane) * 2], b = xr[(c * 32 + lane) * 2 + 1];
+                const uint4 q = wv[c];
+                acc += a.x * __uint_as_float(q.x << 16) + a.y * __uint_as_float(q.x & 0xffff0000u) +
+                       a.z * __uint_as_float(q.y << 16) + a.w * __uint_as_float(q.y & 0xffff0000u) +
+                       b.x * __uint_as_float(q.z << 16) + b.y * __uint_as_float(q.z & 0xffff0000u) +
+                       b.z * __uint_as_float(q.w << 16) + b.w * __uint_as_float(q.w & 0xffff0000u);
+            }
+            acc = sum(acc);
+            if (!lane && e < NE) logits[(uint64_t)t * NE + e] = acc;
+        }
+    }
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (!threadIdx.x) {
+        last = atomicAdd(&router_ticket, 1u) == gridDim.x - 1;
+        if (last) router_ticket = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    /* Acquire: the agent-scope fence invalidates this CU's caches, so plain
+     * loads see the other blocks' logits. */
+    __threadfence();
+    constexpr unsigned J = 16;   /* NE <= 512 */
+    for (unsigned t = wave; t < T; t += 4) {
+        const float *lr = logits + (uint64_t)t * NE;
+        float sc[J];
+        #pragma unroll
+        for (unsigned j = 0; j < J; j++) {
+            const unsigned ej = lane + 32 * j;
+            sc[j] = ej < NE ? lr[ej] + bias[ej] : -INFINITY;
+        }
+        for (unsigned s = 0; s < NS; s++) {
+            float bv = -INFINITY;
+            unsigned bi = UINT_MAX;
+            #pragma unroll
+            for (unsigned j = 0; j < J; j++)
+                if (sc[j] > bv) { bv = sc[j]; bi = lane + 32 * j; }
+            /* Highest score, then the lowest id among the lanes holding it. */
+            const float top = wave_max(bv);
+            bi = wave_min_u32(bv == top ? bi : UINT_MAX);
+            #pragma unroll
+            for (unsigned j = 0; j < J; j++) if (lane + 32 * j == bi) sc[j] = -INFINITY;
+            if (!lane) {
+                sel[(uint64_t)t * NS + s] = (int)bi;
+                weights[(uint64_t)t * stride + s] = sigmoid(lr[bi]) * scale;
+            }
+        }
+        if (!lane) for (unsigned s = NS; s < stride; s++) weights[(uint64_t)t * stride + s] = 1.0f;
+    }
 }
 
 /* One block of 256 threads per token row; D <= 256 * MAXV. */
@@ -568,6 +675,72 @@ extern "C" int ds4_gpu_kolibri_router_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor
     if (!bias) return 0;
     router<<<T, 256, 0, 0>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
         bias, NE, NS, stride, scale);
+    return launched();
+}
+
+/* BF16 copies of the router weights, one per weight offset, made on first
+ * use and kept for the process.  inexact marks an F32 router that is not
+ * BF16-exact; it keeps the F32 path. */
+namespace kolibri_rocm {
+struct router_copy { const void *map; uint64_t off; uint16_t *w; bool inexact; };
+static router_copy router_copies[256];
+static unsigned n_router_copies;
+
+static const router_copy *router_bf16(const void *map, uint64_t size, uint64_t off, uint64_t n) {
+    for (unsigned i = 0; i < n_router_copies; i++)
+        if (router_copies[i].map == map && router_copies[i].off == off) return &router_copies[i];
+    if (n_router_copies == sizeof(router_copies) / sizeof(router_copies[0])) return NULL;
+    const float *src = f32_weight(map, size, off, n);
+    if (!src) return NULL;
+    router_copy c = {map, off, NULL, false};
+    unsigned *inexact = NULL, h_inexact = 0;
+    if (!cuda_ok(cudaMalloc((void **)&c.w, n * 2), "Kolibri router copy") ||
+        !cuda_ok(cudaMalloc((void **)&inexact, 4), "Kolibri router copy") ||
+        !cuda_ok(cudaMemset(inexact, 0, 4), "Kolibri router copy")) return NULL;
+    router_pack<<<(unsigned)((n + 255) / 256), 256, 0, 0>>>(c.w, src, n, inexact);
+    if (!launched() || !cuda_ok(cudaMemcpy(&h_inexact, inexact, 4, cudaMemcpyDeviceToHost), "Kolibri router copy"))
+        return NULL;
+    (void)cudaFree(inexact);
+    if (h_inexact) {
+        fprintf(stderr, "ds4: Kolibri router at offset %llu has %u values that are not BF16; it stays F32\n",
+                (unsigned long long)off, h_inexact);
+        (void)cudaFree(c.w);
+        c.w = NULL;
+        c.inexact = true;
+    }
+    router_copies[n_router_copies] = c;
+    return &router_copies[n_router_copies++];
+}
+}  // namespace kolibri_rocm
+
+/* Router for decode-sized batches.  Returns -1 when the fused path does not
+ * apply (shape, an inexact router, DS4_KOLIBRI_ROUTER_F32=1), so the caller
+ * runs the F32 matvec and ds4_gpu_kolibri_router_tensor instead. */
+extern "C" int ds4_gpu_kolibri_router_decode_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t w_off, uint64_t bias_off, uint32_t T, uint32_t K, uint32_t NE, uint32_t NS,
+        uint32_t stride, float scale) {
+    using namespace kolibri_rocm;
+    static int f32 = -1;
+    if (f32 < 0) f32 = getenv("DS4_KOLIBRI_ROUTER_F32") != NULL;
+    if (f32 || !T || T > 8 || K % 256 || K > 4096 || !NE || NE > 512 || !NS || NS > NE || stride < NS)
+        return -1;
+    if (!tensor(sel, (uint64_t)T * NS * 4) || !tensor(weights, (uint64_t)T * stride * 4) ||
+        !tensor(logits, (uint64_t)T * NE * 4) || !tensor(x, (uint64_t)T * K * 4)) return 0;
+    const router_copy *c = router_bf16(map, size, w_off, (uint64_t)K * NE);
+    if (!c) return 0;
+    if (c->inexact) return -1;
+    const float *bias = f32_weight(map, size, bias_off, NE);
+    if (!bias) return 0;
+    const unsigned blocks = (NE + 3) / 4;
+#define KOLIBRI_ROUTER(KC) router_decode<KC><<<blocks, 128, 0, 0>>>((int *)sel->ptr, (float *)weights->ptr, \
+        (float *)logits->ptr, (const float *)x->ptr, c->w, bias, T, K, NE, NS, stride, scale)
+    switch (K / 256) {
+    case 10: KOLIBRI_ROUTER(10); break;
+    case 16: KOLIBRI_ROUTER(16); break;
+    default: return -1;
+    }
+#undef KOLIBRI_ROUTER
     return launched();
 }
 

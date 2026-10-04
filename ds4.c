@@ -62663,12 +62663,21 @@ static bool kolibri_graph_moe(ds4_kolibri_gpu_graph *g, const ds4_model *m, cons
     const uint64_t gate_up_bytes = (l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes) / NE * K +
                                    l->ffn_gate_shexp->bytes + l->ffn_up_shexp->bytes;
     const uint64_t down_bytes = l->ffn_down_exps->bytes / NE * K + l->ffn_down_shexp->bytes;
-    if (!qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, T) ||
-        !kolibri_mark("router matvec", l->ffn_gate_inp->bytes) ||
-        !ds4_gpu_kolibri_router_tensor(g->sel, g->weights, g->router, m->map, m->size,
-                                       l->ffn_exp_probs_b->abs_offset, T, NE, K, K + 1u,
-                                       DS4_EXPERT_WEIGHT_SCALE) ||
-        !kolibri_mark("router top-k", 0)) return false;
+    const int fused = ds4_gpu_kolibri_router_decode_tensor(g->sel, g->weights, g->router, g->xn,
+                                                           m->map, m->size, l->ffn_gate_inp->abs_offset,
+                                                           l->ffn_exp_probs_b->abs_offset, T, E, NE, K,
+                                                           K + 1u, DS4_EXPERT_WEIGHT_SCALE);
+    if (fused == 0) return false;
+    if (fused > 0) {
+        if (!kolibri_mark("router (bf16, top-k)", l->ffn_gate_inp->bytes / 2u)) return false;
+    } else if (!qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, T) ||
+               !kolibri_mark("router matvec", l->ffn_gate_inp->bytes) ||
+               !ds4_gpu_kolibri_router_tensor(g->sel, g->weights, g->router, m->map, m->size,
+                                              l->ffn_exp_probs_b->abs_offset, T, NE, K, K + 1u,
+                                              DS4_EXPERT_WEIGHT_SCALE) ||
+               !kolibri_mark("router top-k", 0)) {
+        return false;
+    }
     const bool mm = T > 8u && qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
                     qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
                     (E % 64u) == 0 && (F % 64u) == 0;

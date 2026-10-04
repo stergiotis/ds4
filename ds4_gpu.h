@@ -3603,6 +3603,14 @@ int ds4_gpu_kolibri_norm_add_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *xn,
         const ds4_gpu_tensor *shared, uint32_t NS, uint32_t pstride, uint32_t wstride,
         const void *map, uint64_t size, uint64_t post_off, uint64_t next_off,
         uint32_t T, uint32_t D, float eps);
+/* Router logits and top-k selection for T <= 8 rows in one launch, from a
+ * BF16 copy of the F32 router weights (exact for Kolibri's GGUFs).  Returns
+ * -1 when it does not apply; the caller then runs the dense matvec and
+ * ds4_gpu_kolibri_router_tensor. */
+int ds4_gpu_kolibri_router_decode_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t w_off, uint64_t bias_off, uint32_t T, uint32_t K, uint32_t NE, uint32_t NS,
+        uint32_t stride, float scale);
 /* DS4_KOLIBRI_TRACE=1: GPU time per labelled call, from timing events
  * recorded between calls without synchronizing.  mark(NULL, 0) starts a
  * forward; mark(label, bytes) closes the interval since the previous mark;

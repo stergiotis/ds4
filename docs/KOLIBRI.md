@@ -221,12 +221,12 @@ VRAM) above idle; host RSS stays under 0.8 GiB.
 
 | GGUF | context | prefill t/s | decode t/s | GPU memory |
 | --- | ---: | ---: | ---: | ---: |
-| F8 (75.7 GiB) | 512 | 706 | 41.4 | 76.2 GiB |
-| F8 | 8192 | 922 | 39.3 | 76.9 GiB |
-| F8 | 32768 | 776 | 36.1 | 77.4 GiB |
-| Q4_K experts (42.8 GiB) | 512 | 609 | 40.7 | 43.2 GiB |
-| Q4_K experts | 8192 | 916 | 38.6 | 43.9 GiB |
-| Q4_K experts | 32768 | 772 | 35.5 | 44.4 GiB |
+| F8 (75.7 GiB) | 512 | 706 | 44.9 | 76.3 GiB |
+| F8 | 8192 | 920 | 42.2 | 77.0 GiB |
+| F8 | 32768 | 774 | 38.6 | 77.5 GiB |
+| Q4_K experts (42.8 GiB) | 512 | 612 | 43.7 | 43.3 GiB |
+| Q4_K experts | 8192 | 919 | 41.2 | 44.0 GiB |
+| Q4_K experts | 32768 | 773 | 37.7 | 44.5 GiB |
 
 Starting point (first correct version, F8, 2K context): 210 t/s prefill,
 21 t/s decode. Decode at 2K spends per token about 4.8 ms on QKV, 4.2 ms on
@@ -249,8 +249,12 @@ The ranked ideas for making it faster are in
 - **Disk KV checkpoints** (`--kv-disk-dir`) and session payload save/load
   refuse Kolibri sessions with an error; live KV reuse works.
 - **Decode loses time in small calls**, not in launches (the host enqueues a
-  token in 1.4 ms): the F32 router reads at 84 GB/s and the norms run one
-  block per token, while the large matvecs already read at ~210 GB/s.
+  token in 1.4 ms): the norms run one block per token and k/v are too small
+  to reach bandwidth, while the large matvecs already read at ~210 GB/s.
+- **Router**: decode batches (T <= 8) use a BF16 copy of the F32 router
+  weights (exact, checked when the copy is made; 98 MB of GPU memory) with
+  logits and top-k in one launch. `DS4_KOLIBRI_ROUTER_F32=1` keeps the F32
+  matvec; prefill always uses it.
   Q4_K experts read half the bytes of F8 but at half the bandwidth, so both
   GGUFs decode at the same speed. `DS4_KOLIBRI_TRACE=1` shows the per-call
   split.
