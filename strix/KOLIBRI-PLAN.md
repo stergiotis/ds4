@@ -23,8 +23,10 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | Q4_K experts, after item 2 | 612 / 919 / 773 | 43.7 / 41.2 / 37.7 |
 | F8, after item 3 | 707 / 921 / 774 | 46.7 / 44.0 / 40.0 |
 | Q4_K experts, after item 3 | 611 / 917 / 772 | 45.2 / 42.6 / 38.8 |
+| F8, after item 4 | 708 / 923 / 774 | 47.3 / 44.4 / 40.4 |
+| Q4_K experts, after item 4 | 611 / 917 / 772 | 45.7 / 43.0 / 39.2 |
 
-The per-call breakdown below predates items 1-3.
+The per-call breakdown below predates items 1-4.
 
 ### Decode
 
@@ -89,7 +91,7 @@ tok/s.
 | 1 | ~~Decode attention with enough waves~~ done | decode +13% at 512, +14% at 32K | small-medium | float noise (summation order) |
 | 2 | ~~Router as BF16 at full bandwidth, top-k fused~~ done | decode +7-8% | small | float noise (summation order) |
 | 3 | ~~Norm and reduce kernels across more than one block per token~~ done | decode +4% | small | float noise (reduction order) |
-| 4 | k and v (or q, k and v) in one launch | decode -0.6 ms (+2%) | small | none |
+| 4 | ~~k and v (or q, k and v) in one launch~~ done | decode +1% | small | none (bit-identical) |
 | 5 | LM head at full bandwidth | decode -0.8 ms (+3%) | small | none |
 | 6 | Q4_K expert decode kernels at bandwidth | Q4_K decode -3.1 ms (+11%) | medium | none |
 | 7 | F8-specific WMMA expert tile for prefill | prefill +30-50% | medium | none |
@@ -144,6 +146,12 @@ layer" item.
    router does. Prefill keeps 256 threads and is bit-identical.
 4. **k and v together.** Each is 1.3 MB and reaches 121 GB/s; one launch over
    both matrices (they share the input) halves the fixed cost.
+
+   **Done** as one matvec over q, k and v: the converter writes them back
+   to back with one row type and width, so a decode row reads them as a
+   single 7168-row matrix into [q | k | v] and uses views. 4.89 -> 4.34 ms
+   per token at 218 GB/s; output bit-identical. Rows of a T > 1 batch keep
+   three launches (their outputs are not contiguous per tensor).
 5. **LM head.** 0.66 GB of BF16 at 167 GB/s; the other large matvecs reach
    211. Probably the BF16 reader or the row split for a 128000-row output.
 6. **Q4_K expert decode kernels.** #1070's per-row kernels do Q4_K

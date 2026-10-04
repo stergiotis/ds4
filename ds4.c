@@ -62572,6 +62572,7 @@ typedef struct {
     uint32_t ctx_cap, cap_tokens, pos;
     uint32_t n_logit_rows;
     ds4_gpu_tensor *x, *xn, *q, *k, *v, *attn, *h;
+    ds4_gpu_tensor *qkv, *q1, *k1, *v1;   /* one decode row: [q | k | v] and views */
     ds4_gpu_tensor *router, *sel, *weights, *mid, *part, *lists, *counts;
     ds4_gpu_tensor *sh_gate, *sh_up, *sh_mid, *sh_out, *logits;
     ds4_gpu_tensor *kc[DS4_MAX_LAYER], *vc[DS4_MAX_LAYER];
@@ -62580,7 +62581,8 @@ typedef struct {
 } ds4_kolibri_gpu_graph;
 
 static void kolibri_graph_free(ds4_kolibri_gpu_graph *g) {
-    ds4_gpu_tensor **t[] = { &g->x, &g->xn, &g->q, &g->k, &g->v, &g->attn, &g->h, &g->router,
+    ds4_gpu_tensor **t[] = { &g->q1, &g->k1, &g->v1, &g->qkv,
+                             &g->x, &g->xn, &g->q, &g->k, &g->v, &g->attn, &g->h, &g->router,
                              &g->sel, &g->weights, &g->mid, &g->part, &g->lists, &g->counts,
                              &g->sh_gate, &g->sh_up, &g->sh_mid, &g->sh_out, &g->logits };
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) { ds4_gpu_tensor_free(*t[i]); *t[i] = NULL; }
@@ -62621,6 +62623,10 @@ static bool kolibri_graph_alloc(ds4_kolibri_gpu_graph *g, uint32_t ctx_cap, uint
         (g->q = qwen4_graph_alloc_f32(T * q_dim)) && (g->k = qwen4_graph_alloc_f32(T * kv_dim)) &&
         (g->v = qwen4_graph_alloc_f32(T * kv_dim)) && (g->attn = qwen4_graph_alloc_f32(T * q_dim)) &&
         (g->h = qwen4_graph_alloc_f32(T * E)) &&
+        (g->qkv = qwen4_graph_alloc_f32(q_dim + 2u * kv_dim)) &&
+        (g->q1 = ds4_gpu_tensor_view(g->qkv, 0, q_dim * 4u)) &&
+        (g->k1 = ds4_gpu_tensor_view(g->qkv, q_dim * 4u, kv_dim * 4u)) &&
+        (g->v1 = ds4_gpu_tensor_view(g->qkv, (q_dim + kv_dim) * 4u, kv_dim * 4u)) &&
         (g->router = qwen4_graph_alloc_f32(T * DS4_N_EXPERT)) &&
         (g->sel = qwen4_graph_alloc_f32(T * K)) && (g->weights = qwen4_graph_alloc_f32(T * NO)) &&
         (g->mid = qwen4_graph_alloc_f32(T * NO * F)) && (g->part = qwen4_graph_alloc_f32(T * NO * E)) &&
@@ -62719,6 +62725,15 @@ static bool kolibri_graph_moe(ds4_kolibri_gpu_graph *g, const ds4_model *m, cons
            kolibri_mark("ffn reduce+norm", 0);
 }
 
+/* q, k and v stored back to back with one row type and width: a decode
+ * row projects all three in one matvec. */
+static bool kolibri_qkv_adjacent(const ds4_layer_weights *l) {
+    return l->attn_k->type == l->attn_q->type && l->attn_v->type == l->attn_q->type &&
+           l->attn_k->dim[0] == l->attn_q->dim[0] && l->attn_v->dim[0] == l->attn_q->dim[0] &&
+           l->attn_k->abs_offset == l->attn_q->abs_offset + l->attn_q->bytes &&
+           l->attn_v->abs_offset == l->attn_k->abs_offset + l->attn_k->bytes;
+}
+
 /* Forward T tokens at g->pos.  logits_out (optional) receives the last row's
  * logits, or every row's when all_rows. */
 static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
@@ -62756,20 +62771,30 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
                                                     : w->output_norm->abs_offset;
         /* f16 K and V rows the last query reads. */
         const uint64_t keys = sliding && pos0 + T > DS4_N_SLIDING_WINDOW ? DS4_N_SLIDING_WINDOW : pos0 + T;
-        ok = qwen4_gemv(g->q, m, l->attn_q, g->xn, T) &&
-             kolibri_mark("q matvec", l->attn_q->bytes) &&
-             qwen4_gemv(g->k, m, l->attn_k, g->xn, T) &&
-             kolibri_mark("k matvec", l->attn_k->bytes) &&
-             qwen4_gemv(g->v, m, l->attn_v, g->xn, T) &&
-             kolibri_mark("v matvec", l->attn_v->bytes);
+        const bool fused_qkv = T == 1u && kolibri_qkv_adjacent(l);
+        ds4_gpu_tensor *q = fused_qkv ? g->q1 : g->q, *k = fused_qkv ? g->k1 : g->k;
+        ds4_gpu_tensor *v = fused_qkv ? g->v1 : g->v;
+        if (fused_qkv) {
+            const uint64_t rows = l->attn_q->dim[1] + l->attn_k->dim[1] + l->attn_v->dim[1];
+            ok = ds4_gpu_qwen4_dense_mm_tensor(g->qkv, g->xn, m->map, m->size, l->attn_q->abs_offset,
+                                               l->attn_q->type, 1, E, (uint32_t)rows) != 0 &&
+                 kolibri_mark("qkv matvec", l->attn_q->bytes + l->attn_k->bytes + l->attn_v->bytes);
+        } else {
+            ok = qwen4_gemv(q, m, l->attn_q, g->xn, T) &&
+                 kolibri_mark("q matvec", l->attn_q->bytes) &&
+                 qwen4_gemv(k, m, l->attn_k, g->xn, T) &&
+                 kolibri_mark("k matvec", l->attn_k->bytes) &&
+                 qwen4_gemv(v, m, l->attn_v, g->xn, T) &&
+                 kolibri_mark("v matvec", l->attn_v->bytes);
+        }
         KOLIBRI_PROF(0);
         ok = ok &&
-             ds4_gpu_kolibri_qk_prep_tensor(g->q, g->k, g->v, g->kc[il], g->vc[il], m->map, m->size,
+             ds4_gpu_kolibri_qk_prep_tensor(q, k, v, g->kc[il], g->vc[il], m->map, m->size,
                                             l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                             T, H, Hkv, D, pos0, g->cache_rows[il], sliding,
                                             DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
              kolibri_mark("qk norm+rope+store", 0) &&
-             ds4_gpu_kolibri_attention_tensor(g->attn, g->q, g->kc[il], g->vc[il], T, H, Hkv, D, pos0,
+             ds4_gpu_kolibri_attention_tensor(g->attn, q, g->kc[il], g->vc[il], T, H, Hkv, D, pos0,
                                               g->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u) &&
              kolibri_mark(sliding ? "attention sliding" : "attention full",
                           keys * Hkv * D * 2u * sizeof(uint16_t));
