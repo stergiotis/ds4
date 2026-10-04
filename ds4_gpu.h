@@ -3611,6 +3611,10 @@ int ds4_gpu_kolibri_router_decode_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *we
         ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
         uint64_t w_off, uint64_t bias_off, uint32_t T, uint32_t K, uint32_t NE, uint32_t NS,
         uint32_t stride, float scale);
+/* LM head for one row from BF16 weights (K = 2560).  Returns -1 when it
+ * does not apply; the caller then runs the generic matvec. */
+int ds4_gpu_kolibri_head_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t w_off, uint32_t K, uint32_t M);
 /* DS4_KOLIBRI_TRACE=1: GPU time per labelled call, from timing events
  * recorded between calls without synchronizing.  mark(NULL, 0) starts a
  * forward; mark(label, bytes) closes the interval since the previous mark;

@@ -62816,7 +62816,11 @@ static bool kolibri_graph_forward_tokens(ds4_kolibri_gpu_graph *g, const ds4_mod
         } else {
             ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->xn, (uint64_t)(T - 1u) * E * sizeof(float),
                                                        (uint64_t)E * sizeof(float));
-            ok = last && qwen4_gemv(g->logits, m, w->output, last, 1);
+            int head = -1;
+            if (last && w->output->type == DS4_TENSOR_BF16)
+                head = ds4_gpu_kolibri_head_tensor(g->logits, last, m->map, m->size, w->output->abs_offset,
+                                                   E, DS4_N_VOCAB);
+            ok = last && head != 0 && (head > 0 || qwen4_gemv(g->logits, m, w->output, last, 1));
             ds4_gpu_tensor_free(last);
         }
         ok = ok && kolibri_mark("lm head", w->output->bytes);

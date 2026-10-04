@@ -25,8 +25,10 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | Q4_K experts, after item 3 | 611 / 917 / 772 | 45.2 / 42.6 / 38.8 |
 | F8, after item 4 | 708 / 923 / 774 | 47.3 / 44.4 / 40.4 |
 | Q4_K experts, after item 4 | 611 / 917 / 772 | 45.7 / 43.0 / 39.2 |
+| F8, after item 5 | 708 / 923 / 773 | 49.7 / 46.4 / 42.1 |
+| Q4_K experts, after item 5 | 612 / 915 / 771 | 48.3 / 45.2 / 41.2 |
 
-The per-call breakdown below predates items 1-4.
+The per-call breakdown below predates items 1-5.
 
 ### Decode
 
@@ -92,7 +94,7 @@ tok/s.
 | 2 | ~~Router as BF16 at full bandwidth, top-k fused~~ done | decode +7-8% | small | float noise (summation order) |
 | 3 | ~~Norm and reduce kernels across more than one block per token~~ done | decode +4% | small | float noise (reduction order) |
 | 4 | ~~k and v (or q, k and v) in one launch~~ done | decode +1% | small | none (bit-identical) |
-| 5 | LM head at full bandwidth | decode -0.8 ms (+3%) | small | none |
+| 5 | ~~LM head at full bandwidth~~ done | decode +5% | small | float noise (summation order) |
 | 6 | Q4_K expert decode kernels at bandwidth | Q4_K decode -3.1 ms (+11%) | medium | none |
 | 7 | F8-specific WMMA expert tile for prefill | prefill +30-50% | medium | none |
 | 8 | Prefill tile tuning (o projection, router) and chunk size | prefill +10-15% | small | none |
@@ -154,6 +156,11 @@ layer" item.
    three launches (their outputs are not contiguous per tensor).
 5. **LM head.** 0.66 GB of BF16 at 167 GB/s; the other large matvecs reach
    211. Probably the BF16 reader or the row split for a 128000-row output.
+
+   **Done:** BF16 fell to the generic matvec's scalar path (one 2-byte
+   load per lane per step, 80 dependent steps a row). A Kolibri kernel
+   keeps x in registers and streams 8 rows per wave with 16-byte loads,
+   the next row's loads in flight: 3.92 -> 2.83 ms per token at 232 GB/s.
 6. **Q4_K expert decode kernels.** #1070's per-row kernels do Q4_K
    dequantization at 102-126 GB/s. At 200 GB/s Q4_K experts (0.87 GB per
    token) would take 4.3 ms instead of 7.4 ms, and Q4_K would decode about

@@ -426,6 +426,49 @@ __global__ __launch_bounds__(128) void router_decode(int *sel, float *weights, f
     }
 }
 
+/* LM head for one row from BF16 weights [M][K], K = 256 * KC.  Lane l holds
+ * x at (c * 32 + l) * 8 .. + 8 for c < KC in registers; each wave streams
+ * ROWS consecutive rows with 16-byte loads, the next row's loads issued
+ * before the current row is reduced. */
+template<unsigned KC, unsigned ROWS>
+__global__ __launch_bounds__(128) void head_bf16(float *out, const uint16_t *w, const float *x, unsigned M) {
+    constexpr unsigned K = KC * 256;
+    const unsigned wave = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const unsigned row0 = (blockIdx.x * 4 + wave) * ROWS;
+    if (row0 >= M) return;
+    float4 xa[KC], xb[KC];
+    #pragma unroll
+    for (unsigned c = 0; c < KC; c++) {
+        xa[c] = ((const float4 *)x)[(c * 32 + lane) * 2];
+        xb[c] = ((const float4 *)x)[(c * 32 + lane) * 2 + 1];
+    }
+    uint4 wv[2][KC];
+    #pragma unroll
+    for (unsigned c = 0; c < KC; c++) wv[0][c] = ((const uint4 *)(w + (uint64_t)row0 * K))[c * 32 + lane];
+    #pragma unroll
+    for (unsigned r = 0; r < ROWS; r++) {
+        const unsigned row = row0 + r;
+        if (row >= M) break;
+        if (r + 1 < ROWS && row + 1 < M) {
+            #pragma unroll
+            for (unsigned c = 0; c < KC; c++)
+                wv[(r + 1) & 1][c] = ((const uint4 *)(w + (uint64_t)(row + 1) * K))[c * 32 + lane];
+        }
+        float acc = 0;
+        #pragma unroll
+        for (unsigned c = 0; c < KC; c++) {
+            const uint4 q = wv[r & 1][c];
+            const float4 a = xa[c], b = xb[c];
+            acc += a.x * __uint_as_float(q.x << 16) + a.y * __uint_as_float(q.x & 0xffff0000u) +
+                   a.z * __uint_as_float(q.y << 16) + a.w * __uint_as_float(q.y & 0xffff0000u) +
+                   b.x * __uint_as_float(q.z << 16) + b.y * __uint_as_float(q.z & 0xffff0000u) +
+                   b.z * __uint_as_float(q.w << 16) + b.w * __uint_as_float(q.w & 0xffff0000u);
+        }
+        acc = sum(acc);
+        if (!lane) out[row] = acc;
+    }
+}
+
 /* One block of THREADS threads per token row; D <= THREADS * MAXV.  NSC is
  * the slot count when known at compile time (decode: K routed + shared), so
  * the partial loads unroll and go out together; 0 loops over NS.  x is read
@@ -770,6 +813,21 @@ extern "C" int ds4_gpu_kolibri_router_decode_tensor(ds4_gpu_tensor *sel, ds4_gpu
     default: return -1;
     }
 #undef KOLIBRI_ROUTER
+    return launched();
+}
+
+/* LM head for one row from a BF16 matrix.  Returns -1 when the shape does
+ * not fit (the caller runs the generic matvec). */
+extern "C" int ds4_gpu_kolibri_head_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t w_off, uint32_t K, uint32_t M) {
+    using namespace kolibri_rocm;
+    if (K != 2560 || !M) return -1;
+    if (!tensor(out, (uint64_t)M * 4) || !tensor(x, (uint64_t)K * 4)) return 0;
+    const uint16_t *w = (const uint16_t *)weight(map, size, w_off, (uint64_t)M * K * 2);
+    if (!w || ((uintptr_t)w & 15)) return w ? -1 : 0;
+    constexpr unsigned ROWS = 8;
+    head_bf16<10, ROWS><<<(M + 4 * ROWS - 1) / (4 * ROWS), 128, 0, 0>>>((float *)out->ptr, w,
+        (const float *)x->ptr, M);
     return launched();
 }
 
