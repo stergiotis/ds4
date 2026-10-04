@@ -62708,17 +62708,29 @@ static bool kolibri_graph_moe(ds4_kolibri_gpu_graph *g, const ds4_model *m, cons
                                                l->ffn_post_norm->abs_offset, next_off, T, E, DS4_RMS_EPS) &&
                kolibri_mark("ffn reduce+norm", 0);
     }
-    return ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->sel, m->map, m->size,
-                                        l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                        l->ffn_gate_exps->type, NE, T, K, E, F,
-                                        l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                                        l->ffn_gate_shexp->type) &&
-           kolibri_mark("experts gate/up", gate_up_bytes) &&
-           ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->sel, m->map, m->size,
-                                         l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
-                                         NE, T, K, F, E, l->ffn_down_shexp->abs_offset,
-                                         l->ffn_down_shexp->type) &&
-           kolibri_mark("experts down", down_bytes) &&
+    /* Q4_K experts have their own decode kernels; -1 means the Qwen ones. */
+    int rc = ds4_gpu_kolibri_moe_q4k_tensor(g->mid, g->xn, g->sel, m->map, m->size,
+                                            l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                            l->ffn_gate_exps->type, l->ffn_gate_shexp->type,
+                                            NE, T, K, E, F, 0);
+    if (rc < 0)
+        rc = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->sel, m->map, m->size,
+                                          l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                          l->ffn_gate_exps->type, NE, T, K, E, F,
+                                          l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                          l->ffn_gate_shexp->type);
+    if (!rc || !kolibri_mark("experts gate/up", gate_up_bytes)) return false;
+    rc = ds4_gpu_kolibri_moe_q4k_tensor(g->part, g->mid, g->sel, m->map, m->size,
+                                        l->ffn_down_exps->abs_offset, 0, l->ffn_down_shexp->abs_offset, 0,
+                                        l->ffn_down_exps->type, l->ffn_down_shexp->type,
+                                        NE, T, K, F, E, 1);
+    if (rc < 0)
+        rc = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->sel, m->map, m->size,
+                                           l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
+                                           NE, T, K, F, E, l->ffn_down_shexp->abs_offset,
+                                           l->ffn_down_shexp->type);
+    return rc && kolibri_mark("experts down", down_bytes) &&
            ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, NULL, g->part, g->weights, NULL,
                                            K + 1u, K + 1u, K + 1u, m->map, m->size,
                                            l->ffn_post_norm->abs_offset, next_off, T, E, DS4_RMS_EPS) &&

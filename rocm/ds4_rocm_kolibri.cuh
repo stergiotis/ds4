@@ -469,6 +469,104 @@ __global__ __launch_bounds__(128) void head_bf16(float *out, const uint16_t *w, 
     }
 }
 
+/* Q4_K expert rows for decode-sized batches.  A Q4_K block is a 16-byte
+ * header (d, dmin, 12 bytes of 6-bit scales and mins) and 128 bytes of
+ * nibbles: bytes c * 32 .. c * 32 + 31 hold values c * 64 + 0..31 (low
+ * nibbles, group 2c) and c * 64 + 32..63 (high nibbles, group 2c + 1).
+ * Lane l reads the 4 bytes at c * 32 + (l % 8) * 4 with c = l / 8, i.e.
+ * eight values of two groups, plus the header as a broadcast; all KB
+ * blocks of a row are unrolled so the loads go out together. */
+/* Byte k of the 12 scale bytes, held in three words (no indexed memory). */
+__device__ __forceinline__ unsigned q4k_byte(uint4 h, unsigned k) {
+    const unsigned w = k < 4 ? h.y : k < 8 ? h.z : h.w;
+    return (w >> (8 * (k & 3))) & 255;
+}
+
+__device__ __forceinline__ void q4k_scale_min(uint4 h, unsigned g, float &s, float &m) {
+    if (g < 4) { s = (float)(q4k_byte(h, g) & 63); m = (float)(q4k_byte(h, g + 4) & 63); }
+    else {
+        const unsigned hi = q4k_byte(h, g + 4);
+        s = (float)((hi & 15) | ((q4k_byte(h, g - 4) >> 6) << 4));
+        m = (float)((hi >> 4) | ((q4k_byte(h, g) >> 6) << 4));
+    }
+}
+
+/* One block's contribution for this lane: nibble word q, header h. */
+__device__ __forceinline__ float q4k_block(uint4 h, unsigned q, float4 xa, float4 xb, unsigned c) {
+    const float d = __half2float(__ushort_as_half((unsigned short)(h.x & 0xffff)));
+    const float dm = __half2float(__ushort_as_half((unsigned short)(h.x >> 16)));
+    float s0, m0, s1, m1;
+    q4k_scale_min(h, 2 * c, s0, m0);
+    q4k_scale_min(h, 2 * c + 1, s1, m1);
+    const float lo = (float)(q & 15) * xa.x + (float)((q >> 8) & 15) * xa.y +
+                     (float)((q >> 16) & 15) * xa.z + (float)((q >> 24) & 15) * xa.w;
+    const float hi = (float)((q >> 4) & 15) * xb.x + (float)((q >> 12) & 15) * xb.y +
+                     (float)((q >> 20) & 15) * xb.z + (float)(q >> 28) * xb.w;
+    return d * (s0 * lo + s1 * hi) - dm * (m0 * (xa.x + xa.y + xa.z + xa.w) + m1 * (xb.x + xb.y + xb.z + xb.w));
+}
+
+/* Row dots for one row (r1 == NULL) or two rows sharing x, KB blocks in
+ * chunks of CH whose loads all go out before the chunk is used. */
+template<unsigned KB, unsigned CH>
+__device__ __forceinline__ void q4k_rows_dot(const char *r0, const char *r1, const float *x, unsigned lane,
+        float &a, float &b) {
+    static_assert(KB % CH == 0, "chunked blocks");
+    const unsigned c = lane / 8, o = (lane % 8) * 4;
+    float acc0 = 0, acc1 = 0;
+    #pragma unroll
+    for (unsigned b0 = 0; b0 < KB; b0 += CH) {
+        uint4 h0[CH], h1[CH];
+        unsigned q0[CH], q1[CH];
+        float4 xa[CH], xb[CH];
+        #pragma unroll
+        for (unsigned k = 0; k < CH; k++) {
+            const unsigned bk = b0 + k;
+            h0[k] = *(const uint4 *)(r0 + bk * 144);
+            q0[k] = *(const unsigned *)(r0 + bk * 144 + 16 + c * 32 + o);
+            if (r1) {
+                h1[k] = *(const uint4 *)(r1 + bk * 144);
+                q1[k] = *(const unsigned *)(r1 + bk * 144 + 16 + c * 32 + o);
+            }
+            xa[k] = *(const float4 *)(x + bk * 256 + c * 64 + o);
+            xb[k] = *(const float4 *)(x + bk * 256 + c * 64 + 32 + o);
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < CH; k++) {
+            acc0 += q4k_block(h0[k], q0[k], xa[k], xb[k], c);
+            if (r1) acc1 += q4k_block(h1[k], q1[k], xa[k], xb[k], c);
+        }
+    }
+    a = sum(acc0);
+    b = r1 ? sum(acc1) : 0.0f;
+}
+
+/* grid (ceil(M / 4), NS + 1, T), 4 waves per block, one output row per
+ * wave; slot NS is the F8 shared expert.  Same layout and outputs as the
+ * Qwen moe_mv: gate/up write silu(gate) * up, down writes the projection. */
+template<unsigned KB, bool DOWN>
+__global__ __launch_bounds__(128) void moe_q4k(float *out, const float *x, const int *selected,
+        const char *w0, const char *w1, const char *sh0, const char *sh1,
+        unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb) {
+    constexpr unsigned K = KB * 256;
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z;
+    const unsigned lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const uint64_t pair = (uint64_t)t * (NS + 1) + slot;
+    const float *xt = x + (DOWN ? pair : t) * K;
+    float a = 0, b = 0;
+    if (slot == NS) {
+        a = qwen4_rocm::dot<200>(sh0 + row * srb, xt, K);
+        if (!DOWN) b = qwen4_rocm::dot<200>(sh1 + row * srb, xt, K);
+    } else {
+        const int e = selected[(uint64_t)t * NS + slot];
+        if (e >= 0 && (unsigned)e < NE) {
+            const uint64_t off = ((uint64_t)e * M + row) * rb;
+            q4k_rows_dot<KB, (KB % 5 ? KB : 5)>(w0 + off, DOWN ? NULL : w1 + off, xt, lane, a, b);
+        }
+    }
+    if (!lane) out[pair * M + row] = DOWN ? a : qwen4_rocm::silu(a) * b;
+}
+
 /* One block of THREADS threads per token row; D <= THREADS * MAXV.  NSC is
  * the slot count when known at compile time (decode: K routed + shared), so
  * the partial loads unroll and go out together; 0 loops over NS.  x is read
@@ -828,6 +926,38 @@ extern "C" int ds4_gpu_kolibri_head_tensor(ds4_gpu_tensor *out, const ds4_gpu_te
     constexpr unsigned ROWS = 8;
     head_bf16<10, ROWS><<<(M + 4 * ROWS - 1) / (4 * ROWS), 128, 0, 0>>>((float *)out->ptr, w,
         (const float *)x->ptr, M);
+    return launched();
+}
+
+/* Q4_K routed experts with an F8 shared expert, decode-sized batches.
+ * Returns -1 when the shapes or types do not fit (the caller runs the Qwen
+ * kernels). */
+extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t o0, uint64_t o1,
+        uint64_t so0, uint64_t so1, uint32_t type, uint32_t shared_type, uint32_t NE, uint32_t T,
+        uint32_t NS, uint32_t K, uint32_t M, int down) {
+    using namespace kolibri_rocm;
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_KOLIBRI_Q4K_QWEN") != NULL;
+    if (off || type != 12 || shared_type != 200 || !T || T > 16 || !NS || K % 512 ||
+        (K != 2560 && K != 512)) return -1;
+    const unsigned NO = NS + 1;
+    if (!tensor(out, (uint64_t)T * NO * M * 4) || !tensor(sel, (uint64_t)T * NS * 4) ||
+        !tensor(x, (uint64_t)T * (down ? NO : 1) * K * 4)) return 0;
+    const uint64_t rb = (uint64_t)K / 256 * 144, srb = (uint64_t)K / 512 * 528;
+    const char *w0 = weight(map, size, o0, rb * M * NE), *s0 = weight(map, size, so0, srb * M);
+    const char *w1 = down ? NULL : weight(map, size, o1, rb * M * NE);
+    const char *s1 = down ? NULL : weight(map, size, so1, srb * M);
+    if (!w0 || !s0 || (!down && (!w1 || !s1))) return 0;
+    if (((uintptr_t)w0 | (uintptr_t)(w1 ? w1 : w0) | (uintptr_t)x->ptr) & 15) return -1;
+    const dim3 grid((M + 3) / 4, NO, T);
+    if (down && K == 512)
+        moe_q4k<2, true><<<grid, 128, 0, 0>>>((float *)out->ptr, (const float *)x->ptr, (const int *)sel->ptr,
+            w0, NULL, s0, NULL, NE, NS, M, rb, srb);
+    else if (!down && K == 2560)
+        moe_q4k<10, false><<<grid, 128, 0, 0>>>((float *)out->ptr, (const float *)x->ptr, (const int *)sel->ptr,
+            w0, w1, s0, s1, NE, NS, M, rb, srb);
+    else return -1;
     return launched();
 }
 

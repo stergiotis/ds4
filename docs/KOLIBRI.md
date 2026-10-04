@@ -225,9 +225,9 @@ VRAM) above idle; host RSS stays under 0.8 GiB.
 | F8 (75.7 GiB) | 512 | 708 | 49.7 | 76.3 GiB |
 | F8 | 8192 | 923 | 46.4 | 77.0 GiB |
 | F8 | 32768 | 773 | 42.1 | 77.5 GiB |
-| Q4_K experts (42.8 GiB) | 512 | 612 | 48.3 | 43.3 GiB |
-| Q4_K experts | 8192 | 915 | 45.2 | 44.0 GiB |
-| Q4_K experts | 32768 | 771 | 41.2 | 44.5 GiB |
+| Q4_K experts (42.8 GiB) | 512 | 612 | 55.6 | 43.3 GiB |
+| Q4_K experts | 8192 | 917 | 51.7 | 44.0 GiB |
+| Q4_K experts | 32768 | 772 | 46.3 | 44.5 GiB |
 
 Starting point (first correct version, F8, 2K context): 210 t/s prefill,
 21 t/s decode. Decode at 2K spends per token about 4.8 ms on QKV, 4.2 ms on
@@ -236,8 +236,9 @@ and 3.9 ms on the LM head (`DS4_KOLIBRI_TIMING=1`, which syncs per stage).
 Bandwidth would allow roughly 50 t/s for F8; see known gaps.
 `DS4_KOLIBRI_TRACE=1` gives per-call times without the per-stage syncs.
 
-Q4_K saves 33 GiB at the same speed, so it fits next to other resident
-workloads (the machine's other 65 GB service, for example).
+Q4_K saves 33 GiB and decodes 10-12% faster than F8 (its experts read half
+the bytes), so it fits next to other resident workloads (the machine's other
+65 GB service, for example). It is lossy: see the teacher-forced table.
 
 ## Known gaps
 

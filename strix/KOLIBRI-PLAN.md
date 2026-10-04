@@ -27,6 +27,7 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | Q4_K experts, after item 4 | 611 / 917 / 772 | 45.7 / 43.0 / 39.2 |
 | F8, after item 5 | 708 / 923 / 773 | 49.7 / 46.4 / 42.1 |
 | Q4_K experts, after item 5 | 612 / 915 / 771 | 48.3 / 45.2 / 41.2 |
+| Q4_K experts, after item 6 | 612 / 917 / 772 | 55.6 / 51.7 / 46.3 |
 
 The per-call breakdown below predates items 1-5.
 
@@ -95,7 +96,7 @@ tok/s.
 | 3 | ~~Norm and reduce kernels across more than one block per token~~ done | decode +4% | small | float noise (reduction order) |
 | 4 | ~~k and v (or q, k and v) in one launch~~ done | decode +1% | small | none (bit-identical) |
 | 5 | ~~LM head at full bandwidth~~ done | decode +5% | small | float noise (summation order) |
-| 6 | Q4_K expert decode kernels at bandwidth | Q4_K decode -3.1 ms (+11%) | medium | none |
+| 6 | ~~Q4_K expert decode kernels at bandwidth~~ done | Q4_K decode +15% | medium | float noise (summation order) |
 | 7 | F8-specific WMMA expert tile for prefill | prefill +30-50% | medium | none |
 | 8 | Prefill tile tuning (o projection, router) and chunk size | prefill +10-15% | small | none |
 | 9 | FP8 KV cache for the full-attention layers | decode at 32K +10% | medium | small, measurable |
@@ -168,6 +169,15 @@ layer" item.
    Options: several rows per wave, so that independent loads are in flight;
    keep the SwiGLU output in LDS and run the down projection in the same
    block.
+
+   **Done** with Kolibri kernels that follow the Q4_K layout: per 256-value
+   block a lane reads one 4-byte nibble word (eight values of two scale
+   groups) and the 16-byte header as a broadcast, scale bytes extracted by
+   shifts (an indexed byte array went to scratch); gate and up rows share x
+   and go in chunks of five blocks so nothing spills. Gate/up 4.56 -> 2.98
+   ms per token (194 GB/s), down 2.84 -> 1.72 ms (168 GB/s). Q4_K now
+   decodes 12% faster than F8. DS4_KOLIBRI_Q4K_QWEN=1 restores the Qwen
+   kernels.
 7. **F8-specific WMMA expert tile.** Prefill experts use #1070's generic
    `matrix_half_tile`, which decodes four F8 values per lane read. A tile that
    loads 16-byte F8 rows straight into f16 fragments (as the dense direct

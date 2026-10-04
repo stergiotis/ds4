@@ -3615,6 +3615,13 @@ int ds4_gpu_kolibri_router_decode_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *we
  * does not apply; the caller then runs the generic matvec. */
 int ds4_gpu_kolibri_head_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t w_off, uint32_t K, uint32_t M);
+/* Q4_K routed experts with an F8 shared expert (slot NS) for decode-sized
+ * batches, in the Qwen moe_mid/moe_down layouts (o1/so1 unused for down).
+ * Returns -1 when it does not apply; DS4_KOLIBRI_Q4K_QWEN=1 forces that. */
+int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t o0, uint64_t o1,
+        uint64_t so0, uint64_t so1, uint32_t type, uint32_t shared_type, uint32_t NE, uint32_t T,
+        uint32_t NS, uint32_t K, uint32_t M, int down);
 /* DS4_KOLIBRI_TRACE=1: GPU time per labelled call, from timing events
  * recorded between calls without synchronizing.  mark(NULL, 0) starts a
  * forward; mark(label, bytes) closes the interval since the previous mark;
