@@ -30,6 +30,7 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | Q4_K experts, after item 6 | 612 / 917 / 772 | 55.6 / 51.7 / 46.3 |
 | F8, after item 7 | 980 / 1373 / 1062 | 49.7 / 46.6 / 42.2 |
 | F8, after item 10 | 978 / 1377 / 1090 | 49.6 / 46.5 / 42.1 |
+| Q4_K experts, Q4_K prefill tile | 1125 / 1494 / 1161 | 55.2 / 51.5 / 46.1 |
 
 The per-call breakdown below predates items 1-5.
 
@@ -195,6 +196,16 @@ layer" item.
    gate/up 17.0 -> 6.3 ms per layer, down 7.3 -> 4.0 ms. Against a
    double-precision reference the outputs' relative RMS error drops from
    2.4-3.6e-4 to 1.8-2.6e-4.
+
+   The Q4_K GGUF got the same treatment: a Q4_K tile builds A fragments
+   from 16 nibble bytes at a time (two fragments: the low and the high
+   nibbles' groups), decoding the block header once per 256 values. The
+   weights are rounded to f16 as in the generic tile, but scaled by 256
+   first so small weights stay out of the subnormals; the error against a
+   double-precision reference is the same as the generic tile's
+   (2.6-4.1e-4 relative RMS, the f16 activations dominate). Q4_K prefill
+   611 / 927 / 789 -> 1125 / 1494 / 1161 tok/s; at 8K gate/up 16.3 -> 4.1
+   ms and down 8.1 -> 3.6 ms per layer and chunk.
 8. **Prefill tuning.** The direct projection kernel's tile table was tuned
    for Qwen3.8's shapes; Kolibri's o projection (K = 6144, N = 2560) runs at
    60% of q's speed for the same weights, and the F32 router matvec has no

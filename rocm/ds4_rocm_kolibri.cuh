@@ -855,6 +855,112 @@ __global__ void moe_f8_tile(float *out, const __half *xh, const float *xs, const
     }
 }
 
+/* Q4_K expert projections for prefill batches, on WMMA, laid out like
+ * moe_f8_tile.  Each wave owns 16 rows; per 256-value block a lane reads
+ * its row's 16-byte header and 128 nibble bytes, and every 16 bytes yield
+ * two A fragments (low nibbles: group 2c, high: group 2c + 1).  Weights are
+ * formed as (d * sc * q - dmin * mn) * 256 in f32 and rounded to f16, the
+ * 256 keeping small weights out of the f16 subnormals; the accumulator is
+ * divided by it at the end.  x is staged through LDS one block at a time. */
+template<bool DOWN, unsigned NT, unsigned WAVES>
+__launch_bounds__(WAVES * 32)
+__global__ void moe_q4k_tile(float *out, const __half *xh, const float *xs, const char *w0, const char *w1,
+        const int *lists, const int *counts, const unsigned *tiles, unsigned NE, unsigned NS, unsigned NO,
+        unsigned K, unsigned M, unsigned cap) {
+    constexpr unsigned NF = NT / 16, MT = WAVES * 16, KB = 256, LD = KB + 8;
+    constexpr float WS = 256.0f;
+    const unsigned tid = threadIdx.x, wave = tid / 32, lane = tid % 32, lane16 = lane % 16;
+    const unsigned nr = (M + MT - 1) / MT, job = blockIdx.x / nr;
+    if (job >= tiles[NE]) return;
+    unsigned e = 0, end = NE;
+    while (e < end) { const unsigned mid = (e + end) / 2; if (tiles[mid + 1] <= job) e = mid + 1; else end = mid; }
+    const unsigned count = counts[e], t0 = (job - tiles[e]) * NT, r0 = (blockIdx.x % nr) * MT;
+    const unsigned my_row = r0 + wave * 16 + lane16, safe_row = my_row < M ? my_row : M - 1;
+    const uint64_t rb = (uint64_t)K / 256 * 144;
+    const char *g_row = w0 + ((uint64_t)e * M + safe_row) * rb;
+    const char *u_row = DOWN ? NULL : w1 + ((uint64_t)e * M + safe_row) * rb;
+    __shared__ _Float16 sx[NT][LD];
+    __shared__ unsigned xrow[NT];
+    for (unsigned i = tid; i < NT; i += WAVES * 32) {
+        const unsigned item = t0 + i;
+        const unsigned pair = item < count ? (unsigned)lists[(uint64_t)e * cap + item] : 0u;
+        xrow[i] = item < count ? (DOWN ? (pair / NS) * NO + pair % NS : pair / NS) : UINT_MAX;
+    }
+    float8 acc[NF] = {}, up[NF] = {};
+    for (unsigned b = 0; b < K / KB; b++) {
+        __syncthreads();
+        for (unsigned i = tid; i < NT * KB / 8; i += WAVES * 32) {
+            const unsigned tok = i / (KB / 8), kk = (i % (KB / 8)) * 8;
+            const unsigned r = xrow[tok];
+            uint4 v = {0, 0, 0, 0};
+            if (r != UINT_MAX) v = *(const uint4 *)(xh + (uint64_t)r * K + b * KB + kk);
+            *(uint4 *)&sx[tok][kk] = v;
+        }
+        const char *gb = g_row + b * 144, *ub = DOWN ? NULL : u_row + b * 144;
+        const uint4 gh = *(const uint4 *)gb;
+        uint4 uh = {0, 0, 0, 0};
+        if (!DOWN) uh = *(const uint4 *)ub;
+        uint4 gq[8], uq[DOWN ? 1 : 8];
+        #pragma unroll
+        for (unsigned i = 0; i < 8; i++) {
+            gq[i] = *(const uint4 *)(gb + 16 + i * 16);
+            if (!DOWN) uq[i] = *(const uint4 *)(ub + 16 + i * 16);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned c = 0; c < 4; c++) {          /* 64-value chunk: bytes c * 32 .. + 31 */
+            #pragma unroll
+            for (unsigned hi = 0; hi < 2; hi++) {   /* low nibbles: group 2c, high: 2c + 1 */
+                float gs, gm, us = 0, um = 0;
+                q4k_scale_min(gh, 2 * c + hi, gs, gm);
+                if (!DOWN) q4k_scale_min(uh, 2 * c + hi, us, um);
+                const float gd = __half2float(__ushort_as_half((unsigned short)(gh.x & 0xffff))) * WS;
+                const float gdm = __half2float(__ushort_as_half((unsigned short)(gh.x >> 16))) * WS;
+                const float ud = DOWN ? 0.0f : __half2float(__ushort_as_half((unsigned short)(uh.x & 0xffff))) * WS;
+                const float udm = DOWN ? 0.0f : __half2float(__ushort_as_half((unsigned short)(uh.x >> 16))) * WS;
+                const float ga = gd * gs, gb_ = gdm * gm, ua = ud * us, ub_ = udm * um;
+                #pragma unroll
+                for (unsigned half_ = 0; half_ < 2; half_++) {   /* bytes c * 32 + half_ * 16 .. + 15 */
+                    const uint4 qg = gq[2 * c + half_];
+                    const unsigned wg[4] = {qg.x, qg.y, qg.z, qg.w};
+                    half16 ag, au;
+                    #pragma unroll
+                    for (unsigned i = 0; i < 16; i++)
+                        ag[i] = (_Float16)(ga * (float)((wg[i / 4] >> (8 * (i % 4) + 4 * hi)) & 15) - gb_);
+                    if (!DOWN) {
+                        const uint4 qu = uq[2 * c + half_];
+                        const unsigned wu[4] = {qu.x, qu.y, qu.z, qu.w};
+                        #pragma unroll
+                        for (unsigned i = 0; i < 16; i++)
+                            au[i] = (_Float16)(ua * (float)((wu[i / 4] >> (8 * (i % 4) + 4 * hi)) & 15) - ub_);
+                    }
+                    const unsigned k = c * 64 + hi * 32 + half_ * 16;
+                    #pragma unroll
+                    for (unsigned f = 0; f < NF; f++) {
+                        const half16 bx = *(const half16 *)&sx[f * 16 + lane16][k];
+                        acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ag, bx, acc[f]);
+                        if (!DOWN) up[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(au, bx, up[f]);
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned f = 0; f < NF; f++) {
+        const unsigned item = t0 + f * 16 + lane16;
+        if (item >= count) continue;
+        const unsigned pair = (unsigned)lists[(uint64_t)e * cap + item];
+        const unsigned r = DOWN ? (pair / NS) * NO + pair % NS : pair / NS;
+        const float sx_ = xs[r] / WS;
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) {
+            const unsigned row = r0 + wave * 16 + 2 * j + lane / 16;
+            if (row < M) out[((uint64_t)(pair / NS) * NO + pair % NS) * M + row] =
+                DOWN ? acc[f][j] * sx_ : qwen4_rocm::silu(acc[f][j] * sx_) * (up[f][j] * sx_);
+        }
+    }
+}
+
 static const float *f32_weight(const void *map, uint64_t size, uint64_t off, uint64_t n) {
     return (const float *)weight(map, size, off, n * 4);
 }
@@ -1081,22 +1187,28 @@ extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu
     return launched();
 }
 
-/* F8 expert projections for prefill batches (lists/counts from the Qwen
- * expert lists).  Returns -1 when it does not apply (type, shape,
- * DS4_KOLIBRI_F8_TILE=0); the caller then runs the Qwen tile kernels. */
-extern "C" int ds4_gpu_kolibri_moe_f8_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+/* F8 or Q4_K expert projections for prefill batches (lists/counts from the
+ * Qwen expert lists).  Returns -1 when it does not apply (type, shape,
+ * DS4_KOLIBRI_F8_TILE=0, DS4_KOLIBRI_Q4K_TILE=0); the caller then runs the
+ * Qwen tile kernels. */
+extern "C" int ds4_gpu_kolibri_moe_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, const void *map, uint64_t size,
         uint64_t o0, uint64_t o1, uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t NO,
         uint32_t K, uint32_t M, uint32_t cap, int down) {
     using namespace kolibri_rocm;
-    static int off = -1;
-    if (off < 0) { const char *v = getenv("DS4_KOLIBRI_F8_TILE"); off = v && !strcmp(v, "0"); }
-    if (off || type != 200 || K % 512 || !ds4_rocm_is_gfx1151() || !T || !NE || !NS || NO < NS || cap < T)
+    static int f8_off = -1, q4k_off = -1;
+    if (f8_off < 0) {
+        const char *v = getenv("DS4_KOLIBRI_F8_TILE"), *u = getenv("DS4_KOLIBRI_Q4K_TILE");
+        f8_off = v && !strcmp(v, "0");
+        q4k_off = u && !strcmp(u, "0");
+    }
+    const bool f8 = type == 200 && !f8_off && !(K % 512), q4k = type == 12 && !q4k_off && !(K % 256);
+    if ((!f8 && !q4k) || !ds4_rocm_is_gfx1151() || !T || !NE || !NS || NO < NS || cap < T)
         return -1;
     const uint64_t rows = down ? (uint64_t)T * NO : T;
     if (!tensor(out, (uint64_t)T * NO * M * 4) || !tensor(x, rows * K * 4) ||
         !tensor(lists, (uint64_t)NE * cap * 4) || !tensor(counts, (uint64_t)NE * 4)) return 0;
-    const uint64_t wbytes = (uint64_t)K / 512 * 528 * M * NE;
+    const uint64_t wbytes = (f8 ? (uint64_t)K / 512 * 528 : (uint64_t)K / 256 * 144) * M * NE;
     const char *w0 = weight(map, size, o0, wbytes), *w1 = down ? NULL : weight(map, size, o1, wbytes);
     if (!w0 || (!down && !w1)) return 0;
     const uint64_t xbytes = (rows * K * 2 + 15) & ~UINT64_C(15);
@@ -1112,10 +1224,12 @@ extern "C" int ds4_gpu_kolibri_moe_f8_mm_tensor(ds4_gpu_tensor *out, const ds4_g
     const uint64_t jobs = ((uint64_t)T * NS + NT - 1) / NT + NE;
     const uint64_t blocks = jobs * ((M + WAVES * 16 - 1) / (WAVES * 16));
     if (blocks > INT_MAX) return 0;
-    if (down) moe_f8_tile<true, NT, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>((float *)out->ptr, xh, xs, w0, NULL,
-        (const int *)lists->ptr, (const int *)counts->ptr, tiles, NE, NS, NO, K, M, cap);
-    else moe_f8_tile<false, NT, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>((float *)out->ptr, xh, xs, w0, w1,
-        (const int *)lists->ptr, (const int *)counts->ptr, tiles, NE, NS, NO, K, M, cap);
+#define KOLIBRI_TILE(KERNEL, DOWN, W1) KERNEL<DOWN, NT, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>( \
+        (float *)out->ptr, xh, xs, w0, W1, (const int *)lists->ptr, (const int *)counts->ptr, tiles, \
+        NE, NS, NO, K, M, cap)
+    if (f8) { if (down) KOLIBRI_TILE(moe_f8_tile, true, NULL); else KOLIBRI_TILE(moe_f8_tile, false, w1); }
+    else { if (down) KOLIBRI_TILE(moe_q4k_tile, true, NULL); else KOLIBRI_TILE(moe_q4k_tile, false, w1); }
+#undef KOLIBRI_TILE
     return launched();
 }
 
