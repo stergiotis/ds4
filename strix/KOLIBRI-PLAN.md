@@ -29,6 +29,7 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | Q4_K experts, after item 5 | 612 / 915 / 771 | 48.3 / 45.2 / 41.2 |
 | Q4_K experts, after item 6 | 612 / 917 / 772 | 55.6 / 51.7 / 46.3 |
 | F8, after item 7 | 980 / 1373 / 1062 | 49.7 / 46.6 / 42.2 |
+| F8, after item 10 | 978 / 1377 / 1090 | 49.6 / 46.5 / 42.1 |
 
 The per-call breakdown below predates items 1-5.
 
@@ -101,7 +102,7 @@ tok/s.
 | 7 | ~~F8-specific WMMA expert tile for prefill~~ done | F8 prefill +37-49% | medium | none (more exact) |
 | 8 | Prefill tile tuning (o projection, router) and chunk size | prefill +10-15% | small | none |
 | 9 | FP8 KV cache for the full-attention layers | decode at 32K +10% | medium | small, measurable |
-| 10 | Prefill attention shared across all 12 heads of a KV group | prefill at 32K +10-20% | medium | none |
+| 10 | ~~Prefill attention shared across all 12 heads of a KV group~~ done | prefill at 32K +3% | medium | none (bit-identical) |
 | 11 | Speculative decoding with n-gram drafts | 1.3-1.8x on repetitive output | medium-large | none (exact verify) |
 | 12 | Q8_0 LM head | decode -2 ms (+7%) after 5 | small | small, measurable |
 
@@ -210,6 +211,13 @@ layer" item.
    per KV head (12 query heads share it). A block of 12 waves, or a 4-head
    block that loops over the three head groups, loads it once. Also: 32-key
    tiles and double-buffered LDS loads.
+
+   **Done** (12-wave blocks, 32-key tiles): full attention 15.1 -> 13.8 ms
+   and sliding 2.25 -> 1.92 ms per layer per 2048-token chunk at 8K; only
+   +3% prefill at 32K. The kernel was not load-bound: at 32K full attention
+   runs at ~15 TFLOPS of f16 WMMA, and the per-element softmax work (exp2,
+   masking, the P^T shuffle) is the rest. More would need 32 queries per
+   wave or a softmax off the critical path.
 11. **Speculative decoding with n-gram drafts.** Kolibri has no MTP head, but
    drafts can come from the prompt and the output so far (prompt lookup). The
    graph already runs T > 1 rows per forward and can rewind within the sliding

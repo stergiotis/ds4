@@ -224,10 +224,10 @@ VRAM) above idle; host RSS stays under 0.8 GiB.
 | --- | ---: | ---: | ---: | ---: |
 | F8 (75.7 GiB) | 512 | 980 | 49.7 | 76.3 GiB |
 | F8 | 8192 | 1373 | 46.6 | 77.0 GiB |
-| F8 | 32768 | 1062 | 42.2 | 77.5 GiB |
+| F8 | 32768 | 1090 | 42.1 | 77.5 GiB |
 | Q4_K experts (42.8 GiB) | 512 | 612 | 55.6 | 43.3 GiB |
-| Q4_K experts | 8192 | 917 | 51.7 | 44.0 GiB |
-| Q4_K experts | 32768 | 772 | 46.3 | 44.5 GiB |
+| Q4_K experts | 8192 | 927 | 51.6 | 44.0 GiB |
+| Q4_K experts | 32768 | 789 | 46.2 | 44.5 GiB |
 
 Starting point (first correct version, F8, 2K context): 210 t/s prefill,
 21 t/s decode. Decode at 2K spends per token about 4.8 ms on QKV, 4.2 ms on

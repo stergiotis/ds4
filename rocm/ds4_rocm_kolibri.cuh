@@ -644,9 +644,10 @@ __global__ void norm_add(float *x, float *xn, const float *h, const float *part,
 
 /* Prefill attention on WMMA tiles (f16 operands, f32 accumulation).
  *
- * A block covers 16 query positions x 4 query heads of one KV head; its four
- * waves (one head each) share every 16-key K/V tile through LDS.  Each wave
- * computes S^T = K Q^T so the accumulator gives every lane one query column
+ * A block covers 16 query positions x HPB query heads of one KV head (all of
+ * its group when it fits); its waves (one head each) share every K/V tile
+ * through LDS, loaded 32 keys at a time and consumed as two 16-key steps.
+ * Each wave computes S^T = K Q^T so the accumulator gives every lane one query column
  * (lane % 16) and eight of its sixteen keys (the other eight sit in lane^16):
  * the online-softmax max and sum need one cross-lane exchange.  O^T = V^T P^T
  * keeps the per-query rescale lane-local too.  WMMA inputs are replicated
@@ -656,13 +657,15 @@ typedef float float8 __attribute__((ext_vector_type(8)));
 
 constexpr unsigned FA_D = 128, FA_LD = FA_D + 8;
 
-__launch_bounds__(128, 2)
+template<unsigned HPB>
+__launch_bounds__(HPB * 32)
 __global__ void attention_wmma(float *out, const float *q, const __half *kc, const __half *vc,
         unsigned T, unsigned H, unsigned Hkv, unsigned pos0, unsigned cache_rows,
         unsigned window, float scale_log2) {
-    __shared__ _Float16 ks[16][FA_LD], vs[16][FA_LD];
+    constexpr unsigned KT = 32;
+    __shared__ _Float16 ks[KT][FA_LD], vs[KT][FA_LD];
     const unsigned tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, col = lane & 15, half = lane >> 4;
-    const unsigned t0 = blockIdx.x * 16, h = blockIdx.y * 4 + wave, kh = h / (H / Hkv);
+    const unsigned t0 = blockIdx.x * 16, h = blockIdx.y * HPB + wave, kh = h / (H / Hkv);
     const unsigned tq = t0 + col, qpos = pos0 + (tq < T ? tq : T - 1);
     /* Q^T fragments: this lane's query column, sixteen dims per step. */
     half16 qf[FA_D / 16];
@@ -675,10 +678,10 @@ __global__ void attention_wmma(float *out, const float *q, const __half *kc, con
     float m = -INFINITY, l = 0;
     const unsigned first_q = pos0 + t0, last_q = pos0 + min(t0 + 16, T) - 1;
     const unsigned lo = window && first_q + 1 > window ? first_q + 1 - window : 0;
-    for (unsigned kb = lo & ~15u; kb <= last_q; kb += 16) {
+    for (unsigned kt = lo & ~15u; kt <= last_q; kt += KT) {
         __syncthreads();
-        for (unsigned i = tid; i < 16 * (FA_D / 8); i += 128) {
-            const unsigned r = i / (FA_D / 8), c = (i % (FA_D / 8)) * 8, p = kb + r;
+        for (unsigned i = tid; i < KT * (FA_D / 8); i += HPB * 32) {
+            const unsigned r = i / (FA_D / 8), c = (i % (FA_D / 8)) * 8, p = kt + r;
             uint4 kv = {}, vv = {};
             if (p <= last_q) {
                 const uint64_t base = ((uint64_t)(p % cache_rows) * Hkv + kh) * FA_D + c;
@@ -689,48 +692,53 @@ __global__ void attention_wmma(float *out, const float *q, const __half *kc, con
             *(uint4 *)&vs[r][c] = vv;
         }
         __syncthreads();
-        float8 s = {};
         #pragma unroll
-        for (unsigned dt = 0; dt < FA_D / 16; dt++) {
-            const half16 a = *(const half16 *)&ks[col][dt * 16];
-            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, qf[dt], s);
-        }
-        /* this lane: query qpos, keys kb + 2j + half */
-        float mx = -INFINITY;
-        #pragma unroll
-        for (unsigned j = 0; j < 8; j++) {
-            const unsigned p = kb + 2 * j + half;
-            const bool ok = p <= qpos && (!window || p + window > qpos);
-            s[j] = ok ? s[j] : -INFINITY;
-            mx = fmaxf(mx, s[j]);
-        }
-        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
-        const float mn = fmaxf(m, mx);
-        const float corr = mn == -INFINITY ? 1.0f : exp2f(m - mn);
-        float ps[8], sum = 0;
-        #pragma unroll
-        for (unsigned j = 0; j < 8; j++) {
-            ps[j] = mn == -INFINITY ? 0.0f : exp2f(s[j] - mn);
-            sum += ps[j];
-        }
-        sum += __shfl_xor(sum, 16, 32);
-        l = l * corr + sum;
-        m = mn;
-        /* P^T as a B operand: all sixteen keys of this lane's query column */
-        half16 pb;
-        #pragma unroll
-        for (unsigned j = 0; j < 8; j++) {
-            const float other = __shfl_xor(ps[j], 16, 32);
-            pb[2 * j + half] = (_Float16)ps[j];
-            pb[2 * j + 1 - half] = (_Float16)other;
-        }
-        #pragma unroll
-        for (unsigned dt = 0; dt < FA_D / 16; dt++) {
-            half16 a;
+        for (unsigned sub = 0; sub < KT / 16; sub++) {
+            const unsigned kb = kt + 16 * sub;
+            if (kb > last_q) break;
+            float8 s = {};
             #pragma unroll
-            for (unsigned k = 0; k < 16; k++) a[k] = vs[k][dt * 16 + col];
-            o[dt] *= corr;
-            o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, pb, o[dt]);
+            for (unsigned dt = 0; dt < FA_D / 16; dt++) {
+                const half16 a = *(const half16 *)&ks[16 * sub + col][dt * 16];
+                s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, qf[dt], s);
+            }
+            /* this lane: query qpos, keys kb + 2j + half */
+            float mx = -INFINITY;
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const unsigned p = kb + 2 * j + half;
+                const bool ok = p <= qpos && (!window || p + window > qpos);
+                s[j] = ok ? s[j] : -INFINITY;
+                mx = fmaxf(mx, s[j]);
+            }
+            mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+            const float mn = fmaxf(m, mx);
+            const float corr = mn == -INFINITY ? 1.0f : exp2f(m - mn);
+            float ps[8], sum = 0;
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                ps[j] = mn == -INFINITY ? 0.0f : exp2f(s[j] - mn);
+                sum += ps[j];
+            }
+            sum += __shfl_xor(sum, 16, 32);
+            l = l * corr + sum;
+            m = mn;
+            /* P^T as a B operand: all sixteen keys of this lane's query column */
+            half16 pb;
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const float other = __shfl_xor(ps[j], 16, 32);
+                pb[2 * j + half] = (_Float16)ps[j];
+                pb[2 * j + 1 - half] = (_Float16)other;
+            }
+            #pragma unroll
+            for (unsigned dt = 0; dt < FA_D / 16; dt++) {
+                half16 a;
+                #pragma unroll
+                for (unsigned k = 0; k < 16; k++) a[k] = vs[16 * sub + k][dt * 16 + col];
+                o[dt] *= corr;
+                o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, pb, o[dt]);
+            }
         }
     }
     if (tq >= T) return;
@@ -882,9 +890,16 @@ extern "C" int ds4_gpu_kolibri_attention_tensor(ds4_gpu_tensor *out, const ds4_g
     static int no_wmma = -1;
     if (no_wmma < 0) no_wmma = getenv("DS4_KOLIBRI_ATTN_SCALAR") != NULL;
     if (T >= 16 && !no_wmma && ds4_rocm_is_gfx1151() && (H / Hkv) % 4 == 0) {
-        attention_wmma<<<dim3((T + 15) / 16, H / 4), 128, 0, 0>>>((float *)out->ptr,
-            (const float *)q->ptr, (const __half *)kc->ptr, (const __half *)vc->ptr,
-            T, H, Hkv, pos0, cache_rows, window, 1.4426950408889634f / sqrtf((float)D));
+        /* One block per KV group when it has 12 heads, so K/V tiles load once. */
+        const float sl = 1.4426950408889634f / sqrtf((float)D);
+        if (H / Hkv == 12)
+            attention_wmma<12><<<dim3((T + 15) / 16, H / 12), 384, 0, 0>>>((float *)out->ptr,
+                (const float *)q->ptr, (const __half *)kc->ptr, (const __half *)vc->ptr,
+                T, H, Hkv, pos0, cache_rows, window, sl);
+        else
+            attention_wmma<4><<<dim3((T + 15) / 16, H / 4), 128, 0, 0>>>((float *)out->ptr,
+                (const float *)q->ptr, (const __half *)kc->ptr, (const __half *)vc->ptr,
+                T, H, Hkv, pos0, cache_rows, window, sl);
         return launched();
     }
     /* Decode-sized batches read each KV head's cache once for all its query
