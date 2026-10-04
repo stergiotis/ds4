@@ -832,6 +832,11 @@ typedef struct {
     bool stream;
     bool stream_include_usage;
     bool ignore_eos;
+    /* Thinking budget: after this many reasoning tokens the server closes
+     * the think block itself (0 = no budget).  OpenAI-style requests set it
+     * with reasoning_budget_tokens (llama.cpp), max_thinking_tokens or
+     * thinking_budget. */
+    int think_budget;
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
@@ -1040,6 +1045,13 @@ static void request_free(request *r) {
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
     return effort;
+}
+
+/* Request fields that carry a thinking budget: llama.cpp's
+ * reasoning_budget_tokens, halogen's max_thinking_tokens, thinking_budget. */
+static bool key_is_think_budget(const char *key) {
+    return !strcmp(key, "reasoning_budget_tokens") || !strcmp(key, "max_thinking_tokens") ||
+           !strcmp(key, "thinking_budget");
 }
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
@@ -4445,6 +4457,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (key_is_think_budget(key)) {
+            if (!json_int(&p, &r->think_budget)) {
                 free(key);
                 goto bad;
             }
@@ -14220,6 +14237,15 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    /* Thinking budget: once think_tokens reaches it inside the think block,
+     * the close sequence is fed in place of samples ("\n</think>\n\n" as the
+     * ChatML templates write it, "</think>" elsewhere), once per answer. */
+    int think_tokens = 0, think_close_pos = -1;
+    ds4_tokens think_close = {0};
+    if (j->req.think_budget > 0 && ds4_think_mode_enabled(j->req.think_mode))
+        ds4_tokenize_rendered_chat(s->engine,
+                                   syntax_is_chatml(j->req.model_syntax) ? "\n</think>\n\n" : "</think>",
+                                   &think_close);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -14258,7 +14284,14 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
+        if (think_close_pos < 0 && think_close.len > 0 && thinking.inside &&
+            think_tokens >= j->req.think_budget) {
+            think_close_pos = 0;
+            trace_event(s, trace_id, "thinking budget %d reached: closing", j->req.think_budget);
+        }
+        const bool forced = think_close_pos >= 0 && think_close_pos < think_close.len;
+        int token = forced ? think_close.v[think_close_pos++] :
+            j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
@@ -14280,7 +14313,7 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        if (!forced && !s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -14301,7 +14334,7 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+        } else if (!forced && s->batched_mode && s->qwen4_batch_mtp &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -14351,6 +14384,7 @@ decode_again:
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
             const bool was_thinking = thinking.inside;
+            if (was_thinking) think_tokens++;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -14560,6 +14594,7 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+    ds4_tokens_free(&think_close);
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
@@ -18888,6 +18923,13 @@ static void test_render_qwen_chat_prompt_text(void) {
     free(prompt);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+static void test_chat_request_thinking_budget_keys(void) {
+    TEST_ASSERT(key_is_think_budget("reasoning_budget_tokens"));
+    TEST_ASSERT(key_is_think_budget("max_thinking_tokens"));
+    TEST_ASSERT(key_is_think_budget("thinking_budget"));
+    TEST_ASSERT(!key_is_think_budget("max_tokens"));
 }
 
 static void test_qwen_reasoning_effort_levels(void) {
@@ -23415,6 +23457,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
     test_render_kolibri_chat_prompt_text();
+    test_chat_request_thinking_budget_keys();
     test_parse_kolibri_generated_message();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
