@@ -3622,6 +3622,13 @@ int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t o0, uint64_t o1,
         uint64_t so0, uint64_t so1, uint32_t type, uint32_t shared_type, uint32_t NE, uint32_t T,
         uint32_t NS, uint32_t K, uint32_t M, int down);
+/* F8 expert projections for prefill batches on WMMA (gfx1151), in the
+ * Qwen moe_mm layouts.  Returns -1 when it does not apply;
+ * DS4_KOLIBRI_F8_TILE=0 forces that. */
+int ds4_gpu_kolibri_moe_f8_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, const void *map, uint64_t size,
+        uint64_t o0, uint64_t o1, uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t NO,
+        uint32_t K, uint32_t M, uint32_t cap, int down);
 /* DS4_KOLIBRI_TRACE=1: GPU time per labelled call, from timing events
  * recorded between calls without synchronizing.  mark(NULL, 0) starts a
  * forward; mark(label, bytes) closes the interval since the previous mark;

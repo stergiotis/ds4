@@ -62662,6 +62662,23 @@ static bool kolibri_mark(const char *label, uint64_t bytes) {
     return ds4_gpu_kolibri_trace_mark(label, bytes) != 0;
 }
 
+/* Prefill expert projection: Kolibri's F8 tiles, else the Qwen ones. */
+static bool kolibri_moe_mm(ds4_kolibri_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                           uint32_t T, bool down) {
+    const uint32_t E = DS4_N_EMBD, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, F = DS4_N_FF_EXP;
+    const ds4_tensor *w0 = down ? l->ffn_down_exps : l->ffn_gate_exps;
+    int rc = ds4_gpu_kolibri_moe_f8_mm_tensor(down ? g->part : g->mid, down ? g->mid : g->xn,
+                                              g->lists, g->counts, m->map, m->size, w0->abs_offset,
+                                              down ? 0 : l->ffn_up_exps->abs_offset, w0->type, NE, T, K, K,
+                                              down ? F : E, down ? E : F, g->cap_tokens, down);
+    if (rc >= 0) return rc != 0;
+    return down ? ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->lists, g->counts, m->map, m->size,
+                                                   w0->abs_offset, w0->type, NE, T, K, K, F, E, g->cap_tokens) != 0
+                : ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->lists, g->counts, m->map, m->size,
+                                                  w0->abs_offset, l->ffn_up_exps->abs_offset, w0->type,
+                                                  NE, T, K, K, E, F, g->cap_tokens) != 0;
+}
+
 static bool kolibri_graph_moe(ds4_kolibri_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                               uint32_t T, uint64_t next_off) {
     const uint32_t E = DS4_N_EMBD, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, F = DS4_N_FF_EXP;
@@ -62690,13 +62707,9 @@ static bool kolibri_graph_moe(ds4_kolibri_gpu_graph *g, const ds4_model *m, cons
     if (mm) {
         return ds4_gpu_qwen4_moe_build_lists_tensor(g->lists, g->counts, g->sel, T, K, NE, g->cap_tokens) &&
                kolibri_mark("expert lists", 0) &&
-               ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->lists, g->counts, m->map, m->size,
-                                               l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                               l->ffn_gate_exps->type, NE, T, K, K, E, F, g->cap_tokens) &&
+               kolibri_moe_mm(g, m, l, T, false) &&
                kolibri_mark("experts gate/up", 0) &&
-               ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->lists, g->counts, m->map, m->size,
-                                                l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
-                                                NE, T, K, K, F, E, g->cap_tokens) &&
+               kolibri_moe_mm(g, m, l, T, true) &&
                kolibri_mark("experts down", 0) &&
                qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->xn, T) &&
                qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->xn, T) &&

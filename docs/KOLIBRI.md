@@ -222,9 +222,9 @@ VRAM) above idle; host RSS stays under 0.8 GiB.
 
 | GGUF | context | prefill t/s | decode t/s | GPU memory |
 | --- | ---: | ---: | ---: | ---: |
-| F8 (75.7 GiB) | 512 | 708 | 49.7 | 76.3 GiB |
-| F8 | 8192 | 923 | 46.4 | 77.0 GiB |
-| F8 | 32768 | 773 | 42.1 | 77.5 GiB |
+| F8 (75.7 GiB) | 512 | 980 | 49.7 | 76.3 GiB |
+| F8 | 8192 | 1373 | 46.6 | 77.0 GiB |
+| F8 | 32768 | 1062 | 42.2 | 77.5 GiB |
 | Q4_K experts (42.8 GiB) | 512 | 612 | 55.6 | 43.3 GiB |
 | Q4_K experts | 8192 | 917 | 51.7 | 44.0 GiB |
 | Q4_K experts | 32768 | 772 | 46.3 | 44.5 GiB |
@@ -261,9 +261,9 @@ The ranked ideas for making it faster are in
   Q4_K experts read half the bytes of F8 but at half the bandwidth, so both
   GGUFs decode at the same speed. `DS4_KOLIBRI_TRACE=1` shows the per-call
   split.
-- **Prefill**: the routed experts (~60% at 2K) and, at 32K, attention dominate.
-  The WMMA expert tiles are generic #1070 code; an F8-specific tile and a
-  wider attention block are the obvious next steps.
+- **Prefill**: F8 experts run Kolibri's WMMA tile (`DS4_KOLIBRI_F8_TILE=0`
+  restores the generic #1070 tile); Q4_K experts still use the generic one.
+  At 32K, attention dominates.
 - **Thinking prefill**: the server prefills `<think>\n` when thinking is on
   (the template leaves it to the model) so Qwen's reasoning machinery applies;
   the reference's own first output in that position is `<think>\n`. The CLI

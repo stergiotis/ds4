@@ -742,6 +742,111 @@ __global__ void attention_wmma(float *out, const float *q, const __half *kc, con
         for (unsigned j = 0; j < 8; j++) dst[dt * 16 + 2 * j + half] = o[dt][j] * inv;
 }
 
+/* F8 expert projections for prefill batches, on WMMA.  A block takes one
+ * job (expert e, NT routed tokens) and WAVES * 16 weight rows; each wave owns
+ * 16 rows and loads each 128-value scale group of its rows straight into A
+ * fragments: E4M3 bits shifted into f16 give the value / 256 exactly, so the
+ * group's products accumulate in a temporary and the group scale * 256 is
+ * applied per row afterwards (no rounding of scaled weights to f16).  x rows
+ * come pre-packed to f16 with a power-of-two scale per row and are staged
+ * through LDS one group at a time.  Gate/up write silu(gate) * up, down
+ * the projection, in the Qwen tile kernels' layout. */
+__device__ __forceinline__ half16 f8x16_to_half(uint4 q) {
+    half16 h;
+    const unsigned w[4] = {q.x, q.y, q.z, q.w};
+    #pragma unroll
+    for (unsigned i = 0; i < 16; i++) {
+        const unsigned c = (w[i / 4] >> (8 * (i % 4))) & 255;
+        h[i] = __builtin_bit_cast(_Float16, (unsigned short)(((c & 0x80u) << 8) | ((c & 0x7fu) << 7)));
+    }
+    return h;
+}
+
+template<bool DOWN, unsigned NT, unsigned WAVES>
+__launch_bounds__(WAVES * 32)
+__global__ void moe_f8_tile(float *out, const __half *xh, const float *xs, const char *w0, const char *w1,
+        const int *lists, const int *counts, const unsigned *tiles, unsigned NE, unsigned NS, unsigned NO,
+        unsigned K, unsigned M, unsigned cap) {
+    constexpr unsigned NF = NT / 16, MT = WAVES * 16, KG = 128, LD = KG + 8;
+    const unsigned tid = threadIdx.x, wave = tid / 32, lane = tid % 32, lane16 = lane % 16;
+    const unsigned nr = (M + MT - 1) / MT, job = blockIdx.x / nr;
+    if (job >= tiles[NE]) return;
+    unsigned e = 0, end = NE;
+    while (e < end) { const unsigned mid = (e + end) / 2; if (tiles[mid + 1] <= job) e = mid + 1; else end = mid; }
+    const unsigned count = counts[e], t0 = (job - tiles[e]) * NT, r0 = (blockIdx.x % nr) * MT;
+    const unsigned my_row = r0 + wave * 16 + lane16, safe_row = my_row < M ? my_row : M - 1;
+    const uint64_t rb = (uint64_t)K / 512 * 528;
+    const char *g_row = w0 + ((uint64_t)e * M + safe_row) * rb;
+    const char *u_row = DOWN ? NULL : w1 + ((uint64_t)e * M + safe_row) * rb;
+    __shared__ _Float16 sx[NT][LD];
+    __shared__ unsigned xrow[NT];
+    for (unsigned i = tid; i < NT; i += WAVES * 32) {
+        const unsigned item = t0 + i;
+        const unsigned pair = item < count ? (unsigned)lists[(uint64_t)e * cap + item] : 0u;
+        xrow[i] = item < count ? (DOWN ? (pair / NS) * NO + pair % NS : pair / NS) : UINT_MAX;
+    }
+    float8 acc[NF] = {}, up[NF] = {};
+    for (unsigned k0 = 0; k0 < K; k0 += KG) {
+        __syncthreads();
+        for (unsigned i = tid; i < NT * KG / 8; i += WAVES * 32) {
+            const unsigned tok = i / (KG / 8), kk = (i % (KG / 8)) * 8;
+            const unsigned r = xrow[tok];
+            uint4 v = {0, 0, 0, 0};
+            if (r != UINT_MAX) v = *(const uint4 *)(xh + (uint64_t)r * K + k0 + kk);
+            *(uint4 *)&sx[tok][kk] = v;
+        }
+        const unsigned blk = k0 / 512, grp = k0 % 512 / 128;
+        const float gsc = ((const float *)(g_row + blk * 528))[grp] * 256.0f;
+        const float usc = DOWN ? 0.0f : ((const float *)(u_row + blk * 528))[grp] * 256.0f;
+        uint4 gq[KG / 16], uq[DOWN ? 1 : KG / 16];
+        #pragma unroll
+        for (unsigned s = 0; s < KG / 16; s++) {
+            gq[s] = *(const uint4 *)(g_row + blk * 528 + 16 + k0 % 512 + s * 16);
+            if (!DOWN) uq[s] = *(const uint4 *)(u_row + blk * 528 + 16 + k0 % 512 + s * 16);
+        }
+        __syncthreads();
+        float8 tg[NF] = {}, tu[NF] = {};
+        #pragma unroll
+        for (unsigned s = 0; s < KG / 16; s++) {
+            const half16 ag = f8x16_to_half(gq[s]);
+            half16 au;
+            if (!DOWN) au = f8x16_to_half(uq[s]);
+            #pragma unroll
+            for (unsigned f = 0; f < NF; f++) {
+                const half16 b = *(const half16 *)&sx[f * 16 + lane16][s * 16];
+                tg[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ag, b, tg[f]);
+                if (!DOWN) tu[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(au, b, tu[f]);
+            }
+        }
+        /* Element j of a lane's accumulator is row 2j + lane / 16. */
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) {
+            const unsigned src = 2 * j + lane / 16;
+            const float sg = __shfl(gsc, src, 32);
+            const float su = DOWN ? 0.0f : __shfl(usc, src, 32);
+            #pragma unroll
+            for (unsigned f = 0; f < NF; f++) {
+                acc[f][j] += tg[f][j] * sg;
+                if (!DOWN) up[f][j] += tu[f][j] * su;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned f = 0; f < NF; f++) {
+        const unsigned item = t0 + f * 16 + lane16;
+        if (item >= count) continue;
+        const unsigned pair = (unsigned)lists[(uint64_t)e * cap + item];
+        const unsigned r = DOWN ? (pair / NS) * NO + pair % NS : pair / NS;
+        const float sx_ = xs[r];
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) {
+            const unsigned row = r0 + wave * 16 + 2 * j + lane / 16;
+            if (row < M) out[((uint64_t)(pair / NS) * NO + pair % NS) * M + row] =
+                DOWN ? acc[f][j] * sx_ : qwen4_rocm::silu(acc[f][j] * sx_) * (up[f][j] * sx_);
+        }
+    }
+}
+
 static const float *f32_weight(const void *map, uint64_t size, uint64_t off, uint64_t n) {
     return (const float *)weight(map, size, off, n * 4);
 }
@@ -958,6 +1063,44 @@ extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu
         moe_q4k<10, false><<<grid, 128, 0, 0>>>((float *)out->ptr, (const float *)x->ptr, (const int *)sel->ptr,
             w0, w1, s0, s1, NE, NS, M, rb, srb);
     else return -1;
+    return launched();
+}
+
+/* F8 expert projections for prefill batches (lists/counts from the Qwen
+ * expert lists).  Returns -1 when it does not apply (type, shape,
+ * DS4_KOLIBRI_F8_TILE=0); the caller then runs the Qwen tile kernels. */
+extern "C" int ds4_gpu_kolibri_moe_f8_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, const void *map, uint64_t size,
+        uint64_t o0, uint64_t o1, uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t NO,
+        uint32_t K, uint32_t M, uint32_t cap, int down) {
+    using namespace kolibri_rocm;
+    static int off = -1;
+    if (off < 0) { const char *v = getenv("DS4_KOLIBRI_F8_TILE"); off = v && !strcmp(v, "0"); }
+    if (off || type != 200 || K % 512 || !ds4_rocm_is_gfx1151() || !T || !NE || !NS || NO < NS || cap < T)
+        return -1;
+    const uint64_t rows = down ? (uint64_t)T * NO : T;
+    if (!tensor(out, (uint64_t)T * NO * M * 4) || !tensor(x, rows * K * 4) ||
+        !tensor(lists, (uint64_t)NE * cap * 4) || !tensor(counts, (uint64_t)NE * 4)) return 0;
+    const uint64_t wbytes = (uint64_t)K / 512 * 528 * M * NE;
+    const char *w0 = weight(map, size, o0, wbytes), *w1 = down ? NULL : weight(map, size, o1, wbytes);
+    if (!w0 || (!down && !w1)) return 0;
+    const uint64_t xbytes = (rows * K * 2 + 15) & ~UINT64_C(15);
+    char *tmp = (char *)cuda_tmp_alloc(xbytes + rows * 4 + ((uint64_t)NE + 1) * 4, "Kolibri F8 expert tiles");
+    if (!tmp) return 0;
+    __half *xh = (__half *)tmp;
+    float *xs = (float *)(tmp + xbytes);
+    unsigned *tiles = (unsigned *)(xs + rows);
+    constexpr unsigned NT = 64, WAVES = 8;
+    qwen4_rocm::pack_half_rows<0><<<(unsigned)rows, 256, 0, 0>>>(xs, xh, (const char *)x->ptr, K, (uint64_t)K * 4);
+    qwen4_rocm::expert_tiles<<<1, 1, 0, 0>>>(tiles, (const int *)counts->ptr, NE, NT);
+    if (!launched()) return 0;
+    const uint64_t jobs = ((uint64_t)T * NS + NT - 1) / NT + NE;
+    const uint64_t blocks = jobs * ((M + WAVES * 16 - 1) / (WAVES * 16));
+    if (blocks > INT_MAX) return 0;
+    if (down) moe_f8_tile<true, NT, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>((float *)out->ptr, xh, xs, w0, NULL,
+        (const int *)lists->ptr, (const int *)counts->ptr, tiles, NE, NS, NO, K, M, cap);
+    else moe_f8_tile<false, NT, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>((float *)out->ptr, xh, xs, w0, w1,
+        (const int *)lists->ptr, (const int *)counts->ptr, tiles, NE, NS, NO, K, M, cap);
     return launched();
 }
 

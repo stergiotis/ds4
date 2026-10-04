@@ -28,6 +28,7 @@ Measured on 2026-10-04 with `tests/kolibri/bench.sh` (median of 3 runs):
 | F8, after item 5 | 708 / 923 / 773 | 49.7 / 46.4 / 42.1 |
 | Q4_K experts, after item 5 | 612 / 915 / 771 | 48.3 / 45.2 / 41.2 |
 | Q4_K experts, after item 6 | 612 / 917 / 772 | 55.6 / 51.7 / 46.3 |
+| F8, after item 7 | 980 / 1373 / 1062 | 49.7 / 46.6 / 42.2 |
 
 The per-call breakdown below predates items 1-5.
 
@@ -97,7 +98,7 @@ tok/s.
 | 4 | ~~k and v (or q, k and v) in one launch~~ done | decode +1% | small | none (bit-identical) |
 | 5 | ~~LM head at full bandwidth~~ done | decode +5% | small | float noise (summation order) |
 | 6 | ~~Q4_K expert decode kernels at bandwidth~~ done | Q4_K decode +15% | medium | float noise (summation order) |
-| 7 | F8-specific WMMA expert tile for prefill | prefill +30-50% | medium | none |
+| 7 | ~~F8-specific WMMA expert tile for prefill~~ done | F8 prefill +37-49% | medium | none (more exact) |
 | 8 | Prefill tile tuning (o projection, router) and chunk size | prefill +10-15% | small | none |
 | 9 | FP8 KV cache for the full-attention layers | decode at 32K +10% | medium | small, measurable |
 | 10 | Prefill attention shared across all 12 heads of a KV group | prefill at 32K +10-20% | medium | none |
@@ -183,6 +184,16 @@ layer" item.
    loads 16-byte F8 rows straight into f16 fragments (as the dense direct
    kernel does), with prefetch, should close much of the gap to the Q8 direct
    projection kernel's throughput. Experts are 56% of prefill at 8K.
+
+   **Done:** each wave owns 16 expert rows and loads every 128-value scale
+   group straight into WMMA A fragments; E4M3 bits shifted into f16 are the
+   value / 256 exactly, the group's products go to a temporary and the
+   group scale is applied per row (the generic tile rounded scaled weights
+   to f16). Activations are packed to f16 once with a power-of-two row
+   scale and staged through LDS per group. At 8K, per 2048-token chunk:
+   gate/up 17.0 -> 6.3 ms per layer, down 7.3 -> 4.0 ms. Against a
+   double-precision reference the outputs' relative RMS error drops from
+   2.4-3.6e-4 to 1.8-2.6e-4.
 8. **Prefill tuning.** The direct projection kernel's tile table was tuned
    for Qwen3.8's shapes; Kolibri's o projection (K = 6144, N = 2560) runs at
    60% of q's speed for the same weights, and the F32 router matvec has no
