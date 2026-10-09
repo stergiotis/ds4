@@ -71,15 +71,34 @@ quality gates below.
 
 ### Phase 1: kernels (target ~33 ms per token, ~30 tok/s)
 
+Progress on 2026-10-09: decode went from 20.75 / 20.43 to 24.44 / 23.81 tok/s
+at 512 / 8K (+18% / +17%), and the GPU time per token at 8K from 49.6 to
+44.0 ms. Every step was A/B'd on alternating runs (`qwen-prof/ab.sh`, or
+`ab2.sh` for two builds). Every step kept a 128-token greedy reply
+byte-identical, and teacher-forced NLL at T = 1 stayed within +-0.003 of
+2.3096. Prefill is unchanged.
+
+| Commit | Change | Decode at 512 / 8K |
+|---|---|---:|
+| 934a7a8 | Q4_K gate/up on Kolibri's block kernel, which also takes a Q8_0 shared slot | +5.4% / +4.7% |
+| cb6ecc0 | MXFP4 down with one block per lane | +0.6% / +0.6% |
+| 3a255ab | hc down 10240 -> 320 on 160 blocks instead of 40 (119 -> 186 GB/s) | +3.7% / +3.7% |
+| 951ec38 | vectorized Q8_0 dot for those shared slots (`dot<8>` was scalar) | +7.0% / +6.7% |
+
+Tried and reverted: staging the layer-1 n-gram rows after layer 0 was
+queued. Decode did not change (22.83 -> 22.87, 22.33 -> 22.33), so the
+host staging was not on the GPU's critical path.
+
 | # | Idea | Expected gain | Notes |
 |---:|---|---|---|
-| 1 | Q4_K expert gate/up decode at ~200 GB/s | ~5 ms | Kolibri's whole-block-per-lane Q4_K kernel (fdb61d2) took gate/up 4.56 -> 2.98 ms; same format here |
-| 2 | MXFP4 expert down decode at ~200 GB/s | ~2.5-3 ms | new kernel in the same pattern |
-| 3 | Fused hyper-connection mix (norm, low-rank down, gate, up) | ~3-4 ms | 96 calls of ~100 us on 13 MB each; also 24% of prefill |
-| 4 | BF16 router copy with fused top-k | ~1.3 ms | Kolibri item 2: 2.9 -> 1.2 ms |
-| 5 | Fuse the small GDN kernels (conv+gates 38 us, scan 21 us, reduce 11 us) | ~1.5 ms | latency-bound, not bandwidth-bound |
-| 6 | Read the layer-1 n-gram rows asynchronously | ~1 ms | `qwen4_graph_stage_inputs` reads them before the GPU starts; layer 0 does not need them |
+| 1 | ~~Q4_K expert gate/up decode~~ done | 9.96 -> 6.29 ms (167 GB/s) | Kolibri reaches 194 GB/s; the 10-slot grid may still be tunable |
+| 2 | ~~MXFP4 expert down decode~~ done | 5.35 -> 4.01 ms (125 GB/s) | latency-bound at ~10 MB per call. Next: coalesced 340-byte row loads through LDS, more rows per wave |
+| 3 | Hyper-connection mix: ~~down projection~~ (done); norm (20 us x 97 = 1.95 ms) and up+gate (3.7 ms at 172 GB/s) left | ~2 ms | fold the norm into the down projection's block reduction |
+| 4 | Router: matvec 36 us at 146 GB/s, softmax+top-k 20 us per call | ~1.2 ms | top-k: wave-level argmax instead of 80 block barriers |
+| 5 | Fuse the small GDN kernels (conv+gates 38 us, scan 22 us, reduce 13 us) | ~1.5 ms | latency-bound, not bandwidth-bound |
+| 6 | ~~Read the layer-1 n-gram rows asynchronously~~ | none | measured and reverted, see above |
 | 7 | Q4_K / MXFP4 prefill tiles that read the packed formats directly | prefill +50-100% | Kolibri's Q4_K tile (8876191): 611/927/789 -> 1125/1494/1161 tok/s |
+| 8 | MTP verify rows (T = 2-3) still use the `moe_mv_reuse` kernels; check whether their Q8_0 shared slot is scalar too | MTP speed | apply the same fixes to T = 2-3 |
 
 ### Phase 2: bytes per token (target ~4.5-5 GB, 40-45 tok/s)
 
