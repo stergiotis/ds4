@@ -146,6 +146,43 @@ Cross-layer prediction (layer L+1's router on layer L's FFN input) covers
 52/64/71% of the *missing* experts at top-8/12/16, at 1.3/2.7/4.3 wasted
 reads per layer step: below the 70%-at-top-12 bar the plan set.
 
+### Learned eviction (offline, 2026-10-09)
+
+`strix/cachesim/evictml.py` evicts, on each miss with a full cache, the one
+of 64 sampled resident experts whose predicted next use is furthest. This is
+LRB-style (Song et al., NSDI'20). The predictor is a LightGBM model over the
+routing history:
+- age and the last three reuse gaps
+- access counts decayed over 32 / 256 / 2048 tokens
+- the count and rate since the request started
+- the layer, and how many layer steps until that layer is routed again
+
+It is trained leave-one-domain-out: two traces for training, the third held
+out for testing. Miss rates at 5,869 slots (venv and logs in
+`~/.local/share/ds4/evals/evict-ml/`):
+
+| Test domain | LRU | S3-FIFO | best single decayed count | learned (rank + 1 DAgger round) | oracle among the 64 samples | Belady |
+|---|---:|---:|---:|---:|---:|---:|
+| coding | 13.32% | 12.65% | 12.83% | 11.94% (-5.6%) | 5.39% | 5.05% |
+| olympiad | 13.99% | 12.33% | 11.87% | 11.15% (-9.6%) | 5.43% | 5.07% |
+| review | 12.28% | 10.89% | 10.74% | 9.93% (-8.8%) | 4.83% | 4.50% |
+
+- Sampling 64 candidates loses little: the sampled oracle is within 0.4
+  points of Belady, and sampled LRU equals LRU.
+- The learned policy beats S3-FIFO on every held-out domain, by 6-10%.
+- No single decayed-count rule matches it, and the best half-life differs
+  by domain.
+- The model leans on short-window decayed counts and the request's own usage
+  rate; recency matters little.
+- It still closes only about a seventh of the gap to the oracle.
+
+At the measured elasticity (guard 12 -> 8: misses -10%, decode +3%), the
+gain is about +2-3% decode, roughly what ~300 more cache slots would give.
+The evidence is three ~3,000-token traces from three prompts. A runtime port
+needs per-expert feature state in the cache and the trees in C (~20-50 us per
+eviction). Parked: more context would need token ids and the think/answer
+phase in `DS4_GLM_ROUTE_TRACE`, plus 10+ diverse traces (~4 GPU hours).
+
 ## Code changes
 
 - **Q4_K one-token decode reads the selected experts in place.** Before each
