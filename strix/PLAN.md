@@ -75,7 +75,38 @@ Remaining, in order (the scripts are in `~/.local/share/ds4/evals/`):
    (portable across models); S3-FIFO for the pool; a per-layer threshold;
    upgrading a Q2 expert to Q4 when it keeps coming back.
 
-### 2. Faster routing handoff (unknown gain, medium effort)
+### 2. GLM MTP on the streamed Q4 path (unmeasured, cheap to measure)
+
+The read wait is serial: a layer's ids exist only after its router, and the
+next layer needs this layer's output (README, "How one decode layer overlaps
+reads"). The asynchronous load and the shared-expert overlap are
+already in place. Verifying two tokens per pass
+pays for one attention pass and one routing handoff per layer instead of
+two. Those make up the memory-bound 54% phase, which costs about the same
+for two rows as for one. Reads become the union of both tokens' misses. ds4
+already has GLM's built-in MTP (`--mtp`, commits up to two tokens;
+docs/SPECULATIVE_DECODING.md), but there is no recorded run on streamed Q4
+with the tuned `env.sh`.
+
+1. Run the 8K review prompt with 1,000 greedy tokens, with and without
+   `--mtp --mtp-timing`. Record acceptance, decode tok/s, misses per token
+   and the GTT peak (the MTP block and its state take memory from the expert
+   cache).
+2. Check which routed path the 2-3-row verify pass takes. The in-place
+   Q4_K kernels and the selected-load table require `n_tokens == 1`
+   (`rocm/ds4_rocm_moe_launch.cuh:719`), so a verify pass falls through to
+   the batch path. If MTP loses, a two-row in-place variant over the union
+   of experts is the fix to try.
+3. Batched verify reorders floating point, so greedy output may differ.
+   Judge it like the Q2 tier: perplexity and top-1 agreement on scored
+   tokens, then the task evals.
+
+Rough bound: at ~70% acceptance, a pass costs ~162 ms plus ~1.7-1.9x one
+token's read wait for 1.7 tokens, which works out to about +20-30% decode.
+That holds only if the verify pass is about as cheap as a decode step, and
+it ignores the draft block's own cost.
+
+### 3. Shorten the 54% phase: routing handoff and attention (unknown gain, medium effort)
 
 The 54% "attention + router + readback" phase includes a GPU-to-host sync per
 layer before reads can start. Measure GPU kernel time against sync latency
@@ -83,14 +114,19 @@ layer before reads can start. Measure GPU kernel time against sync latency
 dominates, a spin-wait on the event, or pinned-memory polling of the routing
 result, could shorten each of the 42 handoffs.
 
-### 3. Cross-layer expert prefetch (demoted: ~1.1x at best, high effort)
+Also check whether the DSA decode attention reads the shared KV latent once
+per query head (64 heads, 1 KV head). Reading it once per head group was
+turbo-fieldfare's 2.2x at 110K context (README, "Compared with
+turbo-fieldfare"); at the 8-64K contexts used here the gain would be smaller.
+
+### 4. Cross-layer expert prefetch (demoted: ~1.1x at best, high effort)
 
 Measured with the extended probe: top-12 prediction covers 64% of missing
 experts, below the 70% bar; top-8 covers 52% at 1.3 wasted reads per layer
 step. With the disk already at ~2.5 GB/s average, wasted reads compete with
 demand reads. Revisit only after item 1 cuts the miss traffic.
 
-### 4. Root cause of the Q4_K tiled prefill fault (prefill speed, medium effort)
+### 5. Root cause of the Q4_K tiled prefill fault (prefill speed, medium effort)
 
 The sorted/tiled Q4_K kernels fault (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`
 in `routed_moe down`). Ruled out: an expert-id mismatch and NULL activation
@@ -98,7 +134,7 @@ pointers. Prefill already runs at ~25-30 tok/s on the per-pair path, and
 expert streaming dominates it, so the expected gain is modest. Next step:
 bounds-check instrumentation inside the tiled kernel.
 
-### 5. Upstream reports (no local gain, reduces fork drift)
+### 6. Upstream reports (no local gain, reduces fork drift)
 
 - The Q4_K tiled fault on gfx1151, with the serialized-launch reproduction.
 - ds4's memory plan omits the layer-span cache (up to GTT/3), so budgets that
@@ -113,8 +149,19 @@ bounds-check instrumentation inside the tiled kernel.
 
 ## Not worth pursuing
 
-- Resident/missing split compute for Q4_K. The expert compute that could
-  overlap with reads is small next to the reads themselves.
+- Resident/missing split compute ("hit-first") for Q4_K. The cached
+  experts' compute is ~25 ms per token against ~137 ms of read wait, a
+  ceiling of ~7%. Upstream disabled the IQ2 version for a slot-state race
+  (`split_selected = 0`, `rocm/ds4_rocm_moe_launch.cuh:709`).
+- Porting Metal's asynchronous selected-expert load: ROCm has had it on by
+  default since ef8d923 (README, "How one decode layer overlaps reads").
+  Metal's early commits are unnecessary under HIP. Its read advice
+  (`F_RDADVISE`, `madvise(WILLNEED)`) acts on the page cache, which the
+  O_DIRECT reads bypass, and turbo-fieldfare found it unstable.
+- Compressing experts, `mlock` of the resident weights, packed K/V caches:
+  turbo-fieldfare measured all three and dropped them (zstd saves 10%;
+  mlock recovered 0 ms; K4/V4 failed quality). The Kolibri FP8 KV result
+  here agrees.
 - Pushing the GPU cache further by shrinking the span cache: below ~24 GiB,
   decode thrashes (0.27 tok/s at 12 GiB).
 - A warm-start popularity hotlist (was item 3): routing popularity differs by

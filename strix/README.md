@@ -187,9 +187,96 @@ reads per layer step: below the 70%-at-top-12 bar the plan set.
   reloads). The 12 GiB collapse is genuine capacity thrash: decode needs more
   than 12 GiB of layer spans.
 
+## How one decode layer overlaps reads (code read 2026-10-09)
+
+The asynchronous selected-expert load is **on by default on ROCm**, and has
+been since upstream added ROCm GLM support (ef8d923). On Metal the GLM path
+is opt-in (`DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD`), which is
+where the name comes from (`glm_graph_use_streaming_selected_async_load`,
+`ds4.c:50982`). One streamed decode layer on ROCm:
+
+1. The main thread queues attention and the router on the default HIP
+   stream and records an event.
+2. A worker thread (`metal_graph_selected_async_load_run`, `ds4.c:23961`)
+   waits on that event, reads back the 8 ids, decides the Q2 tier, looks the
+   experts up in the cache and hands the misses to the 16 read workers
+   (`cuda_stream_selected_load`). It returns with the reads still in flight.
+3. Meanwhile the main thread queues the shared expert (`shared_first`,
+   `ds4.c:51266`), so it runs on the GPU while the ids come back.
+4. The routed Q4_K step (`cuda_stream_selected_apply_ptrs`,
+   `rocm/ds4_rocm_runtime.cuh:5544`) waits for **all** pending reads and
+   their upload (`cuda_stream_selected_finish_pending_missing(0)`), then
+   queues the in-place kernels for all 8 experts.
+
+The only overlap left on the table is running the cached experts while the
+misses arrive ("hit-first"). ds4 has it for the IQ2 gate path
+(`rocm/ds4_rocm_moe_launch.cuh:1388`), but upstream disabled it
+(`split_selected = 0`, line 709) because the split "can expose partially
+updated selected-expert state to the default stream". That is a slot-reuse
+race. Its ceiling for Q4_K is small: 8 experts are ~113 MiB per layer, about
+0.6 ms at ~200 GB/s, so ~25 ms per token, of which the ~86% that hit could
+overlap, against ~137 ms of read wait. At most ~7%.
+
+Metal has two extras ROCm lacks: early command-buffer commits, which HIP
+does not need because launches are already asynchronous, and read advice
+(`F_RDADVISE`, `madvise(WILLNEED)`, `ds4.c:20085`). Read advice is opt-in on
+Metal too, goes through the page cache that the O_DIRECT reads bypass, and
+turbo-fieldfare measured it as unstable (see below). There is nothing left
+to port.
+
+So the read wait is a serial dependency, not missing overlap. A layer's ids
+exist only after its router, and the next layer's attention needs this
+layer's output. Only prediction, or verifying more than one token per
+forward pass, gets reads off that chain.
+
+## Compared with turbo-fieldfare (2026-10-09)
+
+[turbo-fieldfare](https://github.com/drumih/turbo-fieldfare) streams Gemma 4
+26B-A4B on 8 GB Apple Silicon. It keeps 1.35 GB of shared weights resident
+and the 12 GB of routed experts in per-layer files, with 16 LFU slots per
+layer (12.5% of experts). It decodes at 5-6 tok/s on an M2 and 31-35 on an
+M5 Pro (MLX, resident: 76-82). It is the same design as GLM streaming here,
+at a tenth of the scale, and it publishes all 103 experiments, failures
+included (`docs/experiments/` there).
+
+Where its results match ours, which supports what we dropped:
+
+| Finding | turbo-fieldfare | here |
+|---|---|---|
+| Explicit reads beat demand-paged mmap | 0.50 vs 3.97 tok/s | pread + O_DIRECT |
+| Replacement policy matters less than capacity | LRU -> LFU: I/O -11% | S3-FIFO: misses -9%; size dominates |
+| Distance to Belady (the offline optimum) stays large | 8-11 hit-rate points | -63% misses |
+| Cross-layer prediction is too weak | copy previous layer: 7% | next router on this layer's input: 52% at top-8 |
+| Speculative / Markov prefetch | slower, contends with demand reads | not built (prediction demoted) |
+| Trace-trained policy fails on holdouts | layout -16%, slot split lost | hotlist +4-23% misses |
+| Read advice | `F_RDADVISE` won and lost by state | not used (O_DIRECT) |
+| Shared expert overlapping reads | +7.5% | already done; ~1 ms per token here |
+| Hit-first routed compute | +14.4% | disabled upstream (race); <=7% ceiling |
+| Quantized KV cache | K4/V4 failed quality | Kolibri FP8 KV: KL 0.104 |
+| Compressing quantized experts | zstd 10% | not tried |
+| `mlock` of resident weights | no gain (contention, not eviction) | not tried |
+
+Their hit-first and shared-expert gains are large because their per-layer
+compute after the router is a big share of a token. Here the read wait
+(~137 ms) dwarfs it (~25 ms).
+
+Things they found that may still apply here:
+
+- Grouped full attention (one KV head read once for all query heads that
+  share it) gave 2.2x decode at 110K context, once the reduction order was
+  made to match the old kernel. GLM has 64 query heads on one KV latent; the
+  ds4 ROCm DSA kernel has not been checked for per-head K/V reloads.
+- Chunked prefill so that one expert read serves many rows (32 -> 128 rows:
+  1.8x). This is what the faulting Q4_K tiled path would give us.
+- Their method rules agree with ours and add one: an unclear A/B is called
+  inconclusive and the default stays. They also forced identical token ids
+  in A/B pairs (teacher forcing) so that changed routing could not
+  confound a speed result.
+
 ## Open
 
 - The root cause of the Q4_K tiled-kernel fault.
 - Decode is still I/O-stall bound: GPU ~48% busy, disk ~2.4 GB/s against
-  ~6 GB/s available. ROCm lacks Metal's asynchronous selected-expert load and
-  readahead (`DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD`).
+  ~6 GB/s available. The disk runs at ~4.45 GB/s while a layer waits and
+  sits idle during attention; the asynchronous load already exists (see
+  above).

@@ -259,6 +259,18 @@ layer" item.
    lossy. Q8_0 halves 0.66 GB per token. Keep it only if the teacher-forced KL
    stays near the current 0.008.
 
+**From turbo-fieldfare (2026-10-09).** Its streaming results don't apply to
+a resident model (see `strix/README.md`, "Compared with turbo-fieldfare").
+Its kernel results mostly repeat what is already here:
+- Its grouped full attention, reading the shared KV head once for all the
+  query heads that use it, is items 1 and 10.
+- Its packed K4/V4 cache failed quality, as item 9 did.
+
+One lesson is new. Its grouped kernel first failed the quality tests and
+passed only once the score reduction and FMA order matched the old kernel.
+When a reordered kernel misses the KL bar by a little, try matching the
+reference's order before rejecting the idea.
+
 ## How changes are checked
 
 - **Output.** `tests/kolibri/compare_golden.py` on the real model (greedy
