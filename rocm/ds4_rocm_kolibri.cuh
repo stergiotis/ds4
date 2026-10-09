@@ -541,9 +541,10 @@ __device__ __forceinline__ void q4k_rows_dot(const char *r0, const char *r1, con
 }
 
 /* grid (ceil(M / 4), NS + 1, T), 4 waves per block, one output row per
- * wave; slot NS is the F8 shared expert.  Same layout and outputs as the
- * Qwen moe_mv: gate/up write silu(gate) * up, down writes the projection. */
-template<unsigned KB, bool DOWN>
+ * wave; slot NS is the shared expert, of type SHT (F8 or Q8_0).  Same layout
+ * and outputs as the Qwen moe_mv: gate/up write silu(gate) * up, down writes
+ * the projection. */
+template<unsigned KB, bool DOWN, unsigned SHT>
 __global__ __launch_bounds__(128) void moe_q4k(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
         unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb) {
@@ -555,8 +556,8 @@ __global__ __launch_bounds__(128) void moe_q4k(float *out, const float *x, const
     const float *xt = x + (DOWN ? pair : t) * K;
     float a = 0, b = 0;
     if (slot == NS) {
-        a = qwen4_rocm::dot<200>(sh0 + row * srb, xt, K);
-        if (!DOWN) b = qwen4_rocm::dot<200>(sh1 + row * srb, xt, K);
+        a = qwen4_rocm::dot<SHT>(sh0 + row * srb, xt, K);
+        if (!DOWN) b = qwen4_rocm::dot<SHT>(sh1 + row * srb, xt, K);
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
@@ -1155,9 +1156,9 @@ extern "C" int ds4_gpu_kolibri_head_tensor(ds4_gpu_tensor *out, const ds4_gpu_te
     return launched();
 }
 
-/* Q4_K routed experts with an F8 shared expert, decode-sized batches.
- * Returns -1 when the shapes or types do not fit (the caller runs the Qwen
- * kernels). */
+/* Q4_K routed experts with an F8 (Kolibri) or Q8_0 (Qwen3.8) shared
+ * expert, decode-sized batches.  Returns -1 when the shapes or types do not
+ * fit (the caller runs the Qwen kernels). */
 extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t o0, uint64_t o1,
         uint64_t so0, uint64_t so1, uint32_t type, uint32_t shared_type, uint32_t NE, uint32_t T,
@@ -1165,25 +1166,30 @@ extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu
     using namespace kolibri_rocm;
     static int off = -1;
     if (off < 0) off = getenv("DS4_KOLIBRI_Q4K_QWEN") != NULL;
-    if (off || type != 12 || shared_type != 200 || !T || T > 16 || !NS || K % 512 ||
-        (K != 2560 && K != 512)) return -1;
+    if (off || type != 12 || (shared_type != 200 && shared_type != 8) || !T || T > 16 || !NS ||
+        K % 512 || (K != 2560 && K != 512)) return -1;
     const unsigned NO = NS + 1;
     if (!tensor(out, (uint64_t)T * NO * M * 4) || !tensor(sel, (uint64_t)T * NS * 4) ||
         !tensor(x, (uint64_t)T * (down ? NO : 1) * K * 4)) return 0;
-    const uint64_t rb = (uint64_t)K / 256 * 144, srb = (uint64_t)K / 512 * 528;
+    const uint64_t rb = (uint64_t)K / 256 * 144;
+    const uint64_t srb = shared_type == 8 ? (uint64_t)K / 32 * 34 : (uint64_t)K / 512 * 528;
     const char *w0 = weight(map, size, o0, rb * M * NE), *s0 = weight(map, size, so0, srb * M);
     const char *w1 = down ? NULL : weight(map, size, o1, rb * M * NE);
     const char *s1 = down ? NULL : weight(map, size, so1, srb * M);
     if (!w0 || !s0 || (!down && (!w1 || !s1))) return 0;
     if (((uintptr_t)w0 | (uintptr_t)(w1 ? w1 : w0) | (uintptr_t)x->ptr) & 15) return -1;
     const dim3 grid((M + 3) / 4, NO, T);
-    if (down && K == 512)
-        moe_q4k<2, true><<<grid, 128, 0, 0>>>((float *)out->ptr, (const float *)x->ptr, (const int *)sel->ptr,
-            w0, NULL, s0, NULL, NE, NS, M, rb, srb);
-    else if (!down && K == 2560)
-        moe_q4k<10, false><<<grid, 128, 0, 0>>>((float *)out->ptr, (const float *)x->ptr, (const int *)sel->ptr,
-            w0, w1, s0, s1, NE, NS, M, rb, srb);
-    else return -1;
+#define KOLIBRI_MOE_Q4K(KB, DOWN, SHT, W1, S1) \
+    moe_q4k<KB, DOWN, SHT><<<grid, 128, 0, 0>>>((float *)out->ptr, (const float *)x->ptr, \
+        (const int *)sel->ptr, w0, W1, s0, S1, NE, NS, M, rb, srb)
+    if (down && K == 512) {
+        if (shared_type == 8) KOLIBRI_MOE_Q4K(2, true, 8, NULL, NULL);
+        else KOLIBRI_MOE_Q4K(2, true, 200, NULL, NULL);
+    } else if (!down && K == 2560) {
+        if (shared_type == 8) KOLIBRI_MOE_Q4K(10, false, 8, w1, s1);
+        else KOLIBRI_MOE_Q4K(10, false, 200, w1, s1);
+    } else return -1;
+#undef KOLIBRI_MOE_Q4K
     return launched();
 }
 

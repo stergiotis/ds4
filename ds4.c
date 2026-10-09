@@ -61004,13 +61004,32 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                    DS4_N_FF_EXP, DS4_N_EMBD);
     } else
 #endif
+    /* Single-token Q4_K gate/up with the shared expert as a slot: the
+     * Kolibri kernel reads whole Q4_K blocks per lane.  DS4_QWEN4_Q4K_QWEN=1
+     * keeps the Qwen kernel for A/B. */
+    bool mid_done = false;
+#ifdef DS4_HAS_KOLIBRI_GPU
+    static int q4k_qwen = -1;
+    if (q4k_qwen < 0) q4k_qwen = getenv("DS4_QWEN4_Q4K_QWEN") != NULL;
+    if (ok && T == 1u && !shared_dense && !q4k_qwen && l->ffn_up_exps->type == l->ffn_gate_exps->type) {
+        const int rc = ds4_gpu_kolibri_moe_q4k_tensor(g->mid, g->mixed, g->selected, m->map, m->size,
+                                                      l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                                      l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                                      l->ffn_gate_exps->type, l->ffn_gate_shexp->type,
+                                                      DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_EMBD,
+                                                      DS4_N_FF_EXP, 0);
+        if (rc == 0) ok = false;
+        mid_done = rc > 0;
+    }
+#endif
     if (ok) {
-        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
+        ok = (mid_done ||
+              ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
-                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
+                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0) &&
              qwen4_mark("experts gate/up", qwen4_expert_bytes(l->ffn_gate_exps) + qwen4_expert_bytes(l->ffn_up_exps) +
                                            l->ffn_gate_shexp->bytes + l->ffn_up_shexp->bytes) &&
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
