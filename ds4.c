@@ -60605,6 +60605,22 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
  * kernels; DS4_QWEN4_NO_FUSE=1 forces the prefill kernels for A/B checks.
  * T = 3 uses them for the speculative verify only, so prefill tails of three
  * tokens keep their historical kernel selection. */
+/* DS4_GPU_TRACE=1 marks on ROCm: the label names the work enqueued since the
+ * previous mark, bytes the weights it reads (0 when not meaningful). */
+static bool qwen4_mark(const char *label, uint64_t bytes) {
+#ifdef DS4_ROCM_BUILD
+    return ds4_gpu_kolibri_trace_mark(label, bytes) != 0;
+#else
+    (void)label;
+    (void)bytes;
+    return true;
+#endif
+}
+
+static uint64_t qwen4_expert_bytes(const ds4_tensor *t) {
+    return t->bytes / DS4_N_EXPERT * DS4_N_EXPERT_USED;
+}
+
 static bool qwen4_graph_fused(const ds4_qwen4_gpu_graph *g, uint32_t T) {
     static int no_fuse = -1;
     if (no_fuse < 0) no_fuse = getenv("DS4_QWEN4_NO_FUSE") != NULL;
@@ -60689,6 +60705,7 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
           qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T))) {
         return false;
     }
+    if (!qwen4_mark("gdn qkv+z proj", l->lin_qkv->bytes + l->lin_gate->bytes)) return false;
     bool ok;
     if (qwen4_graph_fused(g, T)) {
         ok = ds4_gpu_qwen4_gdn_front_tensor(g->qkv, g->layer_lin_hist[il], g->mixed, g->ga, g->gb, m->map, m->size,
@@ -60706,17 +60723,20 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            l->lin_dt_bias->abs_offset, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
                                            DS4_N_LIN_HEAD_DIM);
     }
+    if (ok) ok = qwen4_mark("gdn conv+gates", l->lin_alpha->bytes + l->lin_beta->bytes);
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb, T,
                                            DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
                                            g->snap_after_first ? g->snap_lin_state[il] : NULL, 0u,
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
+    if (ok) ok = qwen4_mark("gdn scan", 0);
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
                                           DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
     }
     if (ok) ok = qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
+    if (ok) ok = qwen4_mark("gdn norm+out proj", l->lin_out->bytes);
     return ok;
 }
 
@@ -60856,8 +60876,12 @@ static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         }
         if (!ok) return false;
     }
-    return qwen4_graph_attention_tail(g, m, l, il, pos0, T) &&
-           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+    return qwen4_mark("attn q/k/v/idx proj", l->attn_q->bytes + l->attn_k->bytes + l->attn_v->bytes +
+                                             l->indexer_q_proj->bytes + l->indexer_k_proj->bytes) &&
+           qwen4_graph_attention_tail(g, m, l, il, pos0, T) &&
+           qwen4_mark("attn prep+index+core", 0) &&
+           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T) &&
+           qwen4_mark("attn out proj", l->attn_output->bytes);
 }
 
 /* router GEMV, top-k (+ shared gate logit), experts with the shared expert as
@@ -60879,7 +60903,8 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
               ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
-              qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+              qwen4_moe_profile_boundary(profile, &last, &elapsed[0]) &&
+              qwen4_mark("router+top-k", l->ffn_gate_inp->bytes + l->ffn_gate_inp_shexp->bytes);
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -60915,7 +60940,8 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                  qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
                  qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
                  ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
-                 qwen4_moe_profile_boundary(profile, &last, &elapsed[3]);
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[3]) &&
+                 qwen4_mark("experts gate/up (tiled)", 0);
         }
         if (ok) {
             ok = ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
@@ -60924,12 +60950,14 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                   g->cap_tokens) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[4]) &&
                  qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
-                 qwen4_moe_profile_boundary(profile, &last, &elapsed[5]);
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[5]) &&
+                 qwen4_mark("experts down (tiled)", 0);
         }
         if (ok) {
             ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, g->sh_out, g->R, g->inj,
                                                  T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_HC) != 0 &&
-                 qwen4_moe_profile_boundary(profile, &last, &elapsed[6]);
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[6]) &&
+                 qwen4_mark("moe reduce+combine", 0);
         }
         if (profile) fprintf(stderr,
                 "ds4: Qwen MoE ms pos=%u T=%u weight=%.*s ok=%d router=%.3f lists=%.3f mid=%.3f shared_mid=%.3f down=%.3f shared_down=%.3f reduce=%.3f\n",
@@ -60983,15 +61011,19 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
                                           shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
+             qwen4_mark("experts gate/up", qwen4_expert_bytes(l->ffn_gate_exps) + qwen4_expert_bytes(l->ffn_up_exps) +
+                                           l->ffn_gate_shexp->bytes + l->ffn_up_shexp->bytes) &&
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
-                                           shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+                                           shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0 &&
+             qwen4_mark("experts down", qwen4_expert_bytes(l->ffn_down_exps) + l->ffn_down_shexp->bytes);
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
                                              shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,
-                                             DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
+                                             DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0 &&
+             qwen4_mark("moe reduce+combine", 0);
     }
     return ok;
 }
@@ -61079,7 +61111,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
-    bool ok = true;
+    bool ok = qwen4_mark(NULL, 0);
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only) */
     double prof[6] = {0};
@@ -61106,10 +61138,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                  ds4_gpu_qwen4_ple_conv_tensor(g->R, g->ple_gated, g->ple_normed, g->ple_hist, m->map, m->size,
                                                l->ple_conv->abs_offset, l->ple_conv->type, T, hc_dim, DS4_N_PLE_CONV,
                                                DS4_N_PLE_NGRAM, g->snap_after_first ? g->snap_ple_hist : NULL, 0u,
-                                               g->snap_after_second ? g->snap2_ple_hist : NULL, 1u);
+                                               g->snap_after_second ? g->snap2_ple_hist : NULL, 1u) &&
+                 qwen4_mark("ple n-gram mix", l->ple_key->bytes + l->ple_value->bytes + l->ple_conv->bytes);
         }
         QWEN4_PROF(0);
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
+        if (ok) ok = qwen4_mark("hc mix (attn)", l->hc_attn_down->bytes + l->hc_attn_up->bytes);
         QWEN4_PROF(1);
         if (ok) {
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
@@ -61140,6 +61174,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
+        if (ok) ok = qwen4_mark("hc combine+mix (ffn)", l->hc_ffn_down->bytes + l->hc_ffn_up->bytes);
         QWEN4_PROF(4);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
         if (ok && g->dump_prompt_rows)
@@ -61177,8 +61212,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
     }
+    if (ok && logits_out) ok = qwen4_mark("output mix+head", w->output->bytes);
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
+#ifdef DS4_ROCM_BUILD
+    if (ok) ds4_gpu_kolibri_trace_end(T);
+#endif
     const double t3 = timing ? now_sec() : 0.0;
     if (ok && logits_out) {
         const uint64_t rows = all_rows ? T : 1u;

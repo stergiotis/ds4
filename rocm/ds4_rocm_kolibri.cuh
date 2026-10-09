@@ -1264,7 +1264,8 @@ extern "C" int ds4_gpu_kolibri_norm_add_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor
     return launched();
 }
 
-/* DS4_KOLIBRI_TRACE=1.  Each interval is stream time between two timing
+/* DS4_GPU_TRACE=1 (or DS4_KOLIBRI_TRACE=1), for the Kolibri and Qwen3.8
+ * graphs.  Each interval is stream time between two timing
  * events, so it covers the kernels enqueued in between plus any gap where
  * the GPU waited for the host to launch them; the host column (enqueue time
  * per call) shows when that happens.  Events and records are preallocated;
@@ -1322,7 +1323,7 @@ static void report(void) {
         bucket *b = &bk[k];
         if (!b->forwards) continue;
         const double f = (double)b->forwards;
-        fprintf(stderr, "ds4: Kolibri trace, %s: %llu forwards, %llu tokens; per forward: "
+        fprintf(stderr, "ds4: GPU trace, %s: %llu forwards, %llu tokens; per forward: "
                 "wall %.2f ms, GPU %.2f ms, host enqueue %.2f ms%s\n",
                 name[k], (unsigned long long)b->forwards, (unsigned long long)b->tokens,
                 b->wall_ms / f, b->gpu_ms / f, b->host_ms / f,
@@ -1345,7 +1346,8 @@ static void report(void) {
 
 static bool on(void) {
     if (enabled < 0) {
-        const char *v = getenv("DS4_KOLIBRI_TRACE");
+        const char *v = getenv("DS4_GPU_TRACE");
+        if (!v || !v[0]) v = getenv("DS4_KOLIBRI_TRACE");
         enabled = v && v[0] && strcmp(v, "0") != 0;
         if (enabled) atexit(report);
     }
