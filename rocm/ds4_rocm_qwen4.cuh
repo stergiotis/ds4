@@ -1346,6 +1346,42 @@ __global__ void matvec_f32_prefetch(float*out,const char*w,const float*x,unsigne
  }
 }
 
+/* Single-token F16 matvec for long rows (K % 2048 == 0): one 256-thread
+ * block per ROWS rows, 16-byte weight loads, the x chunk read once for all
+ * ROWS rows, and a fixed-order block reduction. */
+template<unsigned ROWS>
+__global__ __launch_bounds__(256) void matvec_f16_long(float *out, const char *w, const float *x,
+        unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row0 = blockIdx.x * ROWS, tid = threadIdx.x;
+    float acc[ROWS];
+    #pragma unroll
+    for (unsigned r = 0; r < ROWS; r++) acc[r] = 0;
+    for (unsigned i = tid * 8; i < K; i += 256 * 8) {
+        const float4 xa = *(const float4 *)(x + i), xb = *(const float4 *)(x + i + 4);
+        #pragma unroll
+        for (unsigned r = 0; r < ROWS; r++) {
+            const uint4 q = *(const uint4 *)(w + (uint64_t)(row0 + r) * stride + (uint64_t)i * 2);
+            const float2 f0 = __half22float2(*(const __half2 *)&q.x), f1 = __half22float2(*(const __half2 *)&q.y);
+            const float2 f2 = __half22float2(*(const __half2 *)&q.z), f3 = __half22float2(*(const __half2 *)&q.w);
+            acc[r] += f0.x * xa.x + f0.y * xa.y + f1.x * xa.z + f1.y * xa.w +
+                      f2.x * xb.x + f2.y * xb.y + f3.x * xb.z + f3.y * xb.w;
+        }
+    }
+    __shared__ float part[8][ROWS];
+    #pragma unroll
+    for (unsigned r = 0; r < ROWS; r++) {
+        const float v = sum(acc[r]);
+        if (!(tid & 31)) part[tid / 32][r] = v;
+    }
+    __syncthreads();
+    if (tid < ROWS && row0 + tid < M) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) v += part[k][tid];
+        out[row0 + tid] = v;
+    }
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
@@ -1373,6 +1409,12 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         if (type == 8 && T > 1 && ((K == 2560 && (M == 128 || M == 512 || M == 6144 || M == 10240 || M == 12288)) || ((K == 6144 || K == 5120) && M == 2560))) {
             if (T == 2) matvec_prefetch<8,2,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
             else matvec_prefetch<8,4,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+            return launched();
+        }
+        static int f16_long_old = -1;
+        if (f16_long_old < 0) f16_long_old = getenv("DS4_QWEN4_HCDOWN_OLD") != NULL;
+        if (type == 1 && T == 1 && M == 320 && K == 10240 && !f16_long_old && !((uintptr_t)w & 15)) {
+            matvec_f16_long<2><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
             return launched();
         }
         if (type == 1 && T == 1 && M == 320 && K == 10240) {
