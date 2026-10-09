@@ -647,10 +647,89 @@ __global__ void moe_mv_reuse(float*out,const float*x,const int*selected,const ch
  }
 }
 
+/* Single-token MXFP4 down projection, K = 640 (20 blocks of 32 values).
+ * Lane b < 20 owns block b of every row: it keeps its 32 x values in
+ * registers and reads the block's 17 bytes (E8M0 scale, 16 nibble bytes:
+ * low nibbles are values 0..15, high nibbles 16..31) as five aligned words,
+ * which may read up to 3 bytes past the block.  Each wave does OR rows and
+ * one wave sum per row.  Slot NS is the Q8_0 shared expert. */
+__device__ __forceinline__ float mxfp4_level(unsigned q) {
+    const unsigned mag = q & 7;
+    const float l = mag < 2 ? .5f * mag : __uint_as_float(((mag / 2 + 126) << 23) | ((mag & 1) << 22));
+    return q & 8 ? -l : l;
+}
+
+template<unsigned OR>
+__global__ __launch_bounds__(128) void moe_down_mxfp4(float *out, const float *x, const int *selected,
+        const char *w, const char *sh, unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb) {
+    constexpr unsigned K = 640, NB = 20;
+    const unsigned lane = threadIdx.x & 31, row0 = (blockIdx.x * 4 + threadIdx.x / 32) * OR;
+    const unsigned slot = blockIdx.y, t = blockIdx.z;
+    const uint64_t pair = (uint64_t)t * (NS + 1) + slot;
+    const float *xt = x + pair * K;
+    if (slot == NS) {
+        #pragma unroll
+        for (unsigned r = 0; r < OR; r++) {
+            const unsigned row = row0 + r;
+            if (row >= M) return;
+            const float a = dot<8>(sh + row * srb, xt, K);
+            if (!lane) out[pair * M + row] = a;
+        }
+        return;
+    }
+    const int e = selected[(uint64_t)t * NS + slot];
+    const bool valid = e >= 0 && (unsigned)e < NE;
+    float xv[32];
+    if (lane < NB) {
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) {
+            const float4 v = *(const float4 *)(xt + lane * 32 + k * 4);
+            xv[k * 4] = v.x; xv[k * 4 + 1] = v.y; xv[k * 4 + 2] = v.z; xv[k * 4 + 3] = v.w;
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < OR; r++) {
+        const unsigned row = row0 + r;
+        if (row >= M) return;
+        float acc = 0;
+        if (valid && lane < NB) {
+            const uintptr_t a = (uintptr_t)(w + ((uint64_t)e * M + row) * rb + lane * 17);
+            const unsigned o = (unsigned)(a & 3);
+            const unsigned *p = (const unsigned *)(a - o);
+            unsigned wd[5];
+            #pragma unroll
+            for (unsigned i = 0; i < 5; i++) wd[i] = p[i];
+            const unsigned sb = (wd[0] >> (8 * o)) & 255;
+            const float scale = sb == 0 ? 0x1p-127f : __uint_as_float(sb << 23);
+            const unsigned q0 = (o + 1) >> 2, sh8 = 8 * ((o + 1) & 3);
+            #pragma unroll
+            for (unsigned k = 0; k < 4; k++) {
+                const unsigned nb = sh8 ? (wd[q0 + k] >> sh8) | (wd[q0 + k + 1] << (32 - sh8)) : wd[q0 + k];
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    const unsigned byte = (nb >> (8 * j)) & 255;
+                    acc += mxfp4_level(byte & 15) * xv[k * 4 + j] + mxfp4_level(byte >> 4) * xv[16 + k * 4 + j];
+                }
+            }
+            acc *= scale;
+        }
+        acc = sum(acc);
+        if (!lane) out[pair * M + row] = acc;
+    }
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
+    static int mxfp4_old = -1;
+    if (mxfp4_old < 0) mxfp4_old = getenv("DS4_QWEN4_MXFP4_OLD") != NULL;
+    if (!mxfp4_old && down && T == 1 && type == 39 && st == 8 && K == 640 && M % 16 == 0 &&
+        !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
+        const dim3 grid(M / 16, NS + 1, 1);
+        moe_down_mxfp4<4><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb);
+        return launched();
+    }
     if (ds4_rocm_is_gfx1151() && T >= 2 && T <= 3 && NS == 10 && NE == 512 && st == 8 && !((uintptr_t)x&15)) {
         if (!down && K == 2560 && M == 640 && (type == 16 || type == 12)) {
             const dim3 grouped(M,(NS+1)*T);
