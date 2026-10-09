@@ -18,6 +18,7 @@ __device__ __forceinline__ float sigmoid(float x);
 template<unsigned TYPE>
 __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n,
         const uint64_t *grid = NULL, const uint8_t *signs = NULL);
+__device__ __forceinline__ float dot_q8_vec(const char *row, const float *x, unsigned n);
 __device__ float injection(const float *inj, unsigned hc, unsigned stream);
 
 struct rope_args { float freq[32], scale; unsigned nrot; };
@@ -672,7 +673,7 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4(float *out, const float *x
         for (unsigned r = 0; r < OR; r++) {
             const unsigned row = row0 + r;
             if (row >= M) return;
-            const float a = dot<8>(sh + row * srb, xt, K);
+            const float a = dot_q8_vec(sh + row * srb, xt, K);
             if (!lane) out[pair * M + row] = a;
         }
         return;
@@ -1160,6 +1161,17 @@ __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n
         }
     } else {
         for (unsigned i = threadIdx.x & 31; i < n; i += 32) acc += value<TYPE>(row, i, grid, signs) * x[i];
+    }
+    return sum(acc);
+}
+
+/* Q8_0 row dot, four values per lane per step (n % 128 == 0, x 16-byte
+ * aligned; Q8_0 rows need only 2-byte alignment, which value4 respects). */
+__device__ __forceinline__ float dot_q8_vec(const char *row, const float *x, unsigned n) {
+    float acc = 0;
+    for (unsigned i = (threadIdx.x & 31) * 4; i < n; i += 128) {
+        const float4 w = value4<8>(row, i, NULL, NULL), v = *(const float4 *)(x + i);
+        acc += w.x * v.x; acc += w.y * v.y; acc += w.z * v.z; acc += w.w * v.w;
     }
     return sum(acc);
 }

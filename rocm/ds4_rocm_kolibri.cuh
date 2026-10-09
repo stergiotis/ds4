@@ -556,8 +556,13 @@ __global__ __launch_bounds__(128) void moe_q4k(float *out, const float *x, const
     const float *xt = x + (DOWN ? pair : t) * K;
     float a = 0, b = 0;
     if (slot == NS) {
-        a = qwen4_rocm::dot<SHT>(sh0 + row * srb, xt, K);
-        if (!DOWN) b = qwen4_rocm::dot<SHT>(sh1 + row * srb, xt, K);
+        if (SHT == 8) {
+            a = qwen4_rocm::dot_q8_vec(sh0 + row * srb, xt, K);
+            if (!DOWN) b = qwen4_rocm::dot_q8_vec(sh1 + row * srb, xt, K);
+        } else {
+            a = qwen4_rocm::dot<SHT>(sh0 + row * srb, xt, K);
+            if (!DOWN) b = qwen4_rocm::dot<SHT>(sh1 + row * srb, xt, K);
+        }
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
