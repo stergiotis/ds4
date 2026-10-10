@@ -167,7 +167,9 @@ dominates, a spin-wait on the event, or pinned-memory polling of the routing
 result, could shorten each of the 42 handoffs. A third option is
 KTransformers': start the expert reads from a host function queued on the
 stream (`hipLaunchHostFunc`) instead of a host sync. With whole-token graphs
-it gave them 1.23x decode, where launch overhead had been 21-73% of GPU time.
+it gave them 1.23x decode, where launch overhead had been 21-73% of GPU time
+(from the paper's sections 2.3 and 6.4; a second reading reached only the
+abstract, so treat the figure as unconfirmed).
 
 Also check whether the DSA decode attention reads the shared KV latent once
 per query head (64 heads, 1 KV head). Reading it once per head group was
