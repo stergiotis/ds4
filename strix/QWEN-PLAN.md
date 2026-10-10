@@ -112,6 +112,20 @@ for them only fusion, meaning fewer launches, pays.
 Cold prefill is 1,694 tok/s at 512 and 1,844 at 8K; the repeat runs hit
 halogen's prompt cache and are not usable.
 
+**Bytes per token (2026-10-10, `strix/dram_bw.sh` during steady decode,
+GPU 94-96% busy; logs in `qwen-prof/bytes-*`):**
+
+| | Decode tok/s | DRAM read | Bytes per token |
+|---|---:|---:|---:|
+| ds4 (df9a5f2), 512 context, 2,048 greedy tokens | 24.4 | 172.6 GB/s | 7.08 GB |
+| halogen serial, sweep tg1024 | 35.7 | 152.3 GB/s | 4.27 GB |
+| halogen MTP, sweep tg1024 | 52.3 | 181.0 GB/s | 3.46 GB per committed token |
+
+halogen's plain-decode lead is all bytes: it reads 40% fewer per token at a
+lower bandwidth than ds4 already reaches. At 4.27 GB and 173 GB/s, ds4 would
+decode at ~40 tok/s. **Phase 2 (weight formats) is the main lever and MTP
+the second**; Phase 1 kernel work now has diminishing returns.
+
 The plain-decode gap to ds4 (40.2 ms at 512 context) is 1.44x. Half of
 halogen's headline speed is its MTP, which commits far more per round than
 ds4's measured +10-12% suggests. Its EULA permits benchmarking and does
