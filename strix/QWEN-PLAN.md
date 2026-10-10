@@ -89,6 +89,36 @@ Tried and reverted: staging the layer-1 n-gram rows after layer 0 was
 queued. Decode did not change (22.83 -> 22.87, 22.33 -> 22.33), so the
 host staging was not on the GPU's critical path.
 
+2026-10-10: df9a5f2 merges the GDN alpha/beta projections into one 96-block
+launch. Decode is +1.8% (24.40 -> 24.85 at 512, 23.83 -> 24.20 at 8K).
+
+Two more were tried and reverted. Both were exact, but the kernels stayed
+at ~20 us per call:
+- hc_norm with one barrier pair for the injection sums: 20.5 -> 19.3 us.
+- a wave-shuffle router top-k with 2 barriers per round instead of ~10:
+  19.7 -> 19.6 us, with bit-identical NLL and output.
+
+Small dependent kernels here cost ~20 us mostly in dispatch latency, so
+for them only fusion, meaning fewer launches, pays.
+
+**halogen measured (2026-10-10, 0.15.3, its own `sweep -p 512,8192 -n 128
+-d serial,mtp -r 2`, 10 prompt shapes, end to end over HTTP):**
+
+| Decoding | tok/s, mean (min-max) | per token |
+|---|---:|---:|
+| serial, no speculation | 35.9 (33.5-38.1) | ~27.9 ms |
+| MTP, 2.1-2.7 tokens committed per round | 55.0 (46.9-63.3) | ~18.2 ms |
+
+Cold prefill is 1,694 tok/s at 512 and 1,844 at 8K; the repeat runs hit
+halogen's prompt cache and are not usable.
+
+The plain-decode gap to ds4 (40.2 ms at 512 context) is 1.44x. Half of
+halogen's headline speed is its MTP, which commits far more per round than
+ds4's measured +10-12% suggests. Its EULA permits benchmarking and does
+not prohibit reverse engineering, but asks that derived kernels not be
+redistributed as one's own work. So kernel-level profiles of halogen may
+inform this plan, but its code must not be ported here.
+
 | # | Idea | Expected gain | Notes |
 |---:|---|---|---|
 | 1 | ~~Q4_K expert gate/up decode~~ done | 9.96 -> 6.29 ms (167 GB/s) | Kolibri reaches 194 GB/s; the 10-slot grid may still be tunable |
@@ -108,7 +138,7 @@ host staging was not on the GPU's critical path.
 | 9 | Router F32 -> BF16 (as Kolibri) | 0.13 GB | top-k can flip on near ties |
 | 10 | GDN and attention projections Q8_0 -> Q6_K (or Q5_K) | 0.66 (0.89) GB | the main quality question |
 | 11 | Head Q8_0 -> Q6_K; shared expert Q8_0 -> Q4_K | 0.28 GB | low-medium |
-| 12 | MTP on top (`--mtp`, measured upstream at +10-12%) | | already exists; check acceptance here |
+| 12 | MTP on top (`--mtp`, measured upstream at +10-12%) | up to ~1.5x | halogen's MTP gives 1.53x over its serial decode with 2.1-2.7 tokens per round; measure ds4's acceptance and verify cost here first |
 
 Requantizing from the Q8_0 tensors is a double quantization; Q8_0 is close
 enough to lossless that it should be acceptable, but the gates decide.
