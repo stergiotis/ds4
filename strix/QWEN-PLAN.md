@@ -202,17 +202,64 @@ plain. With 1.45-1.55x MTP on code, that is ~58-62 tok/s against halogen's
 | 11 | Head Q8_0 -> Q6_K; shared expert Q8_0 -> Q4_K | 0.28 GB | low-medium |
 | 12 | MTP on top (`--mtp`) | 1.45-1.55x on code, 1.15x on prose | measured, see above; a ds4 Qwen setup in hackathon_2026's `scripts/llm-serve.sh` (none yet) should pass `--mtp` |
 
-Requantizing from the Q8_0 tensors is a double quantization; Q8_0 is close
-enough to lossless that it should be acceptable, but the gates decide.
-**Disk:** since 2026-10-10 a repacked GGUF can leave out the 95 GiB n-gram
-table and point at the current file with `qwen4exp.ple.ngram_file` (or
-`DS4_QWEN_NGRAM_FILE`). Checked by reading the table through that path from
-the Q4 GGUF itself: NLL bit-identical (2.308070771), greedy and MTP output
-identical. A repacked main file still needs ~65 GiB, more than the 55 GiB
-free, so Phase 2 needs space freed (the GLM Q2 GGUF, 90 GiB, serves only
-the paused Q2 tier). The Qwen graph also accepts only Q8_0/Q4_0/F16/BF16/F32
-dense weights (`qwen4_graph_weights_supported`), so Q6_K/Q5_K
-projections need decode and prefill kernels first.
+**Disk:** a repacked GGUF leaves out the 95 GiB n-gram table and points at
+the Q4 GGUF with `qwen4exp.ple.ngram_file` (or `DS4_QWEN_NGRAM_FILE`). The
+GLM Q2 GGUF was deleted on 2026-10-10 to make room (145 GiB free after).
+
+### Phase 2 results (2026-10-10)
+
+`gguf-tools/qwen4_requant.py` rewrites chosen tensor groups and omits the
+n-gram table; `--simulate` stores the rounded values in a format the runtime
+already runs, so quality can be measured before kernels exist; `--imatrix`
+takes a dense imatrix collected with `DS4_QWEN4_DENSE_IMATRIX=FILE` (59k
+calibration tokens from `gguf-tools/imatrix/dataset`, 640 tensors, 2.5
+minutes of prefill). Requantizing from Q8_0 is a double quantization; the
+gates below decide.
+
+**Quality** (teacher-forced, `qwen-prof/quant/eval.txt`: 8,791 tokens of
+Italian prose, an English ADR, Go and Python; `strix/pplcompare.py` against
+the Q4 GGUF, NLL 1.5706; logs in `qwen-prof/quant/`):
+
+| Variant (cumulative) | Saves per token | ppl | KL mean | top-1 |
+|---|---:|---:|---:|---:|
+| router F32 -> BF16 | 0.12 GiB | bit-identical (the weights are BF16 values) | 0 | 100% |
+| hc low-rank F16 -> Q8_0 | 0.60 GiB | +0.13% | 0.0070 | 94.6% |
+| + GDN qkv/gate/out Q4_K (simulated) | 0.96 GiB | +1.5% | 0.032 | 89.4% |
+| same, real Q4_K file | | **+1.14%** | 0.031 | 89.7% |
+| same, imatrix | | +1.9% | 0.028 | 90.3% |
+| + attention q/k/v/out, indexer, shared gate/up Q4_K | 0.39 GiB | +4.8% | 0.062 | 86.3% |
+| + head Q4_K | 0.30 GiB | +5.6% | 0.068 | 85.3% |
+| same, imatrix | | +3.8% | 0.062 | 85.2% |
+| + hc down Q4_K | 0.15 GiB | +6.2% | 0.071 | 85.1% |
+
+The attention projections are the poor trade (most KL for the fewest
+bytes). The imatrix lowers KL by 9-14% and helps attention and the head
+more than GDN.
+
+**Speed of the real V2 file** (`qwen-v2.gguf`, 68.1 GiB: hc Q8_0, router
+BF16, GDN Q4_K), after the kernels below:
+
+| | Q8 (df9a5f2) | V2 |
+|---|---:|---:|
+| GPU per token at 8K | 43 ms | 35.2 ms |
+| decode 512 / 8K | 24.85 / 24.2 | 28.9-29.2 / 28.0-28.2 |
+| prefill 512 / 8K / 32K | ~320 / 435 / 392 | 323 / 437 / 416 |
+| MTP code / essay (512 tokens) | 34.9 / 27.8 | 38.2 / 31.7, identical to plain |
+
+Kernels this needed (each A/B'd; greedy identical where the math is):
+
+- `matvec_q4k_rows`: R = 4 rows per wave, so each x load serves four rows.
+  One row per wave was x-bound: x traffic was ~7x the Q4_K weight bytes,
+  and the K = 6144 out projection ran at 47 GB/s (6.65 ms); now 2.0 ms.
+  Bit-identical to the one-row kernel and independent of T, so MTP verify
+  rows match plain decode exactly.
+- `qwen_q8_direct<12>`: the direct WMMA prefill with a Q4_K group decode.
+  The pack-to-F16 + BLAS path took 6.2 s of GDN projections per 8K chunk,
+  now 1.0 s.
+- `matvec_q8_long<2,T>` for the Q8_0 hc down (3.63 -> 2.24 ms) and
+  `matvec_bf16<T>` for the router (1.81 -> 0.87 ms), both T-invariant.
+- The hc up GEMM at prefill now also takes Q8_0 (it excluded Q8_0, which
+  cost 6.3 s per 8K chunk).
 
 ## How changes are checked
 
