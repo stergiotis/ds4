@@ -140,6 +140,47 @@ not prohibit reverse engineering, but asks that derived kernels not be
 redistributed as one's own work. So kernel-level profiles of halogen may
 inform this plan, but its code must not be ported here.
 
+**ds4 MTP measured (2026-10-10, df9a5f2, `ds4 --mtp-timing`, greedy,
+512 tokens, 8K context; logs in `qwen-prof/mtp-1010-1446`):**
+
+| Prompt | plain | 1 draft (`DS4_QWEN4_MTP_DEPTH=2`) | auto (default) | 2 drafts (`=3`) | first-draft acceptance |
+|---|---:|---:|---:|---:|---:|
+| Go semver function | 24.0 | 31.8 | 34.9 | 36.5 (1.52x) | 92-93% |
+| essay | 23.7 | 27.9 | 27.8 | 27.0 (1.14x) | 68% |
+| train arithmetic | 24.0 | 32.4 | 36.3 | 37.2 (1.55x) | 94-97% |
+| Python refactor | 23.9 | 31.3 | 33.0 | 34.7 (1.45x) | 87-89% |
+| arithmetic, `--think`, 1,536 tokens | 24.2 | | 36.3 (1.50x) | | 93% |
+
+Every non-thinking MTP run was byte-identical to its plain run. The
+thinking run diverged at a near tie ("9:40 + 6" against "9:40+6"): the
+2-3 row verify sums in a different order than T = 1 decode.
+
+So ds4's MTP already matches halogen's ratio (1.53x over its serial
+decode) on code and reasoning. Upstream's +10-12% was the old single-draft
+build. The depth-3 policy is right for code. On prose the second draft
+rarely pays, and auto falls back as designed.
+
+What a verify costs (`DS4_GPU_TRACE=1`, 105 verify passes of 2.94 rows
+each): 67.2 ms against 41.9 ms for a T = 1 forward (1.60x), while each
+cycle commits ~2.46 tokens:
+
+| Call | T = 1 | verify (T ~ 3) | |
+|---|---:|---:|---|
+| experts gate/up | 6.23 | 15.73 | ~2.7x the distinct experts, so mostly inherent |
+| experts down | 3.93 | 9.59 | same |
+| hc down | 3.42 | 6.50 | dense, same bytes: should stay near 3.4 |
+| hc up+gate | 3.63 | 5.97 | dense, same bytes |
+| gdn conv+gates | 0.76 | 1.65 | |
+| router matvec | 1.69 | 2.01 | |
+
+The hc kernels at T = 2-3 still use the old per-row path (Phase 1
+item 8), and fixing them should save ~5 ms per verify, ~2 ms per
+committed token (~7%).
+
+**halogen parity estimate:** Phase 2's ~4.3 GB per token gives ~40 tok/s
+plain. With 1.45-1.55x MTP on code, that is ~58-62 tok/s against halogen's
+55. On prose it is ~46-47.
+
 | # | Idea | Expected gain | Notes |
 |---:|---|---|---|
 | 1 | ~~Q4_K expert gate/up decode~~ done | 9.96 -> 6.29 ms (167 GB/s) | Kolibri reaches 194 GB/s; the 10-slot grid may still be tunable |
@@ -159,14 +200,19 @@ inform this plan, but its code must not be ported here.
 | 9 | Router F32 -> BF16 (as Kolibri) | 0.13 GB | top-k can flip on near ties |
 | 10 | GDN and attention projections Q8_0 -> Q6_K (or Q5_K) | 0.66 (0.89) GB | the main quality question |
 | 11 | Head Q8_0 -> Q6_K; shared expert Q8_0 -> Q4_K | 0.28 GB | low-medium |
-| 12 | MTP on top (`--mtp`, measured upstream at +10-12%) | up to ~1.5x | halogen's MTP gives 1.53x over its serial decode with 2.1-2.7 tokens per round; measure ds4's acceptance and verify cost here first |
+| 12 | MTP on top (`--mtp`) | 1.45-1.55x on code, 1.15x on prose | measured, see above; a ds4 Qwen setup in hackathon_2026's `scripts/llm-serve.sh` (none yet) should pass `--mtp` |
 
 Requantizing from the Q8_0 tensors is a double quantization; Q8_0 is close
 enough to lossless that it should be acceptable, but the gates decide.
-**Disk:** a repacked GGUF carries the 95 GiB n-gram table again unless the
-loader can take the n-grams from the current file. 55 GiB are free after the
-download, so either teach the loader a separate n-gram file or free space
-(the GLM Q2 GGUF, 90 GiB, serves only the paused Q2 tier).
+**Disk:** since 2026-10-10 a repacked GGUF can leave out the 95 GiB n-gram
+table and point at the current file with `qwen4exp.ple.ngram_file` (or
+`DS4_QWEN_NGRAM_FILE`). Checked by reading the table through that path from
+the Q4 GGUF itself: NLL bit-identical (2.308070771), greedy and MTP output
+identical. A repacked main file still needs ~65 GiB, more than the 55 GiB
+free, so Phase 2 needs space freed (the GLM Q2 GGUF, 90 GiB, serves only
+the paused Q2 tier). The Qwen graph also accepts only Q8_0/Q4_0/F16/BF16/F32
+dense weights (`qwen4_graph_weights_supported`), so Q6_K/Q5_K
+projections need decode and prefill kernels first.
 
 ## How changes are checked
 
