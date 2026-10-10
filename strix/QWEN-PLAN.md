@@ -298,6 +298,18 @@ decode. The verify pass (~3 rows) takes 53.4 ms against 31.2 ms for one
 token: experts gate/up 11.8 ms (6.0 at T = 1), down 9.8 ms (4.0; the
 multi kernel did not help down), GDN qkv 6.3 ms (4.4), hc up 3.8 ms (2.5).
 
+**Rejected: hc down at Q4_K (V4 file, deleted).** On top of V3: ppl +2.52%
+(V3 +1.59%), KL 0.069, warm decode 32.5 / 31.6 tok/s (V3 33.0 / 32.1), MTP
+43.8 / 37.2 with code acceptance down from 96% to 89%. The K = 10240,
+M = 320 projection launches only 20 blocks in `matvec_q4k_rows` (2.71 ms
+against 2.19 for `matvec_q8_long`). hc down stays Q8_0.
+
+**Prefill:** Qwen's Q4_K expert gate/up now runs on Kolibri's tile kernel:
+456 -> 619 tok/s at 8K, 417-441 -> 591 at 32K (warm, alternating). Per 8K
+chunk (12.9 s): experts down (MXFP4, Qwen tile) 2.39 s, hc up+gate 1.56,
+expert gate/up 1.31, attention core 1.05, hc down 1.03, GDN qkv 1.0, hc
+norm 0.93. halogen: 1,175-1,844 tok/s.
+
 Measurement note: the first ds4 run after halogen stops is 5-7% slower
 (V3 decode at 8K: 30.2 then 32.2 tok/s with the same binary and file).
 A/B queues need a discarded warm-up run; the V3 numbers above are first
