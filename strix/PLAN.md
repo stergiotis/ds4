@@ -58,6 +58,11 @@ the gate-weight mass) at Q2, perplexity x0.998-1.001, top-1 agreement 94%
 Task check, cut short: hard-smoke cases 1-6, 10, 11 all passed with the
 tier (as with plain Q4).
 
+Blocked (2026-10-10): the GLM Q2 GGUF was deleted to make room for the Qwen
+Phase 2 files. Resuming needs a ~90 GiB re-download, and the disk is nearly
+full (8.2 GB free of 935 GB after `qwen-v3.gguf`). Item 2 does not need the
+Q2 file, apart from its step 3.
+
 Remaining, in order (the scripts are in `~/.local/share/ds4/evals/`):
 1. Finish the task validation: `tier/eval-queue.sh` (hard-smoke case 12,
    then the three Go tasks through ds4-server at 64K with the tier). Check
