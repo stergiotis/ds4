@@ -310,6 +310,34 @@ chunk (12.9 s): experts down (MXFP4, Qwen tile) 2.39 s, hc up+gate 1.56,
 expert gate/up 1.31, attention core 1.05, hc down 1.03, GDN qkv 1.0, hc
 norm 0.93. halogen: 1,175-1,844 tok/s.
 
+**V3 eval on ds4-server (2026-10-10, `--mtp --mtp-exact-sampling`, the
+hackathon_2026 `scripts/llm-eval` suite, engine `qwen-ds4`; results in
+`~/.local/share/llm-eval/qwen-ds4*`):** hard-smoke **11/12** (all three
+OlympiadBench cases including 1618, which no engine had solved; missed the
+LiveBench c8335 case) and Go tasks with the 24576 thinking budget **3/3**
+(expr, glob, semver; ~13 min per task, halogen ~9). halogen 0.15.3 scored
+10/12 and 3/3, strix-llama 11/12 and 3/3. Twelve questions show "not
+weaker", not "better".
+
+**Speed over the API, both engines, thinking on, 512 tokens, two runs:**
+
+| decode tok/s | ds4 V3 code | ds4 V3 essay | halogen code | halogen essay |
+|---|---:|---:|---:|---:|
+| temperature 0 | 40.4 | 36.0 | 58.3 | 43.5 |
+| temperature 1.0 (model card) | **35.0** | **34.5** | **52.0** | **45.5** |
+
+(halogen's essay answers stopped at ~285 tokens.) At the model-card
+sampling the gap is 1.3-1.5x, and most of it is MTP: halogen keeps most of
+its speculative gain at temperature 1.0, ds4's exact-sampling MTP barely
+beats plain decode (~33). Under exact sampling the Qwen spec cycle runs at
+depth 2 only (one draft) and snapshots the full recurrent state each
+verify. Next levers: chained exact acceptance for a second draft, n-gram
+prompt-lookup drafts and an acceptance-based pause (strix/QWEN-RESEARCH.md).
+
+The eval harness's "greedy" speed bench sends no temperature, so with
+thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
+numbers are sampled.
+
 Measurement note: the first ds4 run after halogen stops is 5-7% slower
 (V3 decode at 8K: 30.2 then 32.2 tok/s with the same binary and file).
 A/B queues need a discarded warm-up run; the V3 numbers above are first
