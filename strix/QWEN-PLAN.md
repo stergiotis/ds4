@@ -218,23 +218,34 @@ gates below decide.
 
 **Quality** (teacher-forced, `qwen-prof/quant/eval.txt`: 8,791 tokens of
 Italian prose, an English ADR, Go and Python; `strix/pplcompare.py` against
-the Q4 GGUF, NLL 1.5706; logs in `qwen-prof/quant/`):
+the Q4 GGUF, NLL 1.5706; logs in `qwen-prof/quant/`). KL is over the
+reference's top-20 plus a rest bucket, a lower bound of the full KL (an
+earlier estimator mixed the two top-20 lists and read about half as high):
 
-| Variant (cumulative) | Saves per token | ppl | KL mean | top-1 |
+| Variant (cumulative unless noted) | Saves per token | ppl | KL mean | top-1 |
 |---|---:|---:|---:|---:|
 | router F32 -> BF16 | 0.12 GiB | bit-identical (the weights are BF16 values) | 0 | 100% |
-| hc low-rank F16 -> Q8_0 | 0.60 GiB | +0.13% | 0.0070 | 94.6% |
-| + GDN qkv/gate/out Q4_K (simulated) | 0.96 GiB | +1.5% | 0.032 | 89.4% |
-| same, real Q4_K file | | **+1.14%** | 0.031 | 89.7% |
-| same, imatrix | | +1.9% | 0.028 | 90.3% |
-| + attention q/k/v/out, indexer, shared gate/up Q4_K | 0.39 GiB | +4.8% | 0.062 | 86.3% |
-| + head Q4_K | 0.30 GiB | +5.6% | 0.068 | 85.3% |
-| same, imatrix | | +3.8% | 0.062 | 85.2% |
-| + hc down Q4_K | 0.15 GiB | +6.2% | 0.071 | 85.1% |
+| hc low-rank F16 -> Q8_0 | 0.60 GiB | +0.13% | 0.020 | 94.6% |
+| + GDN qkv/gate/out Q4_K (simulated) | 0.96 GiB | +1.5% | 0.060 | 89.4% |
+| same, real Q4_K file (`qwen-v2.gguf`) | | **+1.14%** | 0.059 | 89.7% |
+| same, imatrix | | +1.9% | 0.053 | 90.3% |
+| + attention q/k/v/out, indexer, shared gate/up Q4_K | 0.39 GiB | +4.8% | 0.106 | 86.3% |
+| + head Q4_K | 0.30 GiB | +5.6% | 0.114 | 85.3% |
+| same, imatrix | | +3.8% | 0.103 | 85.2% |
+| + hc down Q4_K | 0.15 GiB | +6.2% | 0.117 | 85.1% |
+| imatrix: GDN + attention q/k/v, indexer, shared gate/up; **attn_output Q8_0** | | **+1.0%** | 0.060 | 89.5% |
+| same + head Q4_K | | +1.6% | 0.065 | 87.9% |
+| imatrix: GDN + attn_output Q4_K only | | +3.7% | 0.090 | 86.8% |
 
-The attention projections are the poor trade (most KL for the fewest
-bytes). The imatrix lowers KL by 9-14% and helps attention and the head
-more than GDN.
+Nearly all of the attention loss sits in the 13 `attn_output` tensors (12
+full-attention layers and the MTP layer, 0.1 GiB at Q8_0): with them at
+Q8_0 the rest of attention costs almost nothing, and alone at Q4_K they
+cost +3.7%. This matches what halogen's authors report (their 12 o_proj
+promoted to 8 bits). The loss also sits where they say: by quartile of
+reference entropy, the hardest quartile carries most of the NLL increase
+(V2: +0.049 there, -0.004 to +0.008 elsewhere), and the 4-bit runs are
+over-confident there (mean top-1 probability 0.280 in the reference,
+0.289-0.300 in the 4-bit variants, highest with attn_output at Q4_K).
 
 **Speed of the real V2 file** (`qwen-v2.gguf`, 68.1 GiB: hc Q8_0, router
 BF16, GDN Q4_K), after the kernels below:
