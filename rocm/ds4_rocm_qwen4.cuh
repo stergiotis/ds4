@@ -719,6 +719,100 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4(float *out, const float *x
     }
 }
 
+/* moe_down_mxfp4 for 2-3 tokens with each routed expert read once: the
+ * block of the first token that selects an expert decodes each row's
+ * weights once and dots them with the activations of every token that
+ * selects it (held in registers); later tokens' blocks exit.  Each pair's
+ * sum runs in moe_down_mxfp4's order, so results match it. */
+template<unsigned OR>
+__global__ __launch_bounds__(128) void moe_down_mxfp4_multi(float *out, const float *x, const int *selected,
+        const char *w, const char *sh, unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb, unsigned T) {
+    constexpr unsigned K = 640, NB = 20;
+    const unsigned lane = threadIdx.x & 31, row0 = (blockIdx.x * 4 + threadIdx.x / 32) * OR;
+    const unsigned slot = blockIdx.y, t0 = blockIdx.z;
+    const uint64_t pair0 = (uint64_t)t0 * (NS + 1) + slot;
+    if (slot == NS) {
+        const float *xt = x + pair0 * K;
+        #pragma unroll
+        for (unsigned r = 0; r < OR; r++) {
+            const unsigned row = row0 + r;
+            if (row >= M) return;
+            const float a = dot_q8_vec(sh + row * srb, xt, K);
+            if (!lane) out[pair0 * M + row] = a;
+        }
+        return;
+    }
+    const int e = selected[(uint64_t)t0 * NS + slot];
+    if (e < 0 || (unsigned)e >= NE) {
+        if (!lane) for (unsigned r = 0; r < OR; r++) if (row0 + r < M) out[pair0 * M + row0 + r] = 0;
+        return;
+    }
+    for (unsigned t = 0; t < t0; t++)
+        for (unsigned s = 0; s < NS; s++)
+            if (selected[(uint64_t)t * NS + s] == e) return;
+    uint64_t pairs[3] = {pair0, 0, 0};
+    unsigned n = 1;
+    for (unsigned t = t0 + 1; t < T && n < 3; t++)
+        for (unsigned s = 0; s < NS; s++)
+            if (selected[(uint64_t)t * NS + s] == e) { pairs[n++] = (uint64_t)t * (NS + 1) + s; break; }
+    float xv[3][32];
+    #pragma unroll
+    for (unsigned p = 0; p < 3; p++) {
+        if (p < n && lane < NB) {
+            const float *xt = x + pairs[p] * K;
+            #pragma unroll
+            for (unsigned k = 0; k < 8; k++) {
+                const float4 v = *(const float4 *)(xt + lane * 32 + k * 4);
+                xv[p][k * 4] = v.x; xv[p][k * 4 + 1] = v.y; xv[p][k * 4 + 2] = v.z; xv[p][k * 4 + 3] = v.w;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < OR; r++) {
+        const unsigned row = row0 + r;
+        if (row >= M) return;
+        float lv[32], scale = 0;
+        if (lane < NB) {
+            const uintptr_t a = (uintptr_t)(w + ((uint64_t)e * M + row) * rb + lane * 17);
+            const unsigned o = (unsigned)(a & 3);
+            const unsigned *pw = (const unsigned *)(a - o);
+            unsigned wd[5];
+            #pragma unroll
+            for (unsigned i = 0; i < 5; i++) wd[i] = pw[i];
+            const unsigned sb = (wd[0] >> (8 * o)) & 255;
+            scale = sb == 0 ? 0x1p-127f : __uint_as_float(sb << 23);
+            const unsigned q0 = (o + 1) >> 2, sh8 = 8 * ((o + 1) & 3);
+            #pragma unroll
+            for (unsigned k = 0; k < 4; k++) {
+                const unsigned nb = sh8 ? (wd[q0 + k] >> sh8) | (wd[q0 + k + 1] << (32 - sh8)) : wd[q0 + k];
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    const unsigned byte = (nb >> (8 * j)) & 255;
+                    lv[k * 4 + j] = mxfp4_level(byte & 15);
+                    lv[16 + k * 4 + j] = mxfp4_level(byte >> 4);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned p = 0; p < 3; p++) {
+            if (p < n) {
+                float acc = 0;
+                if (lane < NB) {
+                    #pragma unroll
+                    for (unsigned k = 0; k < 4; k++) {
+                        #pragma unroll
+                        for (unsigned j = 0; j < 4; j++)
+                            acc += lv[k * 4 + j] * xv[p][k * 4 + j] + lv[16 + k * 4 + j] * xv[p][16 + k * 4 + j];
+                    }
+                    acc *= scale;
+                }
+                acc = sum(acc);
+                if (!lane) out[pairs[p] * M + row] = acc;
+            }
+        }
+    }
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
@@ -729,6 +823,14 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
         const dim3 grid(M / 16, NS + 1, 1);
         moe_down_mxfp4<4><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb);
+        return launched();
+    }
+    static int multi_old = -1;
+    if (multi_old < 0) multi_old = getenv("DS4_QWEN4_MOE_MULTI_OLD") != NULL;
+    if (!mxfp4_old && !multi_old && down && T >= 2 && T <= 3 && type == 39 && st == 8 && K == 640 &&
+        M % 16 == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
+        const dim3 grid(M / 16, NS + 1, T);
+        moe_down_mxfp4_multi<4><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
         return launched();
     }
     if (ds4_rocm_is_gfx1151() && T >= 2 && T <= 3 && NS == 10 && NE == 512 && st == 8 && !((uintptr_t)x&15)) {
@@ -2409,6 +2511,52 @@ __global__ void hc_mix(float *out, const float *xn, const float *lo,
     if (!lane) out[(uint64_t)tok * E + d] = v / hc;
 }
 
+/* hc_mix for 2-3 tokens in one block: each weight load serves every token.
+ * Each token's arithmetic is hc_mix's, so rows match it and do not depend
+ * on T.  rank <= 512. */
+template<unsigned TYPE, unsigned TM>
+__global__ void hc_mix_multi(float *out, const float *xn, const float *lo,
+                             const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
+    const unsigned d = blockIdx.x * 4 + threadIdx.x / 32;
+    __shared__ __align__(16) float activated[TM][512];
+    for (unsigned i = threadIdx.x; i < TM * rank; i += blockDim.x)
+        activated[i / rank][i % rank] = silu(lo[(uint64_t)(i / rank) * rank + i % rank] / hc);
+    __syncthreads();
+    if (d >= E) return;
+    const unsigned lane = threadIdx.x & 31, stream = lane / 8, l = lane % 8;
+    float a[TM];
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) a[t] = 0;
+    if (stream < hc) {
+        const char *row = up+((uint64_t)stream*E+d)*rb;
+        if (!(rank%4) && !(TYPE == 0 ? (uintptr_t)row&15 : TYPE == 1 ? (uintptr_t)row&7 : 0)) {
+            for (unsigned r = l*4; r < rank; r += 32) {
+                const float4 w = value4<TYPE>(row,r,NULL,NULL);
+                #pragma unroll
+                for (unsigned t = 0; t < TM; t++) {
+                    const float4 v = *(const float4 *)(activated[t]+r);
+                    a[t] += w.x*v.x; a[t] += w.y*v.y; a[t] += w.z*v.z; a[t] += w.w*v.w;
+                }
+            }
+        } else {
+            for (unsigned r = l; r < rank; r += 8) {
+                const float w = value<TYPE>(row,r);
+                #pragma unroll
+                for (unsigned t = 0; t < TM; t++) a[t] += w * activated[t][r];
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) {
+        float at = a[t];
+        for (unsigned off = 1; off <= 4; off *= 2) at += __shfl_xor( at, off, 32);
+        float v = stream < hc ? sigmoid(at) * xn[((uint64_t)t * hc + stream) * E + d] : 0;
+        v += __shfl_xor( v, 8, 32);
+        v += __shfl_xor( v, 16, 32);
+        if (!lane) out[(uint64_t)t * E + d] = v / hc;
+    }
+}
+
 __device__ float injection(const float *inj, unsigned hc, unsigned stream) {
     float v = 0;
     for (unsigned i = 0; i < hc * 8; i++) v += inj[i * hc + stream];
@@ -2731,6 +2879,17 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
     if (!w || (type != 0 && type != 1 && type != 8)) return 0;
+    static int multi_old = -1;
+    if (multi_old < 0) multi_old = getenv("DS4_QWEN4_HC_MULTI_OLD") != NULL;
+    if (T >= 2 && T <= 3 && rank <= 512 && !multi_old) {
+#define QWEN_HCM(TYPE, TM) hc_mix_multi<TYPE,TM><<<(E + 3) / 4,128,0,0>>>((float *)out->ptr, \
+        (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
+        if (type == 0) { if (T == 2) QWEN_HCM(0,2); else QWEN_HCM(0,3); }
+        else if (type == 1) { if (T == 2) QWEN_HCM(1,2); else QWEN_HCM(1,3); }
+        else { if (T == 2) QWEN_HCM(8,2); else QWEN_HCM(8,3); }
+#undef QWEN_HCM
+        return launched();
+    }
 #define QWEN_HC(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, T),128,0,0>>>((float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
     if (type == 0) { QWEN_HC(0); }

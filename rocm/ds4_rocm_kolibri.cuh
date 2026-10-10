@@ -547,6 +547,93 @@ __global__ __launch_bounds__(128) void moe_q4k(float *out, const float *x, const
     if (!lane) out[pair * M + row] = DOWN ? a : qwen4_rocm::silu(a) * b;
 }
 
+/* moe_q4k gate/up for 1-3 tokens with R rows per wave (each x load serves
+ * R rows) and each routed expert read once: the block of the first token
+ * that selects an expert also computes every later token that selects it,
+ * and the later tokens' blocks exit.  Each token's sums run in moe_q4k's
+ * order, so results match it and do not depend on T.  M % (4 * R) == 0. */
+template<unsigned KB, unsigned R, unsigned SHT>
+__global__ __launch_bounds__(128) void moe_q4k_rows(float *out, const float *x, const int *selected,
+        const char *w0, const char *w1, const char *sh0, const char *sh1,
+        unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb, unsigned T) {
+    constexpr unsigned K = KB * 256;
+    const unsigned row0 = (blockIdx.x * 4 + threadIdx.x / 32) * R, slot = blockIdx.y, t0 = blockIdx.z;
+    const unsigned lane = threadIdx.x & 31, c = lane / 8, o = (lane % 8) * 4;
+    if (slot == NS) {
+        const float *xt = x + (uint64_t)t0 * K;
+        const uint64_t pair = (uint64_t)t0 * (NS + 1) + NS;
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const unsigned row = row0 + r;
+            float a, b;
+            if (SHT == 8) {
+                a = qwen4_rocm::dot_q8_vec(sh0 + row * srb, xt, K);
+                b = qwen4_rocm::dot_q8_vec(sh1 + row * srb, xt, K);
+            } else {
+                a = qwen4_rocm::dot<SHT>(sh0 + row * srb, xt, K);
+                b = qwen4_rocm::dot<SHT>(sh1 + row * srb, xt, K);
+            }
+            if (!lane) out[pair * M + row] = qwen4_rocm::silu(a) * b;
+        }
+        return;
+    }
+    const int e = selected[(uint64_t)t0 * NS + slot];
+    if (e < 0 || (unsigned)e >= NE) {
+        if (!lane) for (unsigned r = 0; r < R; r++) out[((uint64_t)t0 * (NS + 1) + slot) * M + row0 + r] = 0;
+        return;
+    }
+    for (unsigned t = 0; t < t0; t++)
+        for (unsigned s = 0; s < NS; s++)
+            if (selected[(uint64_t)t * NS + s] == e) return;
+    uint64_t pairs[3] = {(uint64_t)t0 * (NS + 1) + slot, 0, 0};
+    unsigned toks[3] = {t0, 0, 0}, n = 1;
+    for (unsigned t = t0 + 1; t < T && n < 3; t++)
+        for (unsigned s = 0; s < NS; s++)
+            if (selected[(uint64_t)t * NS + s] == e) { pairs[n] = (uint64_t)t * (NS + 1) + s; toks[n++] = t; break; }
+    float a[3][R], b[3][R];
+    #pragma unroll
+    for (unsigned p = 0; p < 3; p++) {
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) a[p][r] = b[p][r] = 0;
+    }
+    const uint64_t base = ((uint64_t)e * M + row0) * rb;
+    #pragma unroll 2
+    for (unsigned bk = 0; bk < KB; bk++) {
+        uint4 h0[R], h1[R];
+        unsigned q0[R], q1[R];
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const uint64_t off = base + r * rb + bk * 144;
+            h0[r] = *(const uint4 *)(w0 + off);
+            q0[r] = *(const unsigned *)(w0 + off + 16 + c * 32 + o);
+            h1[r] = *(const uint4 *)(w1 + off);
+            q1[r] = *(const unsigned *)(w1 + off + 16 + c * 32 + o);
+        }
+        #pragma unroll
+        for (unsigned p = 0; p < 3; p++) {
+            if (p < n) {
+                const float *xt = x + (uint64_t)toks[p] * K + bk * 256 + c * 64 + o;
+                const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
+                #pragma unroll
+                for (unsigned r = 0; r < R; r++) {
+                    a[p][r] += q4k_block(h0[r], q0[r], xa, xb, c);
+                    b[p][r] += q4k_block(h1[r], q1[r], xa, xb, c);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned p = 0; p < 3; p++) {
+        if (p < n) {
+            #pragma unroll
+            for (unsigned r = 0; r < R; r++) {
+                const float av = sum(a[p][r]), bv = sum(b[p][r]);
+                if (!lane) out[pairs[p] * M + row0 + r] = qwen4_rocm::silu(av) * bv;
+            }
+        }
+    }
+}
+
 /* One block of THREADS threads per token row; D <= THREADS * MAXV.  NSC is
  * the slot count when known at compile time (decode: K routed + shared), so
  * the partial loads unroll and go out together; 0 loops over NS.  x is read
@@ -1157,6 +1244,17 @@ extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *s1 = down ? NULL : weight(map, size, so1, srb * M);
     if (!w0 || !s0 || (!down && (!w1 || !s1))) return 0;
     if (((uintptr_t)w0 | (uintptr_t)(w1 ? w1 : w0) | (uintptr_t)x->ptr) & 15) return -1;
+    static int rows_r = -1;
+    if (rows_r < 0) { const char *v = getenv("DS4_QWEN4_MOE_ROWS"); rows_r = v ? atoi(v) : 2; }
+    if (!down && K == 2560 && T <= 3 && (rows_r == 2 || rows_r == 4) && !(M % (4u * rows_r))) {
+        const dim3 g(M / (4u * rows_r), NO, T);
+#define KOLIBRI_MOE_ROWS(R, SHT) moe_q4k_rows<10, R, SHT><<<g, 128, 0, 0>>>((float *)out->ptr, \
+        (const float *)x->ptr, (const int *)sel->ptr, w0, w1, s0, s1, NE, NS, M, rb, srb, T)
+        if (rows_r == 2) { if (shared_type == 8) KOLIBRI_MOE_ROWS(2, 8); else KOLIBRI_MOE_ROWS(2, 200); }
+        else { if (shared_type == 8) KOLIBRI_MOE_ROWS(4, 8); else KOLIBRI_MOE_ROWS(4, 200); }
+#undef KOLIBRI_MOE_ROWS
+        return launched();
+    }
     const dim3 grid((M + 3) / 4, NO, T);
 #define KOLIBRI_MOE_Q4K(KB, DOWN, SHT, W1, S1) \
     moe_q4k<KB, DOWN, SHT><<<grid, 128, 0, 0>>>((float *)out->ptr, (const float *)x->ptr, \

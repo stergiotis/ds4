@@ -61197,7 +61197,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #ifdef DS4_HAS_KOLIBRI_GPU
     static int q4k_qwen = -1;
     if (q4k_qwen < 0) q4k_qwen = getenv("DS4_QWEN4_Q4K_QWEN") != NULL;
-    if (ok && T == 1u && !shared_dense && !q4k_qwen && l->ffn_up_exps->type == l->ffn_gate_exps->type) {
+    static int multi_old = -1;
+    if (multi_old < 0) multi_old = getenv("DS4_QWEN4_MOE_MULTI_OLD") != NULL;
+    if (ok && (T == 1u || (T <= 3u && !multi_old)) && !shared_dense && !q4k_qwen &&
+        l->ffn_up_exps->type == l->ffn_gate_exps->type) {
         const int rc = ds4_gpu_kolibri_moe_q4k_tensor(g->mid, g->mixed, g->selected, m->map, m->size,
                                                       l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                                       l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
