@@ -290,6 +290,19 @@ pass at T = 2-3 (experts at ~60 GB/s, hc up) is the next lever. Prefill:
 halogen is 2.7-4x faster at every length; the tiled expert GEMMs take 8.4
 of the 17.6 s per 8K chunk.
 
+**MTP verify, first pass (2026-10-10, V3):** routed experts and hc up
+weights are now read once per verify instead of once per token
+(`moe_q4k_rows`, `moe_down_mxfp4_multi`, `hc_mix_multi`). MTP 44.4 ->
+49.6 tok/s on code, 34.6 -> 39.0 on the essay, output identical to plain
+decode. The verify pass (~3 rows) takes 53.4 ms against 31.2 ms for one
+token: experts gate/up 11.8 ms (6.0 at T = 1), down 9.8 ms (4.0; the
+multi kernel did not help down), GDN qkv 6.3 ms (4.4), hc up 3.8 ms (2.5).
+
+Measurement note: the first ds4 run after halogen stops is 5-7% slower
+(V3 decode at 8K: 30.2 then 32.2 tok/s with the same binary and file).
+A/B queues need a discarded warm-up run; the V3 numbers above are first
+runs, warm V3 decodes at ~33 / ~32 tok/s at 512 / 8K.
+
 Kernels this needed (each A/B'd; greedy identical where the math is):
 
 - `matvec_q4k_rows`: R = 4 rows per wave, so each x load serves four rows.
