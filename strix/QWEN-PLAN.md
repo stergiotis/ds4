@@ -257,6 +257,39 @@ BF16, GDN Q4_K), after the kernels below:
 | prefill 512 / 8K / 32K | ~320 / 435 / 392 | 323 / 437 / 416 |
 | MTP code / essay (512 tokens) | 34.9 / 27.8 | 38.2 / 31.7, identical to plain |
 
+**V3 file** (`qwen-v3.gguf`, 67.6 GiB): V2 plus attention q/k/v, indexer
+and head at Q4_K, imatrix for every Q4_K tensor, attn_output and the shared
+expert kept at Q8_0. The five MTP-layer attention tensors have no imatrix
+entry (that layer does not run in prefill) and use plain Q4_K.
+
+| | Q8 (df9a5f2) | V2 | V3 | halogen 0.15.3 |
+|---|---:|---:|---:|---:|
+| ppl vs Q4 GGUF / KL | 0 | +1.14% / 0.059 | +1.59% / 0.064 | ? |
+| decode 512 / 8K / 32K | 24.85 / 24.2 / 19.9 | 29.2 / 28.2 / | 31.1 / 30.4 / 30.0 | 35.9 (serial, sweep) |
+| GPU per token at 8K | 43 ms | 35.2 ms | 33.1 ms | ~27.9 ms |
+| DRAM read, decode at 512 | 172.6 GB/s | 151.4 GB/s | 153.6 GB/s | 152.3 GB/s |
+| **bytes per token** | **7.08 GB** | **5.23 GB** | **4.78 GB** | **4.27 GB** |
+| MTP code / essay (512 tokens) | 34.9 / 27.8 | 38.2 / 31.7 | 44.4 / 34.6 | 59.2 / 45.7 (API) |
+| prefill 8K / 32K | 435 / 392 | 437 / 416 | 420-454 / 414 | 1,175-1,844 |
+
+**How much of the gap the bytes explain.** Plain decode at 512 context
+was 41.0 ms per token against halogen's 27.9 (13.1 ms). V3 takes 31.1 ms,
+so the formats closed 9.9 ms (75%). ds4 and halogen now read DRAM at the
+same rate (~153 GB/s); the remaining 3.2 ms is what the extra 0.51 GB per
+token costs at that rate (0.51 / 153 = 3.3 ms). So plain decode is fully
+explained by bytes per token; the candidates for the last 0.5 GB are the
+hc matrices (0.60 GiB at Q8_0), the shared expert (0.24 GiB at Q8_0) and
+the routed experts' format. The effective bandwidth also fell from 173 to
+153 GB/s when the bytes shrank, because ~6.6 ms per token are small
+latency-bound kernels (hc norm 2.0, attention core 1.5, top-k 0.95, GDN
+scan and conv 1.6, reduce 0.56) that do not shrink with bytes.
+
+The bytes do not explain MTP or prefill. MTP: halogen gains 1.65x (code)
+and 1.27x (essay) over its serial decode, ds4 1.40x and 1.11x; the verify
+pass at T = 2-3 (experts at ~60 GB/s, hc up) is the next lever. Prefill:
+halogen is 2.7-4x faster at every length; the tiled expert GEMMs take 8.4
+of the 17.6 s per 8K chunk.
+
 Kernels this needed (each A/B'd; greedy identical where the math is):
 
 - `matvec_q4k_rows`: R = 4 rows per wave, so each x load serves four rows.
