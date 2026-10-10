@@ -2111,6 +2111,25 @@ __global__ void hc_rows(float *dst, const float *up, const float *xn, unsigned E
 
 namespace qwen4_rocm {
 
+/* Single-token alpha and beta projections of a GDN layer (F32, K % 512 ==
+ * 0) in one launch: block r < M is alpha row r, the rest beta rows; 128
+ * threads split K, then a fixed-order block reduction. */
+__global__ __launch_bounds__(128) void gdn_gates_f32(float *ga, float *gb, const float *wa, const float *wb,
+                                                     const float *x, unsigned K, unsigned M) {
+    const unsigned r = blockIdx.x % M, tid = threadIdx.x;
+    const float *w = (blockIdx.x < M ? wa : wb) + (uint64_t)r * K;
+    float acc = 0;
+    for (unsigned i = tid * 4; i < K; i += 512) {
+        const float4 a = *(const float4 *)(w + i), v = *(const float4 *)(x + i);
+        acc += a.x * v.x + a.y * v.y + a.z * v.z + a.w * v.w;
+    }
+    __shared__ float red[4];
+    acc = sum(acc);
+    if (!(tid & 31)) red[tid / 32] = acc;
+    __syncthreads();
+    if (!tid) (blockIdx.x < M ? ga : gb)[r] = red[0] + red[1] + red[2] + red[3];
+}
+
 __global__ void conv(float *x, float *history, const float *w, unsigned T,
                      unsigned C, unsigned K, bool activate,
                      float *snap, unsigned snap_t, float *snap2, unsigned snap2_t) {
@@ -2673,8 +2692,18 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
         !tensor(qkv,(uint64_t)T*C*4) || !tensor(state,hb) ||
         (snap && (st >= T || !tensor(snap,hb))) || (snap2 && (st2 >= T || !tensor(snap2,hb)))) return 0;
     const char *w = weight(map,size,co,C*CK*4);
-    if (!w || !ds4_gpu_qwen4_dense_mm_tensor(ga,mixed,map,size,ao,type,T,K,Hv) ||
-              !ds4_gpu_qwen4_dense_mm_tensor(gb,mixed,map,size,bo,type,T,K,Hv)) return 0;
+    static int gates_old = -1;
+    if (gates_old < 0) gates_old = getenv("DS4_QWEN4_GDN_GATES_OLD") != NULL;
+    if (!w) return 0;
+    const char *wa = T == 1 && type == 0 && !(K % 512) && !gates_old ? weight(map,size,ao,(uint64_t)K*Hv*4) : NULL;
+    const char *wb = wa ? weight(map,size,bo,(uint64_t)K*Hv*4) : NULL;
+    if (wa && wb && !(((uintptr_t)wa | (uintptr_t)wb | (uintptr_t)mixed->ptr) & 15) &&
+        tensor(ga,(uint64_t)Hv*4) && tensor(gb,(uint64_t)Hv*4) && tensor(mixed,(uint64_t)K*4)) {
+        gdn_gates_f32<<<2*Hv,128,0,0>>>((float *)ga->ptr,(float *)gb->ptr,(const float *)wa,(const float *)wb,
+                                        (const float *)mixed->ptr,K,Hv);
+        if (!launched()) return 0;
+    } else if (!ds4_gpu_qwen4_dense_mm_tensor(ga,mixed,map,size,ao,type,T,K,Hv) ||
+               !ds4_gpu_qwen4_dense_mm_tensor(gb,mixed,map,size,bo,type,T,K,Hv)) return 0;
     conv<<<(C+255)/256,256,0,0>>>((float *)qkv->ptr,(float *)state->ptr,(const float *)w,
         T,C,CK,true,snap ? (float *)snap->ptr : NULL,st,snap2 ? (float *)snap2->ptr : NULL,st2);
     return launched() && ds4_gpu_qwen4_gdn_prep_tensor(qkv,ga,gb,map,size,so,dto,T,Hk,Hv,D);
