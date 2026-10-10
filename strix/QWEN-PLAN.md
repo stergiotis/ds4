@@ -101,6 +101,13 @@ at ~20 us per call:
 Small dependent kernels here cost ~20 us mostly in dispatch latency, so
 for them only fusion, meaning fewer launches, pays.
 
+`__restrict__` on the six hot decode kernels (moe_q4k, moe_down_mxfp4,
+matvec_f16_long, gdn_gates_f32, hc_mix, moe_reduce) changed nothing. The
+per-kernel trace times matched to within 1%, and NLL was bit-identical, so
+the generated code was equivalent. Reverted. The host C compiler (gcc,
+clang or icc) does not matter either: decode is GPU-bound, with 3.7 ms of
+host enqueue overlapped with 43 ms of GPU time.
+
 **halogen measured (2026-10-10, 0.15.3, its own `sweep -p 512,8192 -n 128
 -d serial,mtp -r 2`, 10 prompt shapes, end to end over HTTP):**
 
