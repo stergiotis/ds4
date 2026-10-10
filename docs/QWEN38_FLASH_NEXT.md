@@ -26,6 +26,12 @@ The 95.37 GiB n-gram table stays on disk. The runtime reads selected rows
 directly from the GGUF, without mapping or preloading the table. Keep the
 file on a fast local SSD. No sidecar or n-gram option is needed.
 
+A repacked GGUF may leave the table out and read it from another Qwen GGUF
+that carries it: set the string key `qwen4exp.ple.ngram_file` to that file's
+path (relative paths resolve against the model's directory), or set
+`DS4_QWEN_NGRAM_FILE`, which takes precedence and also replaces a table the
+model carries. The `qwen4exp.ple.*` geometry must match in both files.
+
 The Q2 model uses IQ2_XXS gate/up experts and Q2_K down projections padded
 from 640 to 768 columns, calibrated with an imatrix. Q4 uses calibrated
 Q4_K gate/up and MXFP4 down experts. Context and runtime buffers still need

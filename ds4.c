@@ -2488,6 +2488,7 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+    ds4_tensor *ngram_external; /* table read from another GGUF, owned */
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2712,6 +2713,7 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
 static void model_close(ds4_model *m) {
     if (!m) return;
     if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
+    free(m->ngram_external);
     free(m->kv);
     free(m->tensors);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
@@ -2907,9 +2909,90 @@ static DS4_MAYBE_UNUSED bool model_tensor_is_disk_only_engram(
 
 #endif
 
+static void model_open_ex(ds4_model *m, const char *path, bool metal_mapping,
+                          bool prefetch_cpu, bool external_ngrams);
+static void model_close(ds4_model *m);
+
+/* True when key holds the same scalar, or array of scalars, in both models
+ * (or is absent from both). */
+static bool model_kv_equal(const ds4_model *a, const ds4_model *b, const char *key) {
+    const ds4_kv *x = model_find_kv(a, key), *y = model_find_kv(b, key);
+    if (!x || !y) return !x && !y;
+    if (x->type != y->type) return false;
+    uint64_t pa = x->value_pos, pb = y->value_pos, n = scalar_value_size(x->type);
+    if (x->type == GGUF_VALUE_ARRAY) {
+        ds4_array_ref ra, rb;
+        if (!model_get_array(a, key, &ra) || !model_get_array(b, key, &rb) ||
+            ra.type != rb.type || ra.len != rb.len) return false;
+        const uint64_t el = scalar_value_size(ra.type);
+        if (!el || ra.len > UINT64_MAX / el) return false;
+        pa = ra.data_pos; pb = rb.data_pos; n = ra.len * el;
+    }
+    if (!n || pa > a->size || n > a->size - pa || pb > b->size || n > b->size - pb) return false;
+    return memcmp(a->map + pa, b->map + pb, (size_t)n) == 0;
+}
+
+/* Read the n-gram table from another Qwen GGUF that carries it, so repacked
+ * weights need not copy the ~95 GiB table. */
+static void model_attach_external_ngrams(ds4_model *m, const char *src) {
+    ds4_model ext;
+    model_open_ex(&ext, src, false, false, false);
+    ds4_str arch = {0};
+    if (!model_get_string(&ext, "general.architecture", &arch) ||
+        !ds4_streq(arch, "qwen4exp") || !ext.ngram_tensor || ext.ngram_fd < 0) {
+        fprintf(stderr, "ds4: %s: not a Qwen GGUF with BF16 n-grams\n", src);
+        exit(1);
+    }
+    static const char *const keys[] = {
+        "qwen4exp.ple.ngram_size", "qwen4exp.ple.heads_per_ngram", "qwen4exp.ple.layers",
+        "qwen4exp.ple.layer_multipliers", "qwen4exp.ple.head_offsets",
+        "qwen4exp.ple.head_vocab_sizes", "qwen4exp.ple.row_dimension", "qwen4exp.ple.row_count",
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (!model_kv_equal(m, &ext, keys[i])) {
+            fprintf(stderr, "ds4: %s: %s differs from the model's\n", src, keys[i]);
+            exit(1);
+        }
+    }
+    ds4_tensor *t = malloc(sizeof(*t));
+    if (!t) ds4_die("out of memory");
+    *t = *ext.ngram_tensor;
+    static const char name[] = "per_layer_token_embd.weight";
+    t->name = (ds4_str){name, sizeof(name) - 1u};
+    m->ngram_fd = ext.ngram_fd;
+    m->ngram_tensor = t;
+    m->ngram_external = t;
+    ext.ngram_fd = -1;
+    ext.ngram_tensor = NULL;
+    model_close(&ext);
+    fprintf(stderr, "ds4: Qwen n-grams from %s\n", src);
+}
+
+/* The n-gram source: DS4_QWEN_NGRAM_FILE, else the model's
+ * qwen4exp.ple.ngram_file, relative to the model's directory. */
+static bool model_qwen_ngram_source(const ds4_model *m, const char *path, bool has_table,
+                                    char *out, size_t cap) {
+    const char *env = getenv("DS4_QWEN_NGRAM_FILE");
+    if (env && env[0]) {
+        if (strlen(env) >= cap) ds4_die("DS4_QWEN_NGRAM_FILE is too long");
+        strcpy(out, env);
+        return true;
+    }
+    ds4_str ref = {0};
+    if (has_table || !model_get_string(m, "qwen4exp.ple.ngram_file", &ref) || !ref.len) return false;
+    if (memchr(ref.ptr, 0, ref.len)) ds4_die("invalid qwen4exp.ple.ngram_file");
+    const char *slash = ref.ptr[0] == '/' ? NULL : strrchr(path, '/');
+    const size_t dir = slash ? (size_t)(slash - path) + 1u : 0u;
+    if (dir + ref.len >= cap) ds4_die("qwen4exp.ple.ngram_file path is too long");
+    memcpy(out, path, dir);
+    memcpy(out + dir, ref.ptr, ref.len);
+    out[dir + ref.len] = 0;
+    return true;
+}
+
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
  * prevents warming or a future whole-model GPU view from faulting it in. */
-static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
+static void model_unmap_qwen_ngrams(ds4_model *m, const char *path, bool external_ngrams) {
     ds4_str arch = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "qwen4exp")) return;
@@ -2928,6 +3011,23 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
             if (t->abs_offset + t->bytes > resident_end) resident_end = t->abs_offset + t->bytes;
             if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
         }
+    }
+    char src[PATH_MAX];
+    if (external_ngrams && model_qwen_ngram_source(m, path, table != NULL, src, sizeof(src))) {
+        if (table) {
+            /* drop the local table so the external one is the only n-gram tensor */
+            const long page = sysconf(_SC_PAGESIZE);
+            if (page <= 0 || table->abs_offset % (uint64_t)page || resident_end > table->abs_offset)
+                ds4_die("Qwen n-grams must follow page-aligned weights; repack with gguf-tools/qwen4_native_ngrams.py");
+            if (munmap((void *)(m->map + table->abs_offset), (size_t)(m->size - table->abs_offset)))
+                ds4_die_errno("cannot unmap disk-only n-grams", path);
+            m->size = table->abs_offset;
+            const uint64_t i = (uint64_t)(table - m->tensors);
+            memmove(&m->tensors[i], &m->tensors[i + 1], (m->n_tensors - i - 1u) * sizeof(m->tensors[0]));
+            m->n_tensors--;
+        }
+        model_attach_external_ngrams(m, src);
+        return;
     }
     /* Tokenizer inspection can still open old main-only files. Inference
      * rejects them when binding its required n-gram tensor. */
@@ -2964,8 +3064,8 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
-static void model_open(ds4_model *m, const char *path, bool metal_mapping,
-                       bool prefetch_cpu) {
+static void model_open_ex(ds4_model *m, const char *path, bool metal_mapping,
+                          bool prefetch_cpu, bool external_ngrams) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
     m->ngram_fd = -1;
@@ -3011,9 +3111,14 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
     model_unmap_engram(m);
-    model_unmap_qwen_ngrams(m, path);
+    model_unmap_qwen_ngrams(m, path, external_ngrams);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+}
+
+static void model_open(ds4_model *m, const char *path, bool metal_mapping,
+                       bool prefetch_cpu) {
+    model_open_ex(m, path, metal_mapping, prefetch_cpu, true);
 }
 
 static void print_size(uint64_t bytes) {
@@ -8280,7 +8385,8 @@ static void weights_bind(
         w->token_embd = model_find_tensor(m, "token_embd.weight");
     }
     if (ds4_model_is_qwen4()) {
-        w->ple_embd = model_find_tensor(m, "per_layer_token_embd.weight");
+        w->ple_embd = m->ngram_external ? m->ngram_external
+                                        : model_find_tensor(m, "per_layer_token_embd.weight");
     }
     weights_bind_output(w, m, require_output, optional_output);
 
