@@ -1165,6 +1165,35 @@ __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n
     return sum(acc);
 }
 
+/* Byte k of the 12 scale bytes, held in three words (no indexed memory). */
+__device__ __forceinline__ unsigned q4k_byte(uint4 h, unsigned k) {
+    const unsigned w = k < 4 ? h.y : k < 8 ? h.z : h.w;
+    return (w >> (8 * (k & 3))) & 255;
+}
+
+__device__ __forceinline__ void q4k_scale_min(uint4 h, unsigned g, float &s, float &m) {
+    if (g < 4) { s = (float)(q4k_byte(h, g) & 63); m = (float)(q4k_byte(h, g + 4) & 63); }
+    else {
+        const unsigned hi = q4k_byte(h, g + 4);
+        s = (float)((hi & 15) | ((q4k_byte(h, g - 4) >> 6) << 4));
+        m = (float)((hi >> 4) | ((q4k_byte(h, g) >> 6) << 4));
+    }
+}
+
+/* One block's contribution for this lane: nibble word q, header h. */
+__device__ __forceinline__ float q4k_block(uint4 h, unsigned q, float4 xa, float4 xb, unsigned c) {
+    const float d = __half2float(__ushort_as_half((unsigned short)(h.x & 0xffff)));
+    const float dm = __half2float(__ushort_as_half((unsigned short)(h.x >> 16)));
+    float s0, m0, s1, m1;
+    q4k_scale_min(h, 2 * c, s0, m0);
+    q4k_scale_min(h, 2 * c + 1, s1, m1);
+    const float lo = (float)(q & 15) * xa.x + (float)((q >> 8) & 15) * xa.y +
+                     (float)((q >> 16) & 15) * xa.z + (float)((q >> 24) & 15) * xa.w;
+    const float hi = (float)((q >> 4) & 15) * xb.x + (float)((q >> 12) & 15) * xb.y +
+                     (float)((q >> 20) & 15) * xb.z + (float)(q >> 28) * xb.w;
+    return d * (s0 * lo + s1 * hi) - dm * (m0 * (xa.x + xa.y + xa.z + xa.w) + m1 * (xb.x + xb.y + xb.z + xb.w));
+}
+
 /* Q8_0 row dot, four values per lane per step (n % 128 == 0, x 16-byte
  * aligned; Q8_0 rows need only 2-byte alignment, which value4 respects). */
 __device__ __forceinline__ float dot_q8_vec(const char *row, const float *x, unsigned n) {
@@ -1174,6 +1203,90 @@ __device__ __forceinline__ float dot_q8_vec(const char *row, const float *x, uns
         acc += w.x * v.x; acc += w.y * v.y; acc += w.z * v.z; acc += w.w * v.w;
     }
     return sum(acc);
+}
+
+/* Dense Q4_K rows for 1-3 tokens: one row per wave, the KB blocks of a row
+ * in chunks of CH whose loads go out together, and each weight word dotted
+ * with all T token rows, so the weights are read once. */
+template<unsigned KB, unsigned CH, unsigned T>
+__global__ __launch_bounds__(128) void matvec_q4k(float *out, const char *w, const float *x,
+        unsigned M, uint64_t stride) {
+    static_assert(KB % CH == 0, "chunked blocks");
+    constexpr unsigned K = KB * 256;
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const char *r = w + (uint64_t)row * stride;
+    const unsigned c = lane / 8, o = (lane % 8) * 4;
+    float acc[T];
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) acc[t] = 0;
+    #pragma unroll
+    for (unsigned b0 = 0; b0 < KB; b0 += CH) {
+        uint4 h[CH];
+        unsigned q[CH];
+        #pragma unroll
+        for (unsigned k = 0; k < CH; k++) {
+            h[k] = *(const uint4 *)(r + (b0 + k) * 144);
+            q[k] = *(const unsigned *)(r + (b0 + k) * 144 + 16 + c * 32 + o);
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < CH; k++) {
+            #pragma unroll
+            for (unsigned t = 0; t < T; t++) {
+                const float *xt = x + t * K + (b0 + k) * 256 + c * 64 + o;
+                acc[t] += q4k_block(h[k], q[k], *(const float4 *)xt, *(const float4 *)(xt + 32), c);
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) {
+        const float v = sum(acc[t]);
+        if (!lane) out[(uint64_t)t * M + row] = v;
+    }
+}
+
+/* matvec_q4k with R rows per wave: each x load serves all R rows, so x
+ * traffic drops R-fold.  Every row sums its blocks in the same order as
+ * matvec_q4k, and each token row independently, so results match it and do
+ * not depend on T.  M % (4 * R) == 0. */
+template<unsigned KB, unsigned R, unsigned T>
+__global__ __launch_bounds__(128) void matvec_q4k_rows(float *out, const char *w, const float *x,
+        unsigned M, uint64_t stride) {
+    constexpr unsigned K = KB * 256;
+    const unsigned row0 = (blockIdx.x * 4 + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
+    const unsigned c = lane / 8, o = (lane % 8) * 4;
+    float acc[T][R];
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) {
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) acc[t][r] = 0;
+    }
+    #pragma unroll 2
+    for (unsigned b = 0; b < KB; b++) {
+        uint4 h[R];
+        unsigned q[R];
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const char *blk = w + (uint64_t)(row0 + r) * stride + b * 144;
+            h[r] = *(const uint4 *)blk;
+            q[r] = *(const unsigned *)(blk + 16 + c * 32 + o);
+        }
+        #pragma unroll
+        for (unsigned t = 0; t < T; t++) {
+            const float *xt = x + t * K + b * 256 + c * 64 + o;
+            const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
+            #pragma unroll
+            for (unsigned r = 0; r < R; r++) acc[t][r] += q4k_block(h[r], q[r], xa, xb, c);
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) {
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const float v = sum(acc[t][r]);
+            if (!lane) out[(uint64_t)t * M + row0 + r] = v;
+        }
+    }
 }
 
 template<unsigned TYPE>
@@ -1394,11 +1507,143 @@ __global__ __launch_bounds__(256) void matvec_f16_long(float *out, const char *w
     }
 }
 
+/* Single-token Q8_0 matvec for long rows (K % 1024 == 0), laid out like
+ * matvec_f16_long: one 256-thread block per ROWS rows, four values per
+ * thread per step, the x chunk read once for all ROWS rows. */
+template<unsigned ROWS, unsigned T>
+__global__ __launch_bounds__(256) void matvec_q8_long(float *out, const char *w, const float *x,
+        unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row0 = blockIdx.x * ROWS, tid = threadIdx.x;
+    float acc[T][ROWS];
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) {
+        #pragma unroll
+        for (unsigned r = 0; r < ROWS; r++) acc[t][r] = 0;
+    }
+    for (unsigned i = tid * 4; i < K; i += 1024) {
+        float wq[ROWS][4], scale[ROWS];
+        #pragma unroll
+        for (unsigned r = 0; r < ROWS; r++) {
+            const char *b = w + (uint64_t)(row0 + r) * stride + (i / 32) * 34;
+            scale[r] = __half2float(*(const __half *)b);
+            const uint16_t *q = (const uint16_t *)(b + 2 + i % 32);
+            const unsigned q01 = q[0], q23 = q[1];
+            wq[r][0] = (float)(int8_t)q01; wq[r][1] = (float)(int8_t)(q01 >> 8);
+            wq[r][2] = (float)(int8_t)q23; wq[r][3] = (float)(int8_t)(q23 >> 8);
+        }
+        #pragma unroll
+        for (unsigned t = 0; t < T; t++) {
+            const float4 v = *(const float4 *)(x + (uint64_t)t * K + i);
+            #pragma unroll
+            for (unsigned r = 0; r < ROWS; r++)
+                acc[t][r] += scale[r] * (wq[r][0] * v.x + wq[r][1] * v.y + wq[r][2] * v.z + wq[r][3] * v.w);
+        }
+    }
+    __shared__ float part[T][8][ROWS];
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) {
+        #pragma unroll
+        for (unsigned r = 0; r < ROWS; r++) {
+            const float v = sum(acc[t][r]);
+            if (!(tid & 31)) part[t][tid / 32][r] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < ROWS * T) {
+        const unsigned t = tid / ROWS, r = tid % ROWS;
+        if (row0 + r < M) {
+            float v = 0;
+            #pragma unroll
+            for (unsigned k = 0; k < 8; k++) v += part[t][k][r];
+            out[(uint64_t)t * M + row0 + r] = v;
+        }
+    }
+}
+
+/* BF16 rows for 1-3 tokens (K % 256 == 0): one row per wave, eight weights
+ * (one 16-byte load) per lane per step, each dotted with all T rows. */
+template<unsigned T>
+__global__ __launch_bounds__(128) void matvec_bf16(float *out, const char *w, const float *x,
+        unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const char *r = w + (uint64_t)row * stride;
+    float acc[T];
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) acc[t] = 0;
+    for (unsigned i = lane * 8; i < K; i += 256) {
+        const uint4 q = *(const uint4 *)(r + (uint64_t)i * 2);
+        const float w0 = __uint_as_float(q.x << 16), w1 = __uint_as_float(q.x & 0xffff0000u);
+        const float w2 = __uint_as_float(q.y << 16), w3 = __uint_as_float(q.y & 0xffff0000u);
+        const float w4 = __uint_as_float(q.z << 16), w5 = __uint_as_float(q.z & 0xffff0000u);
+        const float w6 = __uint_as_float(q.w << 16), w7 = __uint_as_float(q.w & 0xffff0000u);
+        #pragma unroll
+        for (unsigned t = 0; t < T; t++) {
+            const float4 a = *(const float4 *)(x + (uint64_t)t * K + i), b = *(const float4 *)(x + (uint64_t)t * K + i + 4);
+            acc[t] += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < T; t++) {
+        const float v = sum(acc[t]);
+        if (!lane) out[(uint64_t)t * M + row] = v;
+    }
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
+    static int q4k_dense_old = -1;
+    if (q4k_dense_old < 0) q4k_dense_old = getenv("DS4_QWEN4_Q4K_DENSE_OLD") != NULL;
+    if (type == 12 && T <= 3 && (K == 2560 || K == 6144 || K == 10240) && !q4k_dense_old &&
+        !((uintptr_t)x&15) && !((uintptr_t)w&15)) {
+        static int ch = -1, rows = -1;
+        if (ch < 0) { const char *e = getenv("DS4_QWEN4_Q4K_CH"); ch = e ? atoi(e) : 0; }
+        if (rows < 0) { const char *e = getenv("DS4_QWEN4_Q4K_ROWS"); rows = e ? atoi(e) : 4; }
+        if ((rows == 2 || rows == 4) && !(M % (4u * rows))) {
+#define QWEN_Q4KR(KB, R) \
+            if (T == 1) matvec_q4k_rows<KB,R,1><<<M/(4*R),128,0,0>>>(out,w,x,M,stride); \
+            else if (T == 2) matvec_q4k_rows<KB,R,2><<<M/(4*R),128,0,0>>>(out,w,x,M,stride); \
+            else matvec_q4k_rows<KB,R,3><<<M/(4*R),128,0,0>>>(out,w,x,M,stride)
+#define QWEN_Q4KK(KB) if (rows == 2) { QWEN_Q4KR(KB,2); } else { QWEN_Q4KR(KB,4); }
+            if (K == 2560) { QWEN_Q4KK(10); }
+            else if (K == 6144) { QWEN_Q4KK(24); }
+            else { QWEN_Q4KK(40); }
+#undef QWEN_Q4KK
+#undef QWEN_Q4KR
+            return launched();
+        }
+#define QWEN_Q4K(KB, CH) \
+        if (T == 1) matvec_q4k<KB,CH,1><<<(M+3)/4,128,0,0>>>(out,w,x,M,stride); \
+        else if (T == 2) matvec_q4k<KB,CH,2><<<(M+3)/4,128,0,0>>>(out,w,x,M,stride); \
+        else matvec_q4k<KB,CH,3><<<(M+3)/4,128,0,0>>>(out,w,x,M,stride)
+        if (K == 2560) { QWEN_Q4K(10,5); }
+        else if (K == 6144) {
+            if (ch == 4) { QWEN_Q4K(24,4); } else if (ch == 6) { QWEN_Q4K(24,6); }
+            else if (ch == 12) { QWEN_Q4K(24,12); } else { QWEN_Q4K(24,8); }
+        } else {
+            if (ch == 4) { QWEN_Q4K(40,4); } else if (ch == 10) { QWEN_Q4K(40,10); } else { QWEN_Q4K(40,8); }
+        }
+#undef QWEN_Q4K
+        return launched();
+    }
+    static int q8_long_old = -1, bf16_old = -1;
+    if (q8_long_old < 0) q8_long_old = getenv("DS4_QWEN4_Q8_LONG_OLD") != NULL;
+    if (bf16_old < 0) bf16_old = getenv("DS4_QWEN4_BF16_MV_OLD") != NULL;
+    if (type == 8 && T <= 3 && K == 10240 && !(M % 2) && !q8_long_old && !((uintptr_t)x&15)) {
+        if (T == 1) matvec_q8_long<2,1><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
+        else if (T == 2) matvec_q8_long<2,2><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
+        else matvec_q8_long<2,3><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
+        return launched();
+    }
+    if (type == 30 && T <= 3 && !(K % 256) && !bf16_old && !((uintptr_t)x&15) && !((uintptr_t)w&15)) {
+        if (T == 1) matvec_bf16<1><<<(M+3)/4,128,0,0>>>(out,w,x,K,M,stride);
+        else if (T == 2) matvec_bf16<2><<<(M+3)/4,128,0,0>>>(out,w,x,K,M,stride);
+        else matvec_bf16<3><<<(M+3)/4,128,0,0>>>(out,w,x,K,M,stride);
+        return launched();
+    }
     // Preserve the FP32 accumulation tree while overlapping four scalar loads.
     if (ds4_rocm_is_gfx1151() && type == 0 && T >= 1 && T <= 3 && K == 2560 && (M == 48 || M == 512) && !((uintptr_t)x&15) && !((uintptr_t)w&3)) {
 #define QWEN_F32_PREFETCH(ROWS) \
@@ -1499,6 +1744,56 @@ __global__ void pack_half_rows(float *scales, __half *hi,
         const float v = value<TYPE>(x+(uint64_t)row*rb,k)*inv;
         const __half h = __float2half_rn(v);
         hi[(uint64_t)row*K+k] = h;
+    }
+}
+
+/* Eight values of one 32-value group of a Q4_K row, the group's scale and
+ * min decoded once; same arithmetic as value<12>. */
+__device__ __forceinline__ void q4k_values8(const char *row, unsigned i, float *v) {
+    const char *blk = row + (i / 256) * 144;
+    const unsigned j = i % 256, g = j / 32;
+    const uint4 h = *(const uint4 *)blk;
+    const float d = __half2float(__ushort_as_half((unsigned short)(h.x & 0xffff)));
+    const float dm = __half2float(__ushort_as_half((unsigned short)(h.x >> 16)));
+    float s, m;
+    q4k_scale_min(h, g, s, m);
+    const uint2 q = *(const uint2 *)(blk + 16 + (g / 2) * 32 + j % 32);
+    const unsigned shift = 4 * (g & 1);
+    #pragma unroll
+    for (unsigned k = 0; k < 8; k++) {
+        const unsigned byte = (k < 4 ? q.x >> (8 * k) : q.y >> (8 * (k - 4))) & 255;
+        v[k] = d * s * (float)((byte >> shift) & 15) - dm * m;
+    }
+}
+
+/* pack_half_rows<12> eight values at a time (K % 2048 == 0). */
+__global__ void pack_half_rows_q4k(float *scales, __half *hi, const char *x, unsigned K, uint64_t rb) {
+    const unsigned row = blockIdx.x, tid = threadIdx.x;
+    const char *r = x + (uint64_t)row * rb;
+    __shared__ float maxima[256], inv;
+    float mx = 0;
+    for (unsigned i = tid * 8; i < K; i += 2048) {
+        float v[8];
+        q4k_values8(r, i, v);
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) mx = fmaxf(mx, fabsf(v[k]));
+    }
+    maxima[tid] = mx;
+    __syncthreads();
+    for (unsigned d = 128; d; d /= 2) {
+        if (tid < d) maxima[tid] = fmaxf(maxima[tid], maxima[tid + d]);
+        __syncthreads();
+    }
+    if (!tid) {
+        const int e = maxima[0] > 0 ? max(-120,min(120,(int)((__float_as_uint(maxima[0])>>23)&255)-127)) : 0;
+        inv = ldexpf(1,-e); scales[row] = ldexpf(1,e);
+    }
+    __syncthreads();
+    for (unsigned i = tid * 8; i < K; i += 2048) {
+        float v[8];
+        q4k_values8(r, i, v);
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) hi[(uint64_t)row * K + i + k] = __float2half_rn(v[k] * inv);
     }
 }
 
@@ -1609,8 +1904,8 @@ __global__ void qwen_q8_direct(float *out,
     const unsigned tid=threadIdx.x, wave=tid>>5, lane=tid&31, lane16=lane&15;
     const unsigned row0=block_m+wave*16, my_row=row0+lane16;
     const unsigned safe_row=my_row<M ? my_row : M-1;
-    /* WT 8: Q8_0 blocks of 32; WT 200: F8_B128 blocks of 512 */
-    const uint64_t rb=WT==200 ? (uint64_t)(K/512)*528 : (uint64_t)(K/32)*34;
+    /* WT 8: Q8_0 blocks of 32; WT 12: Q4_K blocks of 256; WT 200: F8_B128 blocks of 512 */
+    const uint64_t rb=WT==200 ? (uint64_t)(K/512)*528 : WT==12 ? (uint64_t)(K/256)*144 : (uint64_t)(K/32)*34;
     const unsigned char *wr=w+(uint64_t)safe_row*rb;
     const float winv=1.0f/ws[safe_row];
     __shared__ _Float16 sx[NT][KT+PAD];
@@ -1638,6 +1933,21 @@ __global__ void qwen_q8_direct(float *out,
                 for (unsigned i=0;i<16;i++) {
                     a0[i]=(_Float16)(sc*f8_e4m3_x256(q[i]));
                     a1[i]=(_Float16)(sc*f8_e4m3_x256(q[16+i]));
+                }
+            } else if (WT==12) {
+                /* one 32-value group: the same arithmetic as value<12>, then the row scale */
+                const unsigned kk=begin+k0+kb*32, g=kk%256/32;
+                const unsigned char *bp=wr+(uint64_t)(kk/256)*144;
+                uint4 h; __builtin_memcpy(&h,bp,16);
+                const float d=qwen_f16_to_f32((uint16_t)(h.x&0xffff)), dm=qwen_f16_to_f32((uint16_t)(h.x>>16));
+                float s,m;
+                q4k_scale_min(h,g,s,m);
+                const uint8_t *q=bp+16+(g/2)*32;
+                const unsigned shift=4*(g&1);
+                #pragma unroll
+                for (unsigned i=0;i<16;i++) {
+                    a0[i]=(_Float16)((d*s*(float)((q[i]>>shift)&15)-dm*m)*winv);
+                    a1[i]=(_Float16)((d*s*(float)((q[16+i]>>shift)&15)-dm*m)*winv);
                 }
             } else {
                 const unsigned char *bp=wr+(uint64_t)((begin+k0)/32+kb)*34;
@@ -1756,6 +2066,26 @@ static int dense_f8_direct(float *out, const float *x, const char *w,
     return 1;
 }
 
+/* Q4_K projections on gfx1151: the Q8 direct WMMA kernel with the Q4_K
+ * group decode (weights read once, no packed copy).  K % 256 == 0. */
+static int dense_q4k_direct(float *out, const float *x, const char *w,
+        unsigned T, unsigned K, unsigned M) {
+    const uint64_t xn=(uint64_t)T*K;
+    const uint64_t xbytes=(xn*sizeof(__half)+15)&~UINT64_C(15);
+    __half *xh=(__half *)cuda_tmp_alloc(xbytes+((uint64_t)T+M)*sizeof(float), "Qwen Q4_K projection scratch");
+    if (!xh) return 0;
+    float *xs=(float *)((char *)xh+xbytes), *ws=xs+T;
+    pack_half_rows<0><<<T,256,0,0>>>(xs,xh,(const char *)x,K,(uint64_t)K*4);
+    qwen_dense_row_scales<12><<<M,256,0,0>>>(ws,w,K,row_bytes(12,K));
+    if (!launched()) return 0;
+    const unsigned segment=K>4096 ? 1024 : K;
+    for (unsigned begin=0;begin<K;begin+=segment) {
+        const unsigned length=std::min(segment,K-begin);
+        if (!launch_qwen_q8_direct<12>(out,(const unsigned char *)w,xh,xs,ws,T,K,M,begin,length)) return 0;
+    }
+    return 1;
+}
+
 static int dense_q8_blas(float *out, const float *x, const char *w,
         unsigned T, unsigned K, unsigned M) {
     if (T>=32 && !(K%128) && ds4_rocm_is_gfx1151()) {
@@ -1800,7 +2130,10 @@ static int dense_half_tiles(float *out, const float *x, const char *w,
     const uint64_t rb = row_bytes(TYPE,K);
     for (unsigned r = 0; r < M; r += tile) {
         const unsigned n = std::min(tile,M-r);
-        pack_half_rows<TYPE><<<n,256,0,0>>>(ws,wh,w+(uint64_t)r*rb,K,rb);
+        if (TYPE == 12 && !(K % 2048) && !getenv("DS4_QWEN4_Q4K_PACK_OLD"))
+            pack_half_rows_q4k<<<n,256,0,0>>>(ws,wh,w+(uint64_t)r*rb,K,rb);
+        else
+            pack_half_rows<TYPE><<<n,256,0,0>>>(ws,wh,w+(uint64_t)r*rb,K,rb);
         if (!launched()) return 0;
         // Round both scaled Q8 weights and activations to F16.
         if (!dense_half_product(out+r,wh,xh,n,T,K,M,one,zero,"Qwen Q8 projection")) return 0;
@@ -2523,6 +2856,25 @@ extern "C" uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t T, uint32_t H, uint3
     return (uint64_t)T * H * 64 * (D + 2);
 }
 
+/* grid (ceil(K / 256), ceil(T / 64)): each thread sums 64 rows of a column */
+__global__ void sumsq_cols(float *acc, const float *x, unsigned T, unsigned K) {
+    const unsigned k = blockIdx.x * 256 + threadIdx.x, t0 = blockIdx.y * 64;
+    if (k >= K) return;
+    float s = 0;
+    for (unsigned t = t0; t < T && t < t0 + 64; t++) {
+        const float v = x[(uint64_t)t * K + k];
+        s += v * v;
+    }
+    atomicAdd(acc + k, s);
+}
+
+extern "C" int ds4_gpu_qwen4_sumsq_tensor(ds4_gpu_tensor *acc, const ds4_gpu_tensor *x, uint32_t T, uint32_t K) {
+    using namespace qwen4_rocm;
+    if (!T || !K || !tensor(acc, (uint64_t)K * 4) || !tensor(x, (uint64_t)T * K * 4)) return 0;
+    sumsq_cols<<<dim3((K + 255) / 256, (T + 63) / 64), 256, 0, 0>>>((float *)acc->ptr, (const float *)x->ptr, T, K);
+    return launched();
+}
+
 extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
     using namespace qwen4_rocm;
@@ -2538,6 +2890,12 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (type == 8 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode)
         return dense_q8_blas((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
+    if (type == 12 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
+        g_cublas_ready && !g_quality_mode) {
+        if (ds4_rocm_is_gfx1151() && !(K%256) && !getenv("DS4_QWEN4_Q4K_DIRECT_OLD"))
+            return dense_q4k_direct((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
+        return dense_half_tiles<12>((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
+    }
     if (type == 200 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode) {
         if (ds4_rocm_is_gfx1151() && !(K%512))

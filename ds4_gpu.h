@@ -3638,6 +3638,8 @@ int ds4_gpu_kolibri_moe_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 int ds4_gpu_kolibri_trace_mark(const char *label, uint64_t bytes);
 int ds4_gpu_kolibri_trace_end(uint32_t T);
 
+/* acc[k] += sum over the T rows of x[t][k]^2 (imatrix collection). */
+int ds4_gpu_qwen4_sumsq_tensor(ds4_gpu_tensor *acc, const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim);
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,

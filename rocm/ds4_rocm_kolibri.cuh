@@ -476,34 +476,8 @@ __global__ __launch_bounds__(128) void head_bf16(float *out, const uint16_t *w, 
  * Lane l reads the 4 bytes at c * 32 + (l % 8) * 4 with c = l / 8, i.e.
  * eight values of two groups, plus the header as a broadcast; all KB
  * blocks of a row are unrolled so the loads go out together. */
-/* Byte k of the 12 scale bytes, held in three words (no indexed memory). */
-__device__ __forceinline__ unsigned q4k_byte(uint4 h, unsigned k) {
-    const unsigned w = k < 4 ? h.y : k < 8 ? h.z : h.w;
-    return (w >> (8 * (k & 3))) & 255;
-}
-
-__device__ __forceinline__ void q4k_scale_min(uint4 h, unsigned g, float &s, float &m) {
-    if (g < 4) { s = (float)(q4k_byte(h, g) & 63); m = (float)(q4k_byte(h, g + 4) & 63); }
-    else {
-        const unsigned hi = q4k_byte(h, g + 4);
-        s = (float)((hi & 15) | ((q4k_byte(h, g - 4) >> 6) << 4));
-        m = (float)((hi >> 4) | ((q4k_byte(h, g) >> 6) << 4));
-    }
-}
-
-/* One block's contribution for this lane: nibble word q, header h. */
-__device__ __forceinline__ float q4k_block(uint4 h, unsigned q, float4 xa, float4 xb, unsigned c) {
-    const float d = __half2float(__ushort_as_half((unsigned short)(h.x & 0xffff)));
-    const float dm = __half2float(__ushort_as_half((unsigned short)(h.x >> 16)));
-    float s0, m0, s1, m1;
-    q4k_scale_min(h, 2 * c, s0, m0);
-    q4k_scale_min(h, 2 * c + 1, s1, m1);
-    const float lo = (float)(q & 15) * xa.x + (float)((q >> 8) & 15) * xa.y +
-                     (float)((q >> 16) & 15) * xa.z + (float)((q >> 24) & 15) * xa.w;
-    const float hi = (float)((q >> 4) & 15) * xb.x + (float)((q >> 12) & 15) * xb.y +
-                     (float)((q >> 20) & 15) * xb.z + (float)(q >> 28) * xb.w;
-    return d * (s0 * lo + s1 * hi) - dm * (m0 * (xa.x + xa.y + xa.z + xa.w) + m1 * (xb.x + xb.y + xb.z + xb.w));
-}
+using qwen4_rocm::q4k_block;
+using qwen4_rocm::q4k_scale_min;
 
 /* Row dots for one row (r1 == NULL) or two rows sharing x, KB blocks in
  * chunks of CH whose loads all go out before the chunk is used. */

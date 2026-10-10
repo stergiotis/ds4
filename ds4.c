@@ -5762,14 +5762,14 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
 /* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q4_K;
 }
 
 static void tensor_expect_qwen4_dense_layout(
         const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_qwen4_dense(t->type)) {
-        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_0, F16, BF16 or F32\n",
+        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_K, Q4_0, F16, BF16 or F32\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
     }
@@ -5887,7 +5887,8 @@ static void weights_validate_qwen4_layout(
             tensor_expect_layout(l->ple_conv, l->ple_conv->type == DS4_TENSOR_F16 ? DS4_TENSOR_F16 : DS4_TENSOR_F32,
                                  2, DS4_N_PLE_CONV, hc_dim, 0);
         }
-        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_gate_inp, l->ffn_gate_inp->type == DS4_TENSOR_BF16 ? DS4_TENSOR_BF16 : DS4_TENSOR_F32,
+                             2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
@@ -60100,7 +60101,7 @@ typedef struct ds4_qwen4_gpu_graph {
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K);
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -60570,6 +60571,75 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap_after_second = false;
 }
 
+#ifdef DS4_ROCM_BUILD
+/* DS4_QWEN4_DENSE_IMATRIX=FILE collects the mean squared input column of
+ * every dense projection that runs through qwen4_gemv_rows, accumulated on
+ * the GPU, and writes it in llama.cpp's legacy imatrix format when the
+ * session ends. */
+typedef struct {
+    const ds4_tensor *w;
+    ds4_gpu_tensor *acc;
+    uint64_t tokens;
+} qwen4_imatrix_entry;
+
+static qwen4_imatrix_entry *g_qwen4_imatrix;
+static uint32_t g_qwen4_imatrix_len, g_qwen4_imatrix_cap;
+
+static const char *qwen4_imatrix_path(void) {
+    const char *p = getenv("DS4_QWEN4_DENSE_IMATRIX");
+    return p && p[0] ? p : NULL;
+}
+
+static bool qwen4_imatrix_observe(const ds4_tensor *w, const ds4_gpu_tensor *x, uint32_t n_tok) {
+    const uint64_t K = w->dim[0];
+    if (w->ndim < 2 || K > UINT32_MAX) return true;
+    qwen4_imatrix_entry *e = NULL;
+    for (uint32_t i = 0; i < g_qwen4_imatrix_len; i++)
+        if (g_qwen4_imatrix[i].w == w) { e = &g_qwen4_imatrix[i]; break; }
+    if (!e) {
+        if (g_qwen4_imatrix_len == g_qwen4_imatrix_cap) {
+            g_qwen4_imatrix_cap = g_qwen4_imatrix_cap ? 2u * g_qwen4_imatrix_cap : 256u;
+            g_qwen4_imatrix = realloc(g_qwen4_imatrix, g_qwen4_imatrix_cap * sizeof(*g_qwen4_imatrix));
+            if (!g_qwen4_imatrix) ds4_die("out of memory");
+        }
+        float *zero = calloc(K, sizeof(float));
+        ds4_gpu_tensor *acc = zero ? ds4_gpu_tensor_alloc(K * sizeof(float)) : NULL;
+        const bool ok = acc && ds4_gpu_tensor_write(acc, 0, zero, K * sizeof(float));
+        free(zero);
+        if (!ok) { ds4_gpu_tensor_free(acc); return false; }
+        e = &g_qwen4_imatrix[g_qwen4_imatrix_len++];
+        *e = (qwen4_imatrix_entry){w, acc, 0};
+    }
+    e->tokens += n_tok;
+    return ds4_gpu_qwen4_sumsq_tensor(e->acc, x, n_tok, (uint32_t)K) != 0;
+}
+
+static void qwen4_imatrix_save(void) {
+    const char *path = qwen4_imatrix_path();
+    if (!path || !g_qwen4_imatrix_len) return;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { fprintf(stderr, "ds4: cannot write imatrix %s: %s\n", path, strerror(errno)); return; }
+    imatrix_write_i32(fp, (int32_t)g_qwen4_imatrix_len);
+    for (uint32_t i = 0; i < g_qwen4_imatrix_len; i++) {
+        const qwen4_imatrix_entry *e = &g_qwen4_imatrix[i];
+        const uint32_t K = (uint32_t)e->w->dim[0];
+        float *sum2 = xmalloc((size_t)K * sizeof(float));
+        if (!ds4_gpu_tensor_read(e->acc, 0, sum2, (uint64_t)K * sizeof(float))) ds4_die("imatrix readback failed");
+        char name[256];
+        snprintf(name, sizeof(name), "%.*s", (int)e->w->name.len, e->w->name.ptr);
+        const uint32_t count = e->tokens > UINT32_MAX ? UINT32_MAX : (uint32_t)e->tokens;
+        imatrix_write_entry(fp, name, sum2, &count, 1, K);
+        free(sum2);
+        ds4_gpu_tensor_free(e->acc);
+    }
+    fclose(fp);
+    fprintf(stderr, "ds4: Qwen dense imatrix: %u tensors written to %s\n", g_qwen4_imatrix_len, path);
+    free(g_qwen4_imatrix);
+    g_qwen4_imatrix = NULL;
+    g_qwen4_imatrix_len = g_qwen4_imatrix_cap = 0;
+}
+#endif
+
 /* rows > 0 limits the product to a contiguous leading prefix of w. */
 static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                             const ds4_gpu_tensor *x, uint32_t n_tok, uint64_t rows) {
@@ -60579,6 +60649,9 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
 #if !defined(__APPLE__)
     /* Qwen's recurrent graph uses FP32 activation buffers. Keep its projection
      * dispatch separate so each backend can select bulk and decode kernels. */
+#ifdef DS4_ROCM_BUILD
+    if (qwen4_imatrix_path() && !qwen4_imatrix_observe(w, x, n_tok)) return false;
+#endif
     if (in_dim <= UINT32_MAX && out_dim <= UINT32_MAX)
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset,
                                            w->type, n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
@@ -60761,8 +60834,12 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
               qwen4_mark("hc norm", 0) &&
               qwen4_gemv(g->lo, m, down, g->xn, T) &&
               qwen4_mark("hc down 10240->320", down->bytes);
-    if (T > 8u &&
-        up->type != DS4_TENSOR_Q8_0) {
+#ifdef DS4_ROCM_BUILD
+    const bool up_gemm = up->type != DS4_TENSOR_Q8_0 || getenv("DS4_QWEN4_HCUP_Q8_OLD") == NULL;
+#else
+    const bool up_gemm = up->type != DS4_TENSOR_Q8_0;
+#endif
+    if (T > 8u && up_gemm) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
@@ -76991,6 +77068,9 @@ void ds4_session_free(ds4_session *s) {
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
         if (ds4_session_is_qwen4(s)) {
+#ifdef DS4_ROCM_BUILD
+            qwen4_imatrix_save();
+#endif
             if (s->engine && s->engine->glm_mtp_timing && s->qwen4_spec_cycles) {
                 fprintf(stderr, "ds4: Qwen3.8 mtp: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.1f%%)\n",
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
