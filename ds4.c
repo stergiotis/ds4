@@ -60825,6 +60825,28 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
 }
 
 /* grouped norm -> low-rank gate -> mixed; inject may be NULL (final mixer) */
+/* Prefill expert gate/up: Kolibri's Q4_K/F8 tile kernel when it applies
+ * (same expert lists and output rows), else the Qwen tiles.
+ * DS4_QWEN4_KOLIBRI_TILE_OLD keeps the Qwen tiles. */
+static bool qwen4_moe_mm_gate_up(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                 uint32_t T) {
+#ifdef DS4_HAS_KOLIBRI_GPU
+    static int old = -1;
+    if (old < 0) old = getenv("DS4_QWEN4_KOLIBRI_TILE_OLD") != NULL;
+    if (!old) {
+        const int rc = ds4_gpu_kolibri_moe_mm_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
+                                                     l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                                     l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
+                                                     DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens, 0);
+        if (rc >= 0) return rc > 0;
+    }
+#endif
+    return ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
+                                           l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                           l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
+                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) != 0;
+}
+
 static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_tensor *norm, const ds4_tensor *down,
                                const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
@@ -61118,10 +61140,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
                                                       DS4_N_EXPERT, g->cap_tokens) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
-                 ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
-                                                 l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                                 l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
-                                                 DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
+                 qwen4_moe_mm_gate_up(g, m, l, T) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
                  qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
                  qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
