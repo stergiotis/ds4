@@ -477,6 +477,24 @@ experts (gate/up 1.59x, down 1.44x); dense work is +1.1 ms. The remaining
 per-row gap to halogen is mostly expert bytes and expert read rate, which
 is a format question (section on halogen's formats).
 
+**Simple rotated formats are not enough (2026-10-11).** `qwen4_requant.py
+--simulate` now has `r4` (128-point Hadamard with random signs, 4-bit codes,
+one f16 scale per 128, MSE-chosen; 4.125 bpw) and `q6a` (6-bit affine,
+groups of 64; 6.5 bpw). Cumulative, on top of V3's rules, 8,791-token eval:
+
+| variant | ppl vs reference | KL | top-1 |
+|---|---:|---:|---:|
+| V3 | x1.017 | 0.063 | 88.3% |
+| S1: o_proj + shared expert r4 | x1.067 | 0.143 | 83.4% |
+| S2: + hc and final mixer q6a | x1.072 | 0.151 | 82.9% |
+| S3: + GDN/attention/head r4 instead of Q4_K | x1.121 | 0.193 | 81.1% |
+
+Rounding to nearest in a rotated basis loses to imatrix Q4_K at 4.5 bpw,
+and o_proj / shared expert at 4 bits cost 5% perplexity. halogen's 4-bit
+dense tensors are trellis codes (QTIP-style), presumably chosen with an
+activation-aware method; that, not the rotation alone, carries its quality.
+hc at 6 bits is the one cheap trade: +0.4% perplexity for ~0.16 GB/token.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.

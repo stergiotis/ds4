@@ -14,6 +14,13 @@ runs: q4_k values as Q8_0 (or the original F16/F32), bf16 values as F32. Q8_0
 re-encodes a Q4_K block with ~1/8 of the Q4_K step, so the quality of a
 format can be measured before the runtime has kernels for it.
 
+Two types exist only for --simulate (no GGUF encoding yet):
+  r4   rotated 4-bit: each 128-column block of a row is multiplied by fixed
+       random signs (seeded by the tensor name) and a 128-point Hadamard
+       matrix, rounded to codes -8..7 with one f16 scale per block (scale
+       chosen by mean squared error), and rotated back. 4.125 bits a weight.
+  q6a  6-bit affine: groups of 64 with an f16 scale and minimum. 6.5 bits.
+
   qwen4_requant.py --model Q4.gguf --output out.gguf \\
       --set 'blk.*.hc_*.weight=q8_0' --set 'blk.*.ffn_gate_inp.weight=bf16' [--simulate]
 """
@@ -23,6 +30,7 @@ import ctypes
 import fnmatch
 import math
 import os
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import struct
@@ -33,10 +41,12 @@ from qwen4_pack_to_qwen4exp import Reader, kv_bytes, w_str
 
 NGRAM = 'per_layer_token_embd.weight'
 F32, F16, Q8_0, Q4_K, BF16 = 0, 1, 8, 12, 30
-NAMES = {'f32': F32, 'f16': F16, 'q8_0': Q8_0, 'q4_k': Q4_K, 'bf16': BF16}
+R4, Q6A = 1000, 1001   # simulation-only rounding types
+SIM_ONLY = (R4, Q6A)
+NAMES = {'f32': F32, 'f16': F16, 'q8_0': Q8_0, 'q4_k': Q4_K, 'bf16': BF16, 'r4': R4, 'q6a': Q6A}
 # type -> (block elements, block bytes)
 BLOCKS = {0: (1, 4), 1: (1, 2), 2: (32, 18), 8: (32, 34), 12: (256, 144),
-          30: (1, 2), 39: (32, 17)}
+          30: (1, 2), 39: (32, 17), R4: (128, 66), Q6A: (64, 52)}
 
 
 def nbytes(kind, dims):
@@ -85,6 +95,43 @@ def dequant(kind, raw, n):
         y = nib * (d * sc)[:, :, None] - (dmin * mn)[:, :, None]
         return y.reshape(-1)
     raise ValueError(f'cannot dequantize type {kind}')
+
+
+def _hadamard128():
+    from scipy.linalg import hadamard
+    return (hadamard(128) / np.sqrt(128)).astype(np.float32)
+
+
+def sim_r4(x, ncols, name):
+    """Rotated 4-bit round trip of float32 rows of ncols (ncols % 128 == 0)."""
+    w = x.reshape(-1, ncols)
+    signs = np.random.default_rng(zlib.crc32(name.encode())).choice(np.array([-1.0, 1.0], np.float32), ncols)
+    h = _hadamard128()
+    out = np.empty_like(w)
+    for r0 in range(0, w.shape[0], 4096):
+        b = ((w[r0:r0 + 4096] * signs).reshape(-1, ncols // 128, 128) @ h).astype(np.float32)
+        amax = np.abs(b).max(axis=2, keepdims=True)
+        best = np.zeros_like(b)
+        err = np.full(amax.shape, np.inf, np.float32)
+        for c in np.linspace(6.0, 8.0, 9):
+            d = (amax / c).astype(np.float16).astype(np.float32)
+            d[d == 0] = 1.0
+            y = np.clip(np.rint(b / d), -8, 7) * d
+            e = ((y - b) ** 2).sum(axis=2, keepdims=True)
+            better = e < err
+            best = np.where(better, y, best)
+            err = np.where(better, e, err)
+        out[r0:r0 + 4096] = (best @ h.T).reshape(-1, ncols) * signs
+    return out.reshape(-1)
+
+
+def sim_q6a(x, ncols):
+    """6-bit affine round trip, groups of 64 (ncols % 64 == 0)."""
+    g = x.reshape(-1, 64)
+    lo = g.min(axis=1, keepdims=True).astype(np.float16).astype(np.float32)
+    d = ((g.max(axis=1, keepdims=True) - lo) / 63).astype(np.float16).astype(np.float32)
+    d[d == 0] = 1.0
+    return (lo + np.clip(np.rint((g - lo) / d), 0, 63) * d).reshape(-1)
 
 
 class Quantizer:
@@ -149,6 +196,10 @@ def plan_tensor(name, kind, dims, rules, simulate):
             target = t
     if target is None or target == kind:
         return kind, None
+    if target in SIM_ONLY:
+        if not simulate:
+            raise ValueError(f'{name}: r4 and q6a exist only with --simulate')
+        return (kind if kind in (F16, F32) else Q8_0), target
     if not simulate:
         return target, target
     if target == Q4_K:
@@ -220,9 +271,12 @@ def requant(args):
                 raise ValueError(f'{name}: imatrix has {len(weights)} columns, tensor {dims[0]}')
             if rounding == Q4_K and imatrix and weights is None:
                 print(f'warning: no imatrix entry for {name}', flush=True)
-            y = q.quantize(rounding, x, dims[0], weights)
-            if stored != rounding:
-                y = q.quantize(stored, dequant(rounding, y, x.size), dims[0])
+            if rounding in SIM_ONLY:
+                y = q.quantize(stored, sim_r4(x, dims[0], name) if rounding == R4 else sim_q6a(x, dims[0]), dims[0])
+            else:
+                y = q.quantize(rounding, x, dims[0], weights)
+                if stored != rounding:
+                    y = q.quantize(stored, dequant(rounding, y, x.size), dims[0])
             if len(y) != size:
                 raise ValueError(f'{name}: wrote {len(y)} bytes, planned {size}')
             dst.write(y.tobytes())
