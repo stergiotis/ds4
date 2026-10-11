@@ -61721,6 +61721,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     }
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float)) ||
         !glm_graph_begin_commands_if_needed()) return false;
+    (void)qwen4_mark(NULL, 0);
     ds4_gpu_tensor *R_save = g->R;
     bool ok = true;
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
@@ -61738,7 +61739,8 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
     }
-    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
+    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u)) &&
+                 qwen4_mark("mtp stage+eh proj", l->nextn_eh_proj->bytes);
     for (uint32_t t = 0; t < T && ok; t++) {
         ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, t * hc * emb_bytes, hc * emb_bytes);
@@ -61766,14 +61768,19 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
              (gathered ? ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head, (uint32_t)w->output->dim[0],
                                                                   head_rows, g->mixed) != 0
-                       : qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, head_rows));
+                       : qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, head_rows)) &&
+             qwen4_mark("mtp head", w->output->bytes / DS4_N_VOCAB * head_rows);
     }
     g->R = R_save;
     if (ok && gpu_argmax) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp,
-                                                          g->logits, head_rows) != 0;
+                                                          g->logits, head_rows) != 0 &&
+                               qwen4_mark("mtp argmax", 0);
     /* without logits nothing is read back: the batched predictor leaves the
      * command batch open and finishes every session's head at once */
     if (want_logits && !ds4_gpu_end_commands()) ok = false;
+#ifdef DS4_ROCM_BUILD
+    if (ok && want_logits) ds4_gpu_kolibri_trace_end(0x100u | T);
+#endif
     ds4_gpu_tensor_free(last);
     if (ok && gpu_argmax) {
         int32_t token = -1;
@@ -61815,6 +61822,7 @@ static bool qwen4_graph_mtp_chain_step_ex(ds4_qwen4_gpu_graph *g, const ds4_mode
     qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, emb_bytes) ||
         !glm_graph_begin_commands_if_needed()) return false;
+    (void)qwen4_mark(NULL, 0);
     ds4_gpu_tensor *R_save = g->R;
     ds4_gpu_tensor *last = NULL;
     bool ok = true;
@@ -61831,7 +61839,8 @@ static bool qwen4_graph_mtp_chain_step_ex(ds4_qwen4_gpu_graph *g, const ds4_mode
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
     }
-    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, hc + 1u);
+    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, hc + 1u) &&
+                 qwen4_mark("mtp stage+eh proj", l->nextn_eh_proj->bytes);
     if (ok) {
         ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, 0, proj_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, 0, hc * emb_bytes);
@@ -61853,11 +61862,16 @@ static bool qwen4_graph_mtp_chain_step_ex(ds4_qwen4_gpu_graph *g, const ds4_mode
         last = ds4_gpu_tensor_view(g->mtp_R, 0, hc * emb_bytes);
         g->R = last;
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
-             qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, chain_head_rows);
+             qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, chain_head_rows) &&
+             qwen4_mark("mtp head", w->output->bytes / DS4_N_VOCAB * chain_head_rows);
     }
     g->R = R_save;
-    if (ok && !logits_out) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, chain_head_rows) != 0;
+    if (ok && !logits_out) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, chain_head_rows) != 0 &&
+                                qwen4_mark("mtp argmax", 0);
     if (!ds4_gpu_end_commands()) ok = false;
+#ifdef DS4_ROCM_BUILD
+    if (ok) ds4_gpu_kolibri_trace_end(0x100u | 1u);
+#endif
     ds4_gpu_tensor_free(last);
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)chain_head_rows * sizeof(float)) != 0;
@@ -77999,11 +78013,11 @@ typedef struct {
 } qwen4_spec_exact;
 
 /* DS4_QWEN4_SPEC_TIMING=1: wall time of the cycle's phases, printed at exit */
-static double qwen4_spec_t[4];   /* draft, verify, accept, whole cycle */
-static uint64_t qwen4_spec_tn[4];
+static double qwen4_spec_t[7];   /* draft, verify, accept, whole cycle; draft parts: step, chain, draw */
+static uint64_t qwen4_spec_tn[7];
 static void qwen4_spec_timing_report(void) {
-    static const char *name[4] = {"draft", "verify", "accept", "cycle"};
-    for (int i = 0; i < 4; i++) if (qwen4_spec_tn[i])
+    static const char *name[7] = {"draft", "verify", "accept", "cycle", " step", " chain", " draw"};
+    for (int i = 0; i < 7; i++) if (qwen4_spec_tn[i])
         fprintf(stderr, "ds4: spec timing %-10s %6llu calls %8.3f ms each %8.1f ms total\n", name[i],
                 (unsigned long long)qwen4_spec_tn[i], 1e3 * qwen4_spec_t[i] / qwen4_spec_tn[i], 1e3 * qwen4_spec_t[i]);
 }
@@ -78120,15 +78134,19 @@ static void qwen4_spec_draft_after_impl(ds4_session *s, const qwen4_spec_exact *
     s->glm_mtp_have2 = false;
     s->qwen4_q_valid = 0;
     if (parent < 0) return;
+    double t = now_sec();
     if (!qwen4_graph_mtp_step(g, &s->engine->model, &s->engine->weights, row, parent, idx,
                               true, lg, &draft)) return;
+    qwen4_spec_tick(4, t); t = now_sec();
     if (lg && (draft = qwen4_spec_draw(s, x, 0)) < 0) return;
+    if (lg) qwen4_spec_tick(6, t);
     s->glm_mtp_draft = draft;
     s->glm_mtp_parent = parent;
     s->glm_mtp_have = 1;
     s->qwen4_q_valid = lg ? 1 : 0;
     if (depth == 3 && idx + 2u <= g->ctx_cap) {
         int draft2 = -1;
+        const double tc = now_sec();
         if (qwen4_graph_mtp_chain_step_ex(g, &s->engine->model, &s->engine->weights,
                                           draft, idx + 1u, lg, &draft2) &&
             (!lg || (draft2 = qwen4_spec_draw(s, x, 1)) >= 0)) {
@@ -78136,6 +78154,7 @@ static void qwen4_spec_draft_after_impl(ds4_session *s, const qwen4_spec_exact *
             s->glm_mtp_have2 = true;
             if (lg) s->qwen4_q_valid = 2;
         }
+        qwen4_spec_tick(5, tc);
     }
 }
 
@@ -78159,15 +78178,19 @@ static void qwen4_spec_draft_steps_impl(ds4_session *s, const qwen4_spec_exact *
     s->glm_mtp_have2 = false;
     s->qwen4_q_valid = 0;
     if (toks[n - 1u] < 0) return;
+    double t = now_sec();
     if (!qwen4_graph_mtp_steps(g, &s->engine->model, &s->engine->weights, 0, toks, n, pos,
                                true, lg, &draft)) return;
+    qwen4_spec_tick(4, t); t = now_sec();
     if (lg && (draft = qwen4_spec_draw(s, x, 0)) < 0) return;
+    if (lg) qwen4_spec_tick(6, t);
     s->glm_mtp_draft = draft;
     s->glm_mtp_parent = toks[n - 1u];
     s->glm_mtp_have = 1;
     s->qwen4_q_valid = lg ? 1 : 0;
     if (depth == 3 && g->pos + 1u < g->ctx_cap) {
         int draft2 = -1;
+        const double tc = now_sec();
         if (qwen4_graph_mtp_chain_step_ex(g, &s->engine->model, &s->engine->weights,
                                           draft, g->pos, lg, &draft2) &&
             (!lg || (draft2 = qwen4_spec_draw(s, x, 1)) >= 0)) {
@@ -78175,6 +78198,7 @@ static void qwen4_spec_draft_steps_impl(ds4_session *s, const qwen4_spec_exact *
             s->glm_mtp_have2 = true;
             if (lg) s->qwen4_q_valid = 2;
         }
+        qwen4_spec_tick(5, tc);
     }
 }
 

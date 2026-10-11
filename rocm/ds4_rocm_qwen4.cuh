@@ -1920,12 +1920,15 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         else matvec_f16_input_first<8,1,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
         return launched();
     }
-    if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
+    /* up to 16 rows read each weight once (the MTP eh projection runs
+     * 5 rows per token, 10-15 in a catch-up) */
+    if (type == 8 && T <= 16 && !((uintptr_t)x&15)) {
 #define QWEN_Q8_ROWS(N) matvec_q8<N><<<(M+3)/4,128,0,0>>>(out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }
         else if (T == 2) { QWEN_Q8_ROWS(2); }
         else if (T <= 4) { QWEN_Q8_ROWS(4); }
-        else { QWEN_Q8_ROWS(8); }
+        else if (T <= 8) { QWEN_Q8_ROWS(8); }
+        else { QWEN_Q8_ROWS(16); }
 #undef QWEN_Q8_ROWS
         return launched();
     }
@@ -3170,7 +3173,7 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (!rb) return 0;
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
-    if (T <= 8) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M);
+    if (T <= 8 || (type == 8 && T <= 16)) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M);
     if (type == 1 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode)
         return dense_f16_blas((float *)out->ptr,(const float *)x->ptr,(const __half *)w,T,K,M);
