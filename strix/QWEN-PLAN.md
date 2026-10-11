@@ -518,6 +518,18 @@ shared expert at 4 bits it matches V3's perplexity and beats its KL, where
 our rotated round-to-nearest lost 5%. These tensors drop from 4.5-8.5 to
 4.0 bits a weight, ~0.43 GB/token. Next: an HT4 tensor type and kernels.
 
+**HT4 status (2026-10-11).** V3 + HT4 (attention, indexer, GDN projections,
+lm_head from halogen's v2; 2504a27): plain 32.3 -> 33.4 tok/s, MTP depth 3
+53.9 -> 56.6, ppl x1.0085 / KL 0.047 against the reference (V3 x1.0172 /
+0.063). The shared expert as HT4 (run as its own projections) measured
+slower (29.75 vs 29.55 ms GPU: three launches per layer instead of the
+routed kernels' slot) and less accurate (ppl x1.0174, KL 0.050); rejected.
+halogen's codebook and rotation-vector names are exllamav3's EXL3 "mul1"
+codebook (MIT); HGN re-lays EXL3-style tiles out in 128-row bands and its
+own in-tile order. Tiles can be reordered losslessly, values inside a tile
+cannot (the trellis state runs in stream order), so EXL3 files would need
+a kernel variant for EXL3's in-tile order rather than a byte repack.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.

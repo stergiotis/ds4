@@ -61,6 +61,8 @@ BLOCKS = {0: (1, 4), 1: (1, 2), 2: (32, 18), 8: (32, 34), 12: (256, 144),
 
 
 def nbytes(kind, dims):
+    if kind == HT4:   # 16 x 16 tiles: any K and N that are multiples of 16 (ds4 needs 128)
+        return math.prod(dims) // 2
     block, size = BLOCKS[kind]
     if dims[0] % block:
         raise ValueError(f'row length {dims[0]} is not a multiple of {block}')
@@ -259,6 +261,8 @@ def requant(args):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'strix' / 'hgn'))
         import hgn, hmap
         nt, _ = hgn.table(args.hgn_ht4)
+        # the shared expert stays: as HT4 it measured slower (separate launches
+        # instead of the routed kernels' slot) and less accurate than Q8_0
         native = {k: v for k, v in hmap.gguf_overrides(nt).items() if '_shexp' not in k}
         def nat_bytes(base, rows=None):
             e = nt[base + '.weight']; N, K = e['shape']
