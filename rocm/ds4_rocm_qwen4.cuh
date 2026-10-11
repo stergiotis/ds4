@@ -924,6 +924,134 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4_rows(float *out, const flo
     }
 }
 
+/* Byte j of a nibble word holds MXFP4 values j (low nibble) and 16 + j
+ * (high nibble); returns them as int8 lanes, the E2M1 levels doubled. */
+__device__ __forceinline__ int2 mxfp4_nibbles_i8(unsigned q) {
+    constexpr unsigned t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu;
+    const unsigned lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
+    const unsigned lo_a = __builtin_amdgcn_perm(t1, t0, lo & 0x07070707u);
+    const unsigned lo_b = __builtin_amdgcn_perm(t3, t2, lo & 0x07070707u);
+    const unsigned hi_a = __builtin_amdgcn_perm(t1, t0, hi & 0x07070707u);
+    const unsigned hi_b = __builtin_amdgcn_perm(t3, t2, hi & 0x07070707u);
+    const unsigned x = __builtin_amdgcn_perm(lo_b, lo_a, 0x03020100u | ((lo & 0x08080808u) >> 1));
+    const unsigned y = __builtin_amdgcn_perm(hi_b, hi_a, 0x03020100u | ((hi & 0x08080808u) >> 1));
+    return make_int2((int)x, (int)y);
+}
+
+/* moe_down_mxfp4_rows<4, NT> on integer dots: each lane quantizes its own
+ * 32-value block of x to int8 with one scale (amax / 127) and dots it with
+ * the int8 weight levels four at a time (sudot4).  Not bit-identical to the
+ * float kernels; T-invariant, since every pair is quantized the same way
+ * for 1 to 3 tokens. */
+template<unsigned NT>
+__global__ __launch_bounds__(128) void moe_down_mxfp4_q8(float *out, const float *x, const int *selected,
+        const char *w, const char *sh, unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb, unsigned T) {
+    constexpr unsigned K = 640, NB = 20, OR = 4;
+    const unsigned lane = threadIdx.x & 31, row0 = (blockIdx.x * 4 + threadIdx.x / 32) * OR;
+    const unsigned slot = blockIdx.y, t0 = blockIdx.z;
+    const uint64_t pair0 = (uint64_t)t0 * (NS + 1) + slot;
+    if (slot == NS) {
+        const float *xt = x + pair0 * K;
+        #pragma unroll
+        for (unsigned r = 0; r < OR; r++) {
+            const unsigned row = row0 + r;
+            if (row >= M) return;
+            const float a = dot_q8_vec(sh + row * srb, xt, K);
+            if (!lane) out[pair0 * M + row] = a;
+        }
+        return;
+    }
+    const int e = selected[(uint64_t)t0 * NS + slot];
+    if (e < 0 || (unsigned)e >= NE) {
+        if (!lane) for (unsigned r = 0; r < OR; r++) if (row0 + r < M) out[pair0 * M + row0 + r] = 0;
+        return;
+    }
+    uint64_t pairs[NT];
+    pairs[0] = pair0;
+    unsigned n = 1;
+    if (NT > 1) {
+        for (unsigned t = 0; t < t0; t++)
+            for (unsigned s = 0; s < NS; s++)
+                if (selected[(uint64_t)t * NS + s] == e) return;
+        for (unsigned t = t0 + 1; t < T && n < NT; t++)
+            for (unsigned s = 0; s < NS; s++)
+                if (selected[(uint64_t)t * NS + s] == e) { pairs[n++] = (uint64_t)t * (NS + 1) + s; break; }
+    }
+    /* weights first, so their loads are in flight while x is quantized */
+    unsigned wd[OR][5], o[OR];
+    const char *we = w + (uint64_t)e * M * rb + lane * 17;
+    #pragma unroll
+    for (unsigned r = 0; r < OR; r++) {
+        const uintptr_t a = (uintptr_t)(we + (uint64_t)(row0 + r) * rb);
+        o[r] = (unsigned)(a & 3);
+        if (lane < NB && row0 + r < M) {
+            const unsigned *pw = (const unsigned *)(a - o[r]);
+            #pragma unroll
+            for (unsigned i = 0; i < 5; i++) wd[r][i] = pw[i];
+        }
+    }
+    int xq[NT][8];
+    float dx[NT];
+    #pragma unroll
+    for (unsigned p = 0; p < NT; p++) {
+        dx[p] = 0;
+        if (p < n && lane < NB) {
+            const float *xt = x + pairs[p] * K + lane * 32;
+            float v[32], amax = 0;
+            #pragma unroll
+            for (unsigned k = 0; k < 8; k++) {
+                const float4 f = *(const float4 *)(xt + k * 4);
+                v[k * 4] = f.x; v[k * 4 + 1] = f.y; v[k * 4 + 2] = f.z; v[k * 4 + 3] = f.w;
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(v[i]));
+            const float inv = amax > 0 ? 127.0f / amax : 0.0f;
+            dx[p] = amax / 127.0f;
+            #pragma unroll
+            for (unsigned k = 0; k < 8; k++) {
+                unsigned word = 0;
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++)
+                    word |= ((unsigned)__float2int_rn(v[k * 4 + j] * inv) & 255u) << (8 * j);
+                xq[p][k] = (int)word;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < OR; r++) {
+        const unsigned row = row0 + r;
+        if (row >= M) return;
+        int sumi[NT];
+        #pragma unroll
+        for (unsigned p = 0; p < NT; p++) sumi[p] = 0;
+        float scale = 0;
+        if (lane < NB) {
+            const unsigned sb = (wd[r][0] >> (8 * o[r])) & 255;
+            scale = 0.5f * (sb == 0 ? 0x1p-127f : __uint_as_float(sb << 23));
+            const bool q1 = o[r] == 3;
+            const unsigned sh8 = 8 * ((o[r] + 1) & 3);
+            #pragma unroll
+            for (unsigned k = 0; k < 4; k++) {
+                const unsigned lo = q1 ? wd[r][k + 1] : wd[r][k];
+                const unsigned hi = q1 ? (k + 2 < 5 ? wd[r][k + 2] : 0u) : wd[r][k + 1];
+                const int2 v = mxfp4_nibbles_i8(__funnelshift_r(lo, hi, sh8));
+                #pragma unroll
+                for (unsigned p = 0; p < NT; p++) {
+                    sumi[p] = __builtin_amdgcn_sudot4(true, v.x, true, xq[p][k], sumi[p], false);
+                    sumi[p] = __builtin_amdgcn_sudot4(true, v.y, true, xq[p][4 + k], sumi[p], false);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned p = 0; p < NT; p++) {
+            if (p < n) {
+                const float acc = sum(lane < NB ? (float)sumi[p] * (scale * dx[p]) : 0.0f);
+                if (!lane) out[pairs[p] * M + row] = acc;
+            }
+        }
+    }
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
@@ -937,6 +1065,17 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *v = getenv("DS4_QWEN4_MXFP4_ROWS");
         mxfp4_rows = v && v[0] ? atoi(v) : 4;
         if (mxfp4_rows != 0 && mxfp4_rows != 4 && mxfp4_rows != 8 && mxfp4_rows != 16) mxfp4_rows = 4;
+    }
+    /* moe_down_mxfp4_q8 (integer dots on int8 x) by default;
+     * DS4_QWEN4_MXFP4_Q8=0 keeps the float kernels below */
+    static int mxfp4_q8 = -1;
+    if (mxfp4_q8 < 0) mxfp4_q8 = !getenv("DS4_QWEN4_MXFP4_Q8") || atoi(getenv("DS4_QWEN4_MXFP4_Q8")) != 0;
+    if (!mxfp4_old && mxfp4_q8 && down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
+        M % 16 == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
+        const dim3 grid(M / 16, NS + 1, T);
+        if (T == 1) moe_down_mxfp4_q8<1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+        else moe_down_mxfp4_q8<3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+        return launched();
     }
     if (!mxfp4_old && mxfp4_rows && down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
         M % (4u * mxfp4_rows) == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
