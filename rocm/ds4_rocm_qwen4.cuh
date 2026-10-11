@@ -1839,6 +1839,216 @@ __global__ __launch_bounds__(128) void matvec_bf16(float *out, const char *w, co
     }
 }
 
+/* HT4: halogen's `ht` store at 4 bits (hgn-spec STORAGE.md), payloads kept
+ * as published.  W = diag(sv) Hn M Hn diag(su) in 128 x 128 blocks, M a
+ * trellis code: 16 x 16 tiles of 128 bytes, ordered band (128 rows) ->
+ * column tile -> row tile; value i of a tile has the 16-bit state of stream
+ * bits 4(i+1)-16 .. 4(i+1)-1 (words read from the most significant bit,
+ * circular) and M = f16((1774 a - 905216) / 2^18), a = byte sum of
+ * state * 0x83DCD12D.  y = W x is computed as sv * Hn (M (Hn (su * x))).
+ *
+ * One workgroup takes one band and one chunk of CT column tiles, for T <= TM
+ * tokens: it rotates its slice of x into LDS (f16), each of its 8 waves
+ * decodes one row tile per column tile and dots it with every token, and the
+ * band's 128 partial sums are rotated by the last workgroup of the band,
+ * which adds the chunks in order (no atomics on values, so the result does
+ * not depend on T or on scheduling).  rperm (optional) sends output band b
+ * to band rperm[b]; cperm (optional) reads input block j from x block
+ * cperm[j]: the GDN value heads are 128-wide, so halogen's grouped head
+ * order maps to GGUF's tiled order this way. */
+typedef _Float16 ht4_h2 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ ht4_h2 ht4_pair(unsigned s0, unsigned s1) {
+    const unsigned a0 = __builtin_amdgcn_udot4(s0 * 0x83DCD12Du, 0x01010101u, 0u, false);
+    const unsigned a1 = __builtin_amdgcn_udot4(s1 * 0x83DCD12Du, 0x01010101u, 0u, false);
+    const unsigned bits = (0x6400u | a0) | ((0x6400u | a1) << 16);   /* f16 of 1024 + a */
+    ht4_h2 v;
+    __builtin_memcpy(&v, &bits, 4);
+    const unsigned short m16 = 0x1EEE, c16 = 0xC931;
+    _Float16 m, c;
+    __builtin_memcpy(&m, &m16, 2);
+    __builtin_memcpy(&c, &c16, 2);
+    return v * (ht4_h2){m, m} + (ht4_h2){c, c};
+}
+
+/* Sylvester fast Walsh-Hadamard transform of 128-value blocks in LDS by 256
+ * threads (n values, n % 128 == 0, n <= 512) */
+__device__ __forceinline__ void ht4_fwht(float *v, unsigned n) {
+    for (unsigned h = 1; h < 128; h <<= 1) {
+        float a[2], c[2];
+        #pragma unroll
+        for (unsigned q = 0; q < 2; q++) {
+            const unsigned i = threadIdx.x + q * 256;
+            if (i < n) { a[q] = v[i]; c[q] = v[i ^ h]; }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned q = 0; q < 2; q++) {
+            const unsigned i = threadIdx.x + q * 256;
+            if (i < n) v[i] = (i & h) ? c[q] - a[q] : a[q] + c[q];
+        }
+        __syncthreads();
+    }
+}
+
+/* up to 6 matrices over the same x and input vector su, bands concatenated */
+struct ht4_set {
+    const unsigned *w[6];
+    const __half *sv[6];
+    const int *rperm[6];
+    float *y[6];
+    unsigned band0[7];      /* first global band of each matrix, band0[n] = total */
+    unsigned n;
+};
+
+template<unsigned TM>
+__global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsigned *counter,
+        const __half *su, const int *cperm,
+        const float *x, const _Float16 *xr, unsigned T, unsigned K, unsigned CT, unsigned chunks) {
+    constexpr float RS = 0.08838834764831845f;      /* 1 / sqrt(128) */
+    const unsigned gband = blockIdx.x, chunk = blockIdx.y;
+    unsigned mi = 0;
+    while (mi + 1 < set.n && gband >= set.band0[mi + 1]) mi++;
+    const unsigned band = gband - set.band0[mi];
+    const unsigned N = (set.band0[mi + 1] - set.band0[mi]) * 128;
+    const unsigned *w = set.w[mi];
+    const __half *sv = set.sv[mi];
+    const int *rperm = set.rperm[mi];
+    float *y = set.y[mi];
+    const unsigned wave = threadIdx.x / 32, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const unsigned ctiles = K / 16, ct0 = chunk * CT, nct = min(CT, ctiles - ct0);
+    const unsigned nk = nct * 16;                    /* multiple of 128, at most 512 */
+    __shared__ __align__(16) _Float16 xs[TM][512];
+    __shared__ float fb[512];
+    __shared__ float z[TM][128];
+    __shared__ unsigned ticket;
+    if (xr) {
+        for (unsigned t = 0; t < T; t++)
+            for (unsigned i = tid * 8; i < nk; i += 256 * 8)
+                *(uint4 *)&xs[t][i] = *(const uint4 *)&xr[(uint64_t)t * K + ct0 * 16 + i];
+        __syncthreads();
+    } else
+    for (unsigned t = 0; t < T; t++) {
+        for (unsigned i = tid; i < nk; i += 256) {
+            const unsigned kb = ct0 / 8 + i / 128;   /* W column block */
+            const unsigned xb = cperm ? (unsigned)cperm[kb] : kb;
+            fb[i] = x[(uint64_t)t * K + xb * 128 + (i & 127)] * __half2float(su[kb * 128 + (i & 127)]);
+        }
+        __syncthreads();
+        ht4_fwht(fb, nk);
+        for (unsigned i = tid; i < nk; i += 256) xs[t][i] = (_Float16)(fb[i] * RS);
+        __syncthreads();
+    }
+    const unsigned *wb = w + ((uint64_t)band * ctiles * 8) * 32 + wave * 32 + lane;
+    const unsigned col_half = 8 * (lane / 16);
+    float acc[TM];
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) acc[t] = 0.f;
+    for (unsigned c = 0; c < nct; c += 8) {
+        unsigned cur[8];
+        #pragma unroll
+        for (unsigned u = 0; u < 8; u++) cur[u] = wb[(uint64_t)(ct0 + c + u) * 256];
+        #pragma unroll
+        for (unsigned u = 0; u < 8; u++) {
+            const unsigned prev = __shfl(cur[u], (lane + 31) & 31, 32);
+            ht4_h2 m[4];
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j += 2)
+                m[j / 2] = ht4_pair(__builtin_amdgcn_alignbit(prev, cur[u], 28 - 4 * j) & 0xFFFFu,
+                                    __builtin_amdgcn_alignbit(prev, cur[u], 24 - 4 * j) & 0xFFFFu);
+            #pragma unroll
+            for (unsigned t = 0; t < TM; t++) {
+                if (t < T) {
+                    const uint4 xq = *(const uint4 *)&xs[t][(c + u) * 16 + col_half];
+                    const unsigned xw[4] = {xq.x, xq.y, xq.z, xq.w};
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; j++) {
+                        ht4_h2 xv;
+                        __builtin_memcpy(&xv, &xw[j], 4);
+                        acc[t] = __builtin_amdgcn_fdot2(m[j], xv, acc[t], false);
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) {
+        if (t < T) {
+            const float v = acc[t] + __shfl_xor(acc[t], 16, 32);
+            if (lane < 16) z[t][wave * 16 + lane] = v;
+        }
+    }
+    __syncthreads();
+    if (chunks > 1) {
+        float *pb = partial + ((uint64_t)gband * chunks + chunk) * TM * 128;
+        for (unsigned i = tid; i < T * 128; i += 256) pb[i] = z[i / 128][i & 127];
+        __threadfence();
+        __syncthreads();
+        if (!tid) ticket = atomicAdd(&counter[gband], 1u);
+        __syncthreads();
+        if (ticket != chunks - 1) return;
+        __threadfence();
+        const float *p0 = partial + (uint64_t)gband * chunks * TM * 128;
+        for (unsigned i = tid; i < T * 128; i += 256) {
+            float s = 0.f;
+            for (unsigned k = 0; k < chunks; k++) s += __builtin_nontemporal_load(&p0[(uint64_t)k * TM * 128 + i]);
+            z[i / 128][i & 127] = s;
+        }
+        if (!tid) counter[gband] = 0;
+        __syncthreads();
+    }
+    const unsigned ob = rperm ? (unsigned)rperm[band] : band;
+    for (unsigned t = 0; t < T; t++) {
+        if (tid < 128) fb[tid] = z[t][tid];
+        __syncthreads();
+        ht4_fwht(fb, 128);
+        if (tid < 128) y[(uint64_t)t * N + ob * 128 + tid] = fb[tid] * RS * __half2float(sv[band * 128 + tid]);
+        __syncthreads();
+    }
+}
+
+static unsigned *g_ht4_counter;
+
+/* HT4 matvecs of a set (shared x and su) for any T, in chunks of 16 rows */
+static int ht4_dispatch(ht4_set set, const float *x, const __half *su, const int *cperm, unsigned T, unsigned K) {
+    if (!T || K % 128 || !set.n || set.n > 6) return 0;
+    if (!g_ht4_counter) {
+        if (cudaMalloc((void **)&g_ht4_counter, 65536 * 4) != cudaSuccess ||
+            cudaMemset(g_ht4_counter, 0, 65536 * 4) != cudaSuccess) { g_ht4_counter = NULL; return 0; }
+    }
+    const unsigned bands = set.band0[set.n], ctiles = K / 16;
+    if (!bands || bands > 65536) return 0;
+    /* enough workgroups for the GPU: split K when there are few bands; the
+     * split depends only on the shapes, never on T */
+    unsigned chunks = (256 + bands - 1) / bands;
+    if (chunks > ctiles / 8) chunks = ctiles / 8;
+    if (chunks < 1) chunks = 1;
+    unsigned CT = (ctiles + chunks - 1) / chunks;
+    CT = (CT + 7) / 8 * 8;
+    if (CT > 32) CT = 32;
+    chunks = (ctiles + CT - 1) / CT;
+    float *partial = NULL;
+    if (chunks > 1) {
+        partial = (float *)cuda_tmp_alloc((uint64_t)bands * chunks * 16 * 128 * 4, "Qwen HT4 partial sums");
+        if (!partial) return 0;
+    }
+    const dim3 g(bands, chunks);
+    for (unsigned t0 = 0; t0 < T; t0 += 16) {
+        const unsigned n = T - t0 < 16 ? T - t0 : 16;
+        ht4_set s2 = set;
+        for (unsigned i = 0; i < set.n; i++) s2.y[i] = set.y[i] + (uint64_t)t0 * (set.band0[i + 1] - set.band0[i]) * 128;
+        const float *xt = x + (uint64_t)t0 * K;
+#define QWEN_HT4(TMV) ht4_mv<TMV><<<g, 256, 0, 0>>>(s2, partial, g_ht4_counter, su, cperm, xt, NULL, n, K, CT, chunks)
+        if (n == 1) { QWEN_HT4(1); }
+        else if (n <= 3) { QWEN_HT4(3); }
+        else if (n <= 8) { QWEN_HT4(8); }
+        else { QWEN_HT4(16); }
+#undef QWEN_HT4
+        if (!launched()) return 0;
+    }
+    return 1;
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
@@ -3163,6 +3373,46 @@ extern "C" int ds4_gpu_qwen4_sumsq_tensor(ds4_gpu_tensor *acc, const ds4_gpu_ten
     if (!T || !K || !tensor(acc, (uint64_t)K * 4) || !tensor(x, (uint64_t)T * K * 4)) return 0;
     sumsq_cols<<<dim3((K + 255) / 256, (T + 63) / 64), 256, 0, 0>>>((float *)acc->ptr, (const float *)x->ptr, T, K);
     return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_ht4_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t w_off, uint64_t su_off, uint64_t sv_off,
+        uint64_t rperm_off, uint64_t cperm_off, uint32_t T, uint32_t K, uint32_t N) {
+    using namespace qwen4_rocm;
+    if (!T || !K || !N || !tensor(x, (uint64_t)T*K*4) || !tensor(out, (uint64_t)T*N*4)) return 0;
+    const char *w = weight(map, size, w_off, (uint64_t)N*K/2);
+    const __half *su = (const __half *)weight(map, size, su_off, (uint64_t)K*2);
+    const __half *sv = (const __half *)weight(map, size, sv_off, (uint64_t)N*2);
+    const int *rp = rperm_off != UINT64_MAX ? (const int *)weight(map, size, rperm_off, (uint64_t)N/128*4) : NULL;
+    const int *cp = cperm_off != UINT64_MAX ? (const int *)weight(map, size, cperm_off, (uint64_t)K/128*4) : NULL;
+    if (!w || !su || !sv || (rperm_off != UINT64_MAX && !rp) || (cperm_off != UINT64_MAX && !cp) || N % 128) return 0;
+    ht4_set set = {};
+    set.w[0] = (const unsigned *)w; set.sv[0] = sv; set.rperm[0] = rp; set.y[0] = (float *)out->ptr;
+    set.band0[0] = 0; set.band0[1] = N / 128; set.n = 1;
+    return ht4_dispatch(set, (const float *)x->ptr, su, cp, T, K);
+}
+
+extern "C" int ds4_gpu_qwen4_ht4_multi_tensor(const ds4_gpu_tensor *x, uint32_t T, uint32_t K, uint32_t n,
+        ds4_gpu_tensor *const *outs, const void *map, uint64_t size, uint64_t su_off,
+        const uint64_t *w_offs, const uint64_t *sv_offs, const uint64_t *rperm_offs, const uint32_t *rows) {
+    using namespace qwen4_rocm;
+    if (!T || !K || !n || n > 6 || !tensor(x, (uint64_t)T*K*4)) return 0;
+    const __half *su = (const __half *)weight(map, size, su_off, (uint64_t)K*2);
+    if (!su) return 0;
+    ht4_set set = {};
+    set.n = n;
+    set.band0[0] = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t N = rows[i];
+        if (N % 128 || !tensor(outs[i], (uint64_t)T*N*4)) return 0;
+        set.w[i] = (const unsigned *)weight(map, size, w_offs[i], (uint64_t)N*K/2);
+        set.sv[i] = (const __half *)weight(map, size, sv_offs[i], (uint64_t)N*2);
+        set.rperm[i] = rperm_offs[i] != UINT64_MAX ? (const int *)weight(map, size, rperm_offs[i], (uint64_t)N/128*4) : NULL;
+        if (!set.w[i] || !set.sv[i] || (rperm_offs[i] != UINT64_MAX && !set.rperm[i])) return 0;
+        set.y[i] = (float *)outs[i]->ptr;
+        set.band0[i + 1] = set.band0[i] + N / 128;
+    }
+    return ht4_dispatch(set, (const float *)x->ptr, su, NULL, T, K);
 }
 
 extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,

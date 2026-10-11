@@ -26,6 +26,11 @@ halogen v2 checkpoint (attention, indexer, GDN projections, shared expert,
 lm_head; decoded with strix/hgn, value heads reordered to GGUF order) and
 stores them as Q8_0, to measure that checkpoint's dense quality in ds4.
 
+--hgn-ht4 FILE copies the same matrices (shared expert excepted) into the
+output unchanged as ds4 type HT4 (210), with their F16 rotation vectors as
+NAME.suh / NAME.svh and, for the GDN projections, I32 NAME.rperm / NAME.cperm
+mapping halogen's grouped value heads to GGUF's tiled order.
+
   qwen4_requant.py --model Q4.gguf --output out.gguf \\
       --set 'blk.*.hc_*.weight=q8_0' --set 'blk.*.ffn_gate_inp.weight=bf16' [--simulate]
 """
@@ -46,13 +51,13 @@ import numpy as np
 from qwen4_pack_to_qwen4exp import Reader, kv_bytes, w_str
 
 NGRAM = 'per_layer_token_embd.weight'
-F32, F16, Q8_0, Q4_K, BF16 = 0, 1, 8, 12, 30
+F32, F16, Q8_0, Q4_K, BF16, I32, HT4 = 0, 1, 8, 12, 30, 26, 210
 R4, Q6A = 1000, 1001   # simulation-only rounding types
 SIM_ONLY = (R4, Q6A)
 NAMES = {'f32': F32, 'f16': F16, 'q8_0': Q8_0, 'q4_k': Q4_K, 'bf16': BF16, 'r4': R4, 'q6a': Q6A}
 # type -> (block elements, block bytes)
 BLOCKS = {0: (1, 4), 1: (1, 2), 2: (32, 18), 8: (32, 34), 12: (256, 144),
-          30: (1, 2), 39: (32, 17), R4: (128, 66), Q6A: (64, 52)}
+          26: (1, 4), 30: (1, 2), 39: (32, 17), R4: (128, 66), Q6A: (64, 52), HT4: (256, 128)}
 
 
 def nbytes(kind, dims):
@@ -249,15 +254,51 @@ def requant(args):
 
     alignment = model.kv.get('general.alignment', 32)
     align = lambda n: (n + alignment - 1) // alignment * alignment
+    native = {}
+    if args.hgn_ht4:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'strix' / 'hgn'))
+        import hgn, hmap
+        nt, _ = hgn.table(args.hgn_ht4)
+        native = {k: v for k, v in hmap.gguf_overrides(nt).items() if '_shexp' not in k}
+        def nat_bytes(base, rows=None):
+            e = nt[base + '.weight']; N, K = e['shape']
+            b = bytes(hgn.payload(args.hgn_ht4, e))
+            return b if rows is None else b[rows[0] * K // 2:rows[1] * K // 2]
+        def vec(base, which, rows=None):
+            v = bytes(hgn.payload(args.hgn_ht4, nt[base + '.' + which]))
+            return v if rows is None or which == 'suh' else v[rows[0] * 2:rows[1] * 2]
+        g2t = hmap.G2T
+        print(f'{len(native)} tensors as HT4 from {args.hgn_ht4}', flush=True)
     plan, offset = [], 0
     for name, (kind, dims, old) in model.tensors.items():
         if name == NGRAM:
+            continue
+        if name in native:
+            base, fix, rows = native[name]
+            K, N = dims
+            stem = name[:-len('.weight')]
+            items = [(name, HT4, dims, lambda b=base, r=rows: nat_bytes(b, r)),
+                     (stem + '.suh', F16, [K], lambda b=base, r=rows: vec(b, 'suh', r)),
+                     (stem + '.svh', F16, [N], lambda b=base, r=rows: vec(b, 'svh', r))]
+            gg = name.split('.')[-2]
+            if gg == 'attn_qkv':   # q, k bands as they are; the 48 v bands grouped -> tiled
+                rp = np.arange(N // 128, dtype='<i4'); vb = rp.size - 48
+                rp[vb:] = vb + g2t
+                items.append((stem + '.rperm', I32, [rp.size], lambda a=rp: a.tobytes()))
+            elif gg == 'attn_gate':
+                items.append((stem + '.rperm', I32, [48], lambda: g2t.astype('<i4').tobytes()))
+            elif gg == 'ssm_out':
+                items.append((stem + '.cperm', I32, [48], lambda: g2t.astype('<i4').tobytes()))
+            for iname, itype, idims, getter in items:
+                size = nbytes(itype, idims)
+                plan.append((iname, kind, idims, old, itype, None, offset, size, getter))
+                offset = align(offset + size)
             continue
         stored, rounding = (Q8_0, Q8_0) if name in hgn_over else plan_tensor(name, kind, dims, rules, args.simulate)
         if rounding is not None:
             nbytes(rounding, dims)  # the rounding type must tile the rows
         size = nbytes(stored, dims)
-        plan.append((name, kind, dims, old, stored, rounding, offset, size))
+        plan.append((name, kind, dims, old, stored, rounding, offset, size, None))
         offset = align(offset + size)
 
     metadata = {k: (model.kv_types[k], v) for k, v in model.kv.items()}
@@ -265,10 +306,11 @@ def requant(args):
     ref = os.path.relpath(src, out.resolve().parent) if src.parent == out.resolve().parent else str(src)
     metadata['qwen4exp.ple.ngram_file'] = (8, ref)
     metadata['ds4.qwen4.requant'] = (8, ('simulate ' if args.simulate else '') +
+                                     (f'hgn-ht4 {Path(args.hgn_ht4).name} ' if args.hgn_ht4 else '') +
                                      (f'imatrix {Path(args.imatrix).name} ' if args.imatrix else '') + ' '.join(args.set))
     head = bytearray(b'GGUF' + struct.pack('<IQQ', 3, len(plan), len(metadata)))
     head += b''.join(kv_bytes(k, t, v) for k, (t, v) in metadata.items())
-    for name, _, dims, _, stored, _, pos, _ in plan:
+    for name, _, dims, _, stored, _, pos, _, _ in plan:
         head += w_str(name) + struct.pack('<I', len(dims))
         head += struct.pack('<' + 'Q' * len(dims), *dims) + struct.pack('<IQ', stored, pos)
     data_start = align(len(head))
@@ -276,7 +318,14 @@ def requant(args):
     changed = before = after = 0
     with pending.open('xb') as dst:
         dst.write(head)
-        for name, kind, dims, old, stored, rounding, pos, size in plan:
+        for name, kind, dims, old, stored, rounding, pos, size, getter in plan:
+            if getter is not None:
+                b = getter()
+                if len(b) != size:
+                    raise ValueError(f'{name}: {len(b)} bytes, planned {size}')
+                dst.seek(data_start + pos)
+                dst.write(b)
+                continue
             src_bytes = nbytes(kind, dims)
             model.f.seek(model.data_start + old)
             raw = np.frombuffer(model.f.read(src_bytes), np.uint8)
@@ -320,6 +369,7 @@ def main():
     parser.add_argument('--simulate', action='store_true')
     parser.add_argument('--imatrix')
     parser.add_argument('--hgn')
+    parser.add_argument('--hgn-ht4')
     parser.add_argument('--lib', default=Path(__file__).resolve().with_name('libds4quants.so'))
     args = parser.parse_args()
     try:

@@ -3640,6 +3640,17 @@ int ds4_gpu_kolibri_trace_end(uint32_t T);
 
 /* acc[k] += sum over the T rows of x[t][k]^2 (imatrix collection). */
 int ds4_gpu_qwen4_sumsq_tensor(ds4_gpu_tensor *acc, const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim);
+/* HT4 (halogen ht, 4 bits): y = diag(sv) Hn M Hn diag(su) x; rperm / cperm
+ * (UINT64_MAX when absent) reorder 128-row output bands / 128-wide input
+ * blocks. */
+int ds4_gpu_qwen4_ht4_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t w_off, uint64_t su_off, uint64_t sv_off,
+        uint64_t rperm_off, uint64_t cperm_off, uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
+/* n <= 6 HT4 matrices over the same x and the same input vector su (at
+ * su_off), in one launch; rows[i] % 128 == 0. */
+int ds4_gpu_qwen4_ht4_multi_tensor(const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n,
+        ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size, uint64_t su_off,
+        const uint64_t *w_offs, const uint64_t *sv_offs, const uint64_t *rperm_offs, const uint32_t *rows);
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,

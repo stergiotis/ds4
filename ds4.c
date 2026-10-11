@@ -2428,6 +2428,8 @@ static const gguf_type_info gguf_types[] = {
     [39] = {"mxfp4",   32,  17},
     /* ds4's own: FP8 e4m3 with one fp32 scale per 128 (see DS4_TENSOR_F8_B128) */
     [200] = {"f8_b128", 512, 528},
+    /* halogen's ht at 4 bits (see DS4_TENSOR_HT4) */
+    [210] = {"ht4",     256, 128},
 };
 
 enum {
@@ -2451,6 +2453,13 @@ enum {
      * scales of its four 128-wide source blocks followed by 512 e4m3 bytes.
      * No ggml equivalent. */
     DS4_TENSOR_F8_B128  = 200,
+    /* halogen's `ht` store at 4 bits, payload as published (hgn-spec): 16x16
+     * tiles of trellis codes in a 128-point Hadamard basis.  Its vectors are
+     * the F16 tensors NAME.suh (input, K values) and NAME.svh (output, N);
+     * optional I32 NAME.rperm / NAME.cperm reorder 128-row output bands /
+     * 128-wide input blocks (halogen groups the GDN value heads, GGUF tiles
+     * them).  No ggml equivalent. */
+    DS4_TENSOR_HT4      = 210,
 };
 
 typedef struct {
@@ -2459,7 +2468,7 @@ typedef struct {
     uint64_t value_pos;
 } ds4_kv;
 
-typedef struct {
+typedef struct ds4_tensor {
     ds4_str name;
     uint32_t ndim;
     uint64_t dim[DS4_MAX_DIMS];
@@ -2468,6 +2477,8 @@ typedef struct {
     uint64_t abs_offset;
     uint64_t elements;
     uint64_t bytes;
+    /* DS4_TENSOR_HT4 companions, linked at load (NULL otherwise) */
+    const struct ds4_tensor *ht_su, *ht_sv, *ht_rperm, *ht_cperm;
 } ds4_tensor;
 
 typedef struct ds4_model {
@@ -2572,6 +2583,8 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     *bytes = blocks * info->block_bytes;
     return true;
 }
+
+static void model_link_ht4(ds4_model *m);
 
 static ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
     ds4_cursor c = {
@@ -2837,6 +2850,7 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
             m->max_tensor_bytes = t->bytes;
         }
     }
+    model_link_ht4(m);
 }
 
 #ifdef DS4_ROCM_BUILD
@@ -3467,6 +3481,32 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
         }
     }
     return NULL;
+}
+
+/* link every HT4 tensor BASE.weight to BASE.suh / .svh (required) and
+ * BASE.rperm / .cperm (optional) */
+static void model_link_ht4(ds4_model *m) {
+    char name[256];
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *t = &m->tensors[i];
+        if (t->type != DS4_TENSOR_HT4) continue;
+        const size_t len = t->name.len;
+        if (len < 8 || len > 200 || memcmp(t->name.ptr + len - 7, ".weight", 7) != 0 || t->ndim != 2 ||
+            t->dim[0] % 128 || t->dim[1] % 128)
+            ds4_die("HT4 tensor needs a NAME.weight of 2 dimensions, both multiples of 128");
+        const int base = (int)(len - 7);
+        snprintf(name, sizeof(name), "%.*s.suh", base, t->name.ptr);  t->ht_su = model_find_tensor(m, name);
+        snprintf(name, sizeof(name), "%.*s.svh", base, t->name.ptr);  t->ht_sv = model_find_tensor(m, name);
+        snprintf(name, sizeof(name), "%.*s.rperm", base, t->name.ptr); t->ht_rperm = model_find_tensor(m, name);
+        snprintf(name, sizeof(name), "%.*s.cperm", base, t->name.ptr); t->ht_cperm = model_find_tensor(m, name);
+        if (!t->ht_su || !t->ht_sv || t->ht_su->type != DS4_TENSOR_F16 || t->ht_sv->type != DS4_TENSOR_F16 ||
+            t->ht_su->elements != t->dim[0] || t->ht_sv->elements != t->dim[1] ||
+            (t->ht_rperm && (t->ht_rperm->type != DS4_TENSOR_I32 || t->ht_rperm->elements != t->dim[1] / 128)) ||
+            (t->ht_cperm && (t->ht_cperm->type != DS4_TENSOR_I32 || t->ht_cperm->elements != t->dim[0] / 128))) {
+            fprintf(stderr, "ds4: HT4 tensor %.*s has missing or malformed vectors\n", (int)len, t->name.ptr);
+            exit(1);
+        }
+    }
 }
 
 static const char *support_kind_name(ds4_support_kind kind) {
@@ -5762,7 +5802,8 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
 /* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_HT4;
 }
 
 static void tensor_expect_qwen4_dense_layout(
@@ -60099,7 +60140,8 @@ typedef struct ds4_qwen4_gpu_graph {
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K);
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K ||
+                 t->type == DS4_TENSOR_HT4);
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -60646,6 +60688,16 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
      * dispatch separate so each backend can select bulk and decode kernels. */
 #ifdef DS4_ROCM_BUILD
     if (qwen4_imatrix_path() && !qwen4_imatrix_observe(w, x, n_tok)) return false;
+    if (w->type == DS4_TENSOR_HT4) {
+        /* whole 128-row bands: a draft head prefix rounds down to a band */
+        const uint64_t rows_ht = out_dim / 128u * 128u;
+        if (!rows_ht || in_dim > UINT32_MAX || rows_ht > UINT32_MAX) return false;
+        return ds4_gpu_qwen4_ht4_mm_tensor(out, x, m->map, m->size, w->abs_offset, w->ht_su->abs_offset,
+                                           w->ht_sv->abs_offset,
+                                           w->ht_rperm ? w->ht_rperm->abs_offset : UINT64_MAX,
+                                           w->ht_cperm ? w->ht_cperm->abs_offset : UINT64_MAX,
+                                           n_tok, (uint32_t)in_dim, (uint32_t)rows_ht) != 0;
+    }
 #endif
     if (in_dim <= UINT32_MAX && out_dim <= UINT32_MAX)
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset,
@@ -60779,6 +60831,34 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
  * kernels; DS4_QWEN4_NO_FUSE=1 forces the prefill kernels for A/B checks.
  * T = 3 uses them for the speculative verify only, so prefill tails of three
  * tokens keep their historical kernel selection. */
+/* n HT4 projections of the same x in one launch when they share the input
+ * vector su (halogen gives one to GDN qkv and z, and one to the attention
+ * q, k, v and indexer projections of a layer); false when they cannot, so
+ * the caller runs them one by one. */
+static bool qwen4_ht4_group(const ds4_model *m, const ds4_tensor *const *ws, ds4_gpu_tensor *const *outs,
+                            uint32_t n, const ds4_gpu_tensor *x, uint32_t T) {
+#ifdef DS4_ROCM_BUILD
+    if (n < 2 || n > 6) return false;
+    uint64_t w_offs[6], sv_offs[6], rp_offs[6];
+    uint32_t rows[6];
+    for (uint32_t i = 0; i < n; i++) {
+        const ds4_tensor *w = ws[i];
+        if (!w || w->type != DS4_TENSOR_HT4 || w->ht_cperm || w->dim[0] != ws[0]->dim[0] ||
+            memcmp((const char *)m->map + w->ht_su->abs_offset, (const char *)m->map + ws[0]->ht_su->abs_offset,
+                   w->ht_su->bytes) != 0) return false;
+        w_offs[i] = w->abs_offset;
+        sv_offs[i] = w->ht_sv->abs_offset;
+        rp_offs[i] = w->ht_rperm ? w->ht_rperm->abs_offset : UINT64_MAX;
+        rows[i] = (uint32_t)w->dim[1];
+    }
+    return ds4_gpu_qwen4_ht4_multi_tensor(x, T, (uint32_t)ws[0]->dim[0], n, outs, m->map, m->size,
+                                          ws[0]->ht_su->abs_offset, w_offs, sv_offs, rp_offs, rows) != 0;
+#else
+    (void)m; (void)ws; (void)outs; (void)n; (void)x; (void)T;
+    return false;
+#endif
+}
+
 /* DS4_GPU_TRACE=1 marks on ROCm: the label names the work enqueued since the
  * previous mark, bytes the weights it reads (0 when not meaningful). */
 /* DS4_QWEN4_OP_HASH_POS=P (debug): at every mark of the forward that starts
@@ -60935,7 +61015,10 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
             l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
             l->lin_qkv->dim[1], l->lin_gate->dim[1], g->mixed, T) != 0;
     }
-    if (!paired && !(qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) &&
+    const ds4_tensor *gdn_in[2] = { l->lin_qkv, l->lin_gate };
+    ds4_gpu_tensor *gdn_out[2] = { g->qkv, g->z };
+    if (!paired && !qwen4_ht4_group(m, gdn_in, gdn_out, 2u, g->mixed, T) &&
+        !(qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) &&
           qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T))) {
         return false;
     }
@@ -61093,8 +61176,14 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
 static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                   uint32_t il, uint32_t pos0, uint32_t T) {
     {
-        bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
-        if (ok && qwen4_graph_fused(g, T)) {
+        const ds4_tensor *att_in[5] = { l->attn_q, l->attn_k, l->attn_v, l->indexer_q_proj, l->indexer_k_proj };
+        ds4_gpu_tensor *att_out[5] = { g->qg, g->kp, g->vp, g->iq, g->ik };
+        const bool grouped = qwen4_ht4_group(m, att_in, att_out, 5u, g->mixed, T);
+        bool ok = grouped || qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
+        const bool any_ht4 = l->attn_k->type == DS4_TENSOR_HT4 || l->attn_v->type == DS4_TENSOR_HT4 ||
+                             l->indexer_q_proj->type == DS4_TENSOR_HT4 || l->indexer_k_proj->type == DS4_TENSOR_HT4;
+        if (grouped) {
+        } else if (ok && qwen4_graph_fused(g, T) && !any_ht4) {
             ds4_gpu_tensor *outs[4] = { g->kp, g->vp, g->iq, g->ik };
             const uint64_t offs[4] = { l->attn_k->abs_offset, l->attn_v->abs_offset,
                                        l->indexer_q_proj->abs_offset, l->indexer_k_proj->abs_offset };
