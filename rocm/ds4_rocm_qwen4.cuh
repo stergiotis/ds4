@@ -483,10 +483,10 @@ static uint64_t expert_row_bytes(unsigned type, unsigned K) {
     return row_bytes(type, type == 10 ? ((uint64_t)K + 255) / 256 * 256 : K);
 }
 
-__global__ void router(int *selected, float *weights, const float *logits,
+__device__ __forceinline__ void router_token(unsigned t, int *selected, float *weights, const float *logits,
         const float *x, const char *gate, float *shared_gate,
         unsigned NE, unsigned NS, unsigned K, unsigned type) {
-    const unsigned t = blockIdx.x, tid = threadIdx.x;
+    const unsigned tid = threadIdx.x;
     __shared__ float p[512], maxima[256], red[32];
     __shared__ unsigned ids[256];
     float mx = -FLT_MAX;
@@ -566,6 +566,57 @@ __global__ void router(int *selected, float *weights, const float *logits,
     }
     __syncthreads();
     if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
+}
+
+__global__ void router(int *selected, float *weights, const float *logits,
+        const float *x, const char *gate, float *shared_gate,
+        unsigned NE, unsigned NS, unsigned K, unsigned type) {
+    router_token(blockIdx.x, selected, weights, logits, x, gate, shared_gate, NE, NS, K, type);
+}
+
+/* BF16 router logits (matvec_bf16's per-row arithmetic, eight rows per
+ * block) and the top-k in one launch: the last block to finish reads the
+ * logits and runs router_token for every token. */
+template<unsigned T>
+__global__ __launch_bounds__(256) void router_fused(int *selected, float *weights, float *logits,
+        const char *rw, uint64_t rstride, const float *x, const char *gate, float *shared_gate,
+        unsigned *counter, unsigned NE, unsigned NS, unsigned K, unsigned type) {
+    const unsigned row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    __shared__ unsigned ticket;
+    if (row < NE) {
+        const char *r = rw + (uint64_t)row * rstride;
+        float acc[T];
+        #pragma unroll
+        for (unsigned t = 0; t < T; t++) acc[t] = 0;
+        for (unsigned i = lane * 8; i < K; i += 256) {
+            const uint4 q = *(const uint4 *)(r + (uint64_t)i * 2);
+            const float w0 = __uint_as_float(q.x << 16), w1 = __uint_as_float(q.x & 0xffff0000u);
+            const float w2 = __uint_as_float(q.y << 16), w3 = __uint_as_float(q.y & 0xffff0000u);
+            const float w4 = __uint_as_float(q.z << 16), w5 = __uint_as_float(q.z & 0xffff0000u);
+            const float w6 = __uint_as_float(q.w << 16), w7 = __uint_as_float(q.w & 0xffff0000u);
+            #pragma unroll
+            for (unsigned t = 0; t < T; t++) {
+                const float4 a = *(const float4 *)(x + (uint64_t)t * K + i), b = *(const float4 *)(x + (uint64_t)t * K + i + 4);
+                acc[t] += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+            }
+        }
+        #pragma unroll
+        for (unsigned t = 0; t < T; t++) {
+            const float v = sum(acc[t]);
+            if (!lane) logits[(uint64_t)t * NE + row] = v;
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (!threadIdx.x) ticket = atomicAdd(counter, 1u);
+    __syncthreads();
+    if (ticket != gridDim.x - 1) return;
+    __threadfence();
+    for (unsigned t = 0; t < T; t++) {
+        router_token(t, selected, weights, logits, x, gate, shared_gate, NE, NS, K, type);
+        __syncthreads();
+    }
+    if (!threadIdx.x) *counter = 0;
 }
 
 template<unsigned TYPE, bool DOWN>
@@ -3516,6 +3567,28 @@ extern "C" int ds4_gpu_qwen4_q8_pair_tensor(ds4_gpu_tensor *o0, ds4_gpu_tensor *
     if ((M0 & 1) || (M1 & 1)) return 0;
     return ds4_gpu_qwen4_matmul_q8_0_tensor(o0, map, size, w0, K, M0, x, T) &&
            ds4_gpu_qwen4_matmul_q8_0_tensor(o1, map, size, w1, K, M1, x, T);
+}
+
+/* BF16 router matvec and top-k in one launch (T <= 3, K % 256 == 0, NE % 8 == 0) */
+extern "C" int ds4_gpu_qwen4_router_fused_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size, uint64_t rw_off,
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS) {
+    using namespace qwen4_rocm;
+    static unsigned *counter;
+    if (!T || T > 3 || !NE || NE > 512 || NE % 8 || !NS || NS > NE || NS > 32 || !K || K % 256 ||
+        !tensor(sel, (uint64_t)T*NS*4) || !tensor(weights, (uint64_t)T*NS*4) || !tensor(logits, (uint64_t)T*NE*4) ||
+        !tensor(x, (uint64_t)T*K*4) || !tensor(sg, (uint64_t)T*4)) return 0;
+    const char *rw = weight(map, size, rw_off, (uint64_t)NE*K*2);
+    const char *wg = weight(map, size, off, row_bytes(type, K));
+    if (!rw || !wg || ((uintptr_t)rw & 15) || ((uintptr_t)x->ptr & 15)) return 0;
+    if (!counter && (cudaMalloc((void **)&counter, 4) != cudaSuccess || cudaMemset(counter, 0, 4) != cudaSuccess)) {
+        counter = NULL; return 0;
+    }
+#define QWEN_RF(TV) router_fused<TV><<<NE / 8, 256, 0, 0>>>((int *)sel->ptr, (float *)weights->ptr, \
+        (float *)logits->ptr, rw, (uint64_t)K * 2, (const float *)x->ptr, wg, (float *)sg->ptr, counter, NE, NS, K, type)
+    if (T == 1) { QWEN_RF(1); } else if (T == 2) { QWEN_RF(2); } else { QWEN_RF(3); }
+#undef QWEN_RF
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,

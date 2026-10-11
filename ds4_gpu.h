@@ -3651,6 +3651,12 @@ int ds4_gpu_qwen4_ht4_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 int ds4_gpu_qwen4_ht4_multi_tensor(const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size, uint64_t su_off,
         const uint64_t *w_offs, const uint64_t *sv_offs, const uint64_t *rperm_offs, const uint32_t *rows);
+/* BF16 router matvec (router_off) and top-k (with the shared gate at off) in
+ * one launch, T <= 3 */
+int ds4_gpu_qwen4_router_fused_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t router_off, uint64_t off, uint32_t type, uint32_t in_dim, ds4_gpu_tensor *shared_gate,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used);
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,

@@ -61266,7 +61266,19 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
-    bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
+    bool ok;
+#ifdef DS4_ROCM_BUILD
+    if (T == 1u && l->ffn_gate_inp->type == DS4_TENSOR_BF16 && !qwen4_imatrix_path()) {
+        /* single tokens: router matvec and top-k in one launch (verify rows
+         * keep two launches: one block would run their top-k in turn) */
+        ok = ds4_gpu_qwen4_router_fused_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
+                                               l->ffn_gate_inp->abs_offset, l->ffn_gate_inp_shexp->abs_offset,
+                                               l->ffn_gate_inp_shexp->type, DS4_N_EMBD, g->sh_gate_logit, T,
+                                               DS4_N_EXPERT, DS4_N_EXPERT_USED) != 0 &&
+             qwen4_mark("router (fused)", l->ffn_gate_inp->bytes + l->ffn_gate_inp_shexp->bytes);
+    } else
+#endif
+    ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
               qwen4_mark("router matvec", l->ffn_gate_inp->bytes) &&
               ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
