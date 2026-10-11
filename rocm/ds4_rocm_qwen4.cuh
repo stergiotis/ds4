@@ -6,6 +6,17 @@
 #include "../ds4_qwen4_vision.h"
 #include <hip/hip_bfloat16.h>
 
+/* Decode and verify kernels must round the same way whatever the row count
+ * T: an MTP verify row has to match plain decode bit for bit, or greedy
+ * output depends on the drafts.  Under fast math the compiler reassociates
+ * and fuses differently per template instance (a T = 2 instance shares a
+ * block's d * scale across tokens), so this file keeps each expression's
+ * order and fuses only within an expression.  DS4_QWEN4_FP_FAST builds
+ * with fast math as before. */
+#ifndef DS4_QWEN4_FP_FAST
+#pragma clang fp reassociate(off) contract(on)
+#endif
+
 namespace qwen4_rocm {
 
 __device__ __forceinline__ float qwen_f16_to_f32(uint16_t bits) {
@@ -1036,14 +1047,17 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4_q8(float *out, const float
             }
             #pragma unroll
             for (unsigned i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(v[i]));
-            const float inv = amax > 0 ? 127.0f / amax : 0.0f;
-            dx[p] = amax / 127.0f;
+            /* explicitly rounded, so fast math cannot reassociate them
+             * differently for different slots p: a pair computed in slot p
+             * of a verify block must match its own block in plain decode */
+            const float inv = amax > 0 ? __fdiv_rn(127.0f, amax) : 0.0f;
+            dx[p] = __fdiv_rn(amax, 127.0f);
             #pragma unroll
             for (unsigned k = 0; k < 8; k++) {
                 unsigned word = 0;
                 #pragma unroll
                 for (unsigned j = 0; j < 4; j++)
-                    word |= ((unsigned)__float2int_rn(v[k * 4 + j] * inv) & 255u) << (8 * j);
+                    word |= ((unsigned)__float2int_rn(__fmul_rn(v[k * 4 + j], inv)) & 255u) << (8 * j);
                 xq[p][k] = (int)word;
             }
         }
@@ -1076,7 +1090,7 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4_q8(float *out, const float
         #pragma unroll
         for (unsigned p = 0; p < NT; p++) {
             if (p < n) {
-                const float acc = sum(lane < NB ? (float)sumi[p] * (scale * dx[p]) : 0.0f);
+                const float acc = sum(lane < NB ? __fmul_rn(__int2float_rn(sumi[p]), __fmul_rn(scale, dx[p])) : 0.0f);
                 if (!lane) out[pairs[p] * M + row] = acc;
             }
         }
@@ -1103,9 +1117,11 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
     if (mxfp4_q8 < 0) mxfp4_q8 = !getenv("DS4_QWEN4_MXFP4_Q8") || atoi(getenv("DS4_QWEN4_MXFP4_Q8")) != 0;
     if (!mxfp4_old && mxfp4_q8 && down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
         M % 16 == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
+        /* one instance for every T: under fast math a separate one-token
+         * instance may round the scales differently, and verify rows would
+         * no longer match plain decode */
         const dim3 grid(M / 16, NS + 1, T);
-        if (T == 1) moe_down_mxfp4_q8<1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-        else moe_down_mxfp4_q8<3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+        moe_down_mxfp4_q8<3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
         return launched();
     }
     if (!mxfp4_old && mxfp4_rows && down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
@@ -2109,8 +2125,18 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
             else matvec_prefetch<8,4,1,false,2,4><<<(M+1)/2,32,0,0>>>(out,w,x,T,K,M,stride);
             return launched();
         }
-        if (type == 8 && T > 1 && ((K == 2560 && (M == 128 || M == 512 || M == 6144 || M == 10240 || M == 12288)) || ((K == 6144 || K == 5120) && M == 2560))) {
-            if (T == 2) matvec_prefetch<8,2,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
+        /* T-invariant Q8_0: one kernel family for every T, so verify rows
+         * match plain decode.  DS4_QWEN4_Q8_INVARIANT=prefetch runs these
+         * shapes on matvec_prefetch for T = 1 too, =off restores the split
+         * (matvec_q8 for one token, matvec_prefetch for 2-3) */
+        static int q8_inv = -1;
+        if (q8_inv < 0) {
+            const char *e = getenv("DS4_QWEN4_Q8_INVARIANT");
+            q8_inv = !e || !strcmp(e, "q8") ? 1 : !strcmp(e, "prefetch") ? 2 : 0;
+        }
+        if (type == 8 && (T > 1 || q8_inv == 2) && q8_inv != 1 &&
+            ((K == 2560 && (M == 128 || M == 512 || M == 6144 || M == 10240 || M == 12288)) || ((K == 6144 || K == 5120) && M == 2560))) {
+            if (T <= 2) matvec_prefetch<8,2,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
             else matvec_prefetch<8,4,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
             return launched();
         }
@@ -2936,13 +2962,17 @@ __global__ void hc_rows(float *dst, const float *up, const float *xn, unsigned E
 
 namespace qwen4_rocm {
 
-/* Single-token alpha and beta projections of a GDN layer (F32, K % 512 ==
- * 0) in one launch: block r < M is alpha row r, the rest beta rows; 128
- * threads split K, then a fixed-order block reduction. */
+/* Alpha and beta projections of a GDN layer (F32, K % 512 == 0) for 1-3
+ * tokens in one launch: block r < M is alpha row r, the rest beta rows,
+ * blockIdx.y the token; 128 threads split K, then a fixed-order block
+ * reduction, the same for every token count. */
 __global__ __launch_bounds__(128) void gdn_gates_f32(float *ga, float *gb, const float *wa, const float *wb,
                                                      const float *x, unsigned K, unsigned M) {
-    const unsigned r = blockIdx.x % M, tid = threadIdx.x;
+    const unsigned r = blockIdx.x % M, tid = threadIdx.x, t = blockIdx.y;
     const float *w = (blockIdx.x < M ? wa : wb) + (uint64_t)r * K;
+    x += (uint64_t)t * K;
+    ga += (uint64_t)t * M;
+    gb += (uint64_t)t * M;
     float acc = 0;
     for (unsigned i = tid * 4; i < K; i += 512) {
         const float4 a = *(const float4 *)(w + i), v = *(const float4 *)(x + i);
@@ -3560,11 +3590,11 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
     static int gates_old = -1;
     if (gates_old < 0) gates_old = getenv("DS4_QWEN4_GDN_GATES_OLD") != NULL;
     if (!w) return 0;
-    const char *wa = T == 1 && type == 0 && !(K % 512) && !gates_old ? weight(map,size,ao,(uint64_t)K*Hv*4) : NULL;
+    const char *wa = T <= 3 && type == 0 && !(K % 512) && !gates_old ? weight(map,size,ao,(uint64_t)K*Hv*4) : NULL;
     const char *wb = wa ? weight(map,size,bo,(uint64_t)K*Hv*4) : NULL;
     if (wa && wb && !(((uintptr_t)wa | (uintptr_t)wb | (uintptr_t)mixed->ptr) & 15) &&
-        tensor(ga,(uint64_t)Hv*4) && tensor(gb,(uint64_t)Hv*4) && tensor(mixed,(uint64_t)K*4)) {
-        gdn_gates_f32<<<2*Hv,128,0,0>>>((float *)ga->ptr,(float *)gb->ptr,(const float *)wa,(const float *)wb,
+        tensor(ga,(uint64_t)T*Hv*4) && tensor(gb,(uint64_t)T*Hv*4) && tensor(mixed,(uint64_t)T*K*4)) {
+        gdn_gates_f32<<<dim3(2*Hv,T),128,0,0>>>((float *)ga->ptr,(float *)gb->ptr,(const float *)wa,(const float *)wb,
                                         (const float *)mixed->ptr,K,Hv);
         if (!launched()) return 0;
     } else if (!ds4_gpu_qwen4_dense_mm_tensor(ga,mixed,map,size,ao,type,T,K,Hv) ||
@@ -3707,7 +3737,11 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         !tensor(out, n) || !tensor(q, n) || !tensor(gate, n) || !tensor(kc, cb) || !tensor(vc, cb) ||
         (sparse && (!stride || !tensor(sel, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4)))) return 0;
     const unsigned keys = sparse ? stride : pos0 + T;
-    const unsigned splits = partial ? std::min(64u, (keys + 31) / 32) : 1;
+    /* fixed 32-key splits (wider only past 2048 keys): split boundaries that
+     * depend on keys = pos0 + T would give a verify row other partial sums
+     * than the same row in plain decode */
+    const unsigned per = !partial ? keys : keys <= 64u * 32u ? 32u : (keys + 63u) / 64u;
+    const unsigned splits = partial ? (keys + per - 1u) / per : 1u;
     if (partial && !tensor(partial, (uint64_t)T * H * splits * (D + 2) * 4)) return 0;
     // Preserve the quality-mode and narrow-token paths. The mask scratch is
     // consumed on the same stream before the existing temporary arena is reused.
@@ -3734,7 +3768,7 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
 #define QWEN_ATTN(DIM) attention<DIM><<<grid, 128, 0, 0>>>((float *)out->ptr, \
         partial ? (float *)partial->ptr : NULL, (const float *)q->ptr, (const float *)gate->ptr, \
         (const __half *)kc->ptr, (const __half *)vc->ptr, sparse ? (const int *)sel->ptr : NULL, \
-        sparse ? (const unsigned *)count->ptr : NULL, H, Hkv, pos0, stride, sparse, splits, (keys + splits - 1) / splits, scale)
+        sparse ? (const unsigned *)count->ptr : NULL, H, Hkv, pos0, stride, sparse, splits, per, scale)
     if (D == 32) { QWEN_ATTN(32); }
     else if (D == 128) { QWEN_ATTN(128); }
     else { QWEN_ATTN(256); }
@@ -3744,3 +3778,8 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         (const float *)partial->ptr, (const float *)gate->ptr, H, D, splits);
     return launched();
 }
+
+#ifndef DS4_QWEN4_FP_FAST
+/* back to the fast-math defaults for the files included after this one */
+#pragma clang fp reassociate(on) contract(fast)
+#endif
