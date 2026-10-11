@@ -540,10 +540,16 @@ the whole stream per block, so the 11-expert sum runs 8x over in 32 blocks);
 a vectorized hc_norm with merged reductions (-0.05 ms, noise). Lesson: on
 this GPU a dependent kernel costs ~10-16 us however little it does, and the
 summed kernel time equals wall time, so the floor is per kernel, not launch
-gaps. ~660 kernels per token. The next real win removes kernels outright:
-fold the hc norm into hc down (per-stream partial dots of gamma*R, the four
-inject rows as extra output rows, inv_s applied by the consumers) would drop
-97 kernels (~1.5 ms).
+gaps. ~660 kernels per token. Folding the hc norm into hc down (per-stream partial dots of gamma*R
+and x*x, the four inject rows as two extra blocks, each block writing its
+share of xn, the residual combine folded in on the FFN side) was built and
+rejected: plain 29.24 -> 29.07 ms but 3-row verify 42.8 -> 44.1 ms (the
+folded kernel takes 38 us at T=1 vs ~39 for norm + down, 51-57 us at T=3 vs
+~40). A static-stream variant at 320 threads was far worse (132 us at T=3,
+register spills). So the ~16 us of a small reduction kernel is mostly its
+own dependent-reduction latency, which comes back inside a fused kernel;
+fusion pays only where the second kernel needs no new reduction (as with
+combine + norm and router + top-k).
 
 **halogen's 6-bit hc (q6g64) costs quality (2026-10-11).** `--hgn-hc`
 (decoded, stored F16) on top of V3 + HT4: ppl x1.0151, KL 0.054 against the
