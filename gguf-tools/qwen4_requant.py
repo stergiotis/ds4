@@ -31,6 +31,9 @@ output unchanged as ds4 type HT4 (210), with their F16 rotation vectors as
 NAME.suh / NAME.svh and, for the GDN projections, I32 NAME.rperm / NAME.cperm
 mapping halogen's grouped value heads to GGUF's tiled order.
 
+--hgn-hc FILE takes the hyper-connection matrices (q6g64) from a halogen v2
+checkpoint, decoded and stored as F16, to measure their quality in ds4.
+
   qwen4_requant.py --model Q4.gguf --output out.gguf \\
       --set 'blk.*.hc_*.weight=q8_0' --set 'blk.*.ffn_gate_inp.weight=bf16' [--simulate]
 """
@@ -273,9 +276,24 @@ def requant(args):
             return v if rows is None or which == 'suh' else v[rows[0] * 2:rows[1] * 2]
         g2t = hmap.G2T
         print(f'{len(native)} tensors as HT4 from {args.hgn_ht4}', flush=True)
+    hc_over = {}
+    if args.hgn_hc:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'strix' / 'hgn'))
+        import hgn, hmap
+        hct, _ = hgn.table(args.hgn_hc)
+        hc_over = hmap.hc_overrides(hct)
+        print(f'{len(hc_over)} hyper-connection matrices from {args.hgn_hc} (F16)', flush=True)
     plan, offset = [], 0
     for name, (kind, dims, old) in model.tensors.items():
         if name == NGRAM:
+            continue
+        if name in hc_over:
+            def hc_bytes(hname=hc_over[name]):
+                e = hct[hname]; N, K = e['shape']
+                return hmap.q6g64_decode(bytes(hgn.payload(args.hgn_hc, e)), N, K).astype('<f2').tobytes()
+            size = nbytes(F16, dims)
+            plan.append((name, kind, dims, old, F16, None, offset, size, hc_bytes))
+            offset = align(offset + size)
             continue
         if name in native:
             base, fix, rows = native[name]
@@ -374,6 +392,7 @@ def main():
     parser.add_argument('--imatrix')
     parser.add_argument('--hgn')
     parser.add_argument('--hgn-ht4')
+    parser.add_argument('--hgn-hc')
     parser.add_argument('--lib', default=Path(__file__).resolve().with_name('libds4quants.so'))
     args = parser.parse_args()
     try:

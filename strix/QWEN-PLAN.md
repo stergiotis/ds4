@@ -530,6 +530,11 @@ own in-tile order. Tiles can be reordered losslessly, values inside a tile
 cannot (the trellis state runs in stream order), so EXL3 files would need
 a kernel variant for EXL3's in-tile order rather than a byte repack.
 
+**halogen's 6-bit hc (q6g64) costs quality (2026-10-11).** `--hgn-hc`
+(decoded, stored F16) on top of V3 + HT4: ppl x1.0151, KL 0.054 against the
+reference (V3 + HT4: x1.0085, 0.047), for ~0.16 GB/token. Parked behind the
+routed experts.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.

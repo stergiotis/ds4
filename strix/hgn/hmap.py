@@ -48,3 +48,27 @@ def gguf_overrides(t, n_layers=48, attn_every=4):
             out[f'blk.{L}.indexer.k_proj.weight'] = (f'layers.{L}.self_attn.indexer.index_qk_proj', None, (512, 640))
     out['output.weight'] = ('lm_head', None, None)
     return {k: v for k, v in out.items() if v[0] + '.weight' in t}
+
+
+def q6g64_decode(payload, N, K):
+    """values [N, K] of a q6g64 matrix (hgn-spec STORAGE.md)"""
+    S = (13 * K // 16 + 15) // 16 * 16
+    rows = np.frombuffer(payload, np.uint8, count=N * S).reshape(N, S)
+    lo = rows[:, :K // 2]
+    low = np.empty((N, K), np.uint8); low[:, 0::2] = lo & 15; low[:, 1::2] = lo >> 4
+    hb = rows[:, K // 2:3 * K // 4]
+    high = np.stack([(hb >> (2 * j)) & 3 for j in range(4)], axis=2).reshape(N, K)
+    rec = rows[:, 3 * K // 4:13 * K // 16].copy().view('<f2').reshape(N, K // 64, 2).astype(np.float32)
+    c = (low | (high << 4)).astype(np.float32).reshape(N, K // 64, 64)
+    return (c * rec[:, :, :1] + rec[:, :, 1:]).reshape(N, K)
+
+def hc_overrides(t, n_layers=48):
+    """{gguf name: hgn name} for the q6g64 hyper-connection matrices of the trunk and the final mixer"""
+    out = {}
+    for L in range(n_layers):
+        for side, g in (('attn', 'attn'), ('mlp', 'ffn')):
+            out[f'blk.{L}.hc_{g}_down.weight'] = f'layers.{L}.{side}_hyper_connection.input_mix_weight_down.weight'
+            out[f'blk.{L}.hc_{g}_up.weight'] = f'layers.{L}.{side}_hyper_connection.input_mix_weight_up.weight'
+    out['output_hc_down.weight'] = 'hyper_connection_mixer.input_mix_weight_down.weight'
+    out['output_hc_up.weight'] = 'hyper_connection_mixer.input_mix_weight_up.weight'
+    return {k: v for k, v in out.items() if v in t and t[v]['store'] == 24}
