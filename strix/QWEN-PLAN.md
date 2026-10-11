@@ -454,6 +454,29 @@ are published (Hugging Face card: Apache-2.0, derived from the Qwen
 licence); the spec describes formats only, so reading HGN payloads with our
 own kernels stays within the "do not port halogen's kernels" courtesy.
 
+**Cheaper speculation rows: what did not pay (2026-10-11).**
+- Draft vocabulary prefix (`DS4_QWEN4_MTP_DRAFT_ROWS=65536`): the head drops
+  from 1.6 to 0.35 ms per draft, but greedy text needs 8% more verify cycles.
+  The prefix covers 98.35% of held-out generated tokens and a frequency list
+  98.64% (`~/.local/share/ds4/qwen-prof/step2/vocab`), so a gathered head
+  would not do better; each miss is a rejection that also resets the depth
+  window.
+- Prompt lookup replacing the predictor's drafts (match of n tokens): API
+  mean at temperature 1.0 46.5 (off) -> 42.4 (n = 2), 44.4 (n = 3), 46.9
+  (n = 4); greedy 49.2 -> 47.1 (n = 3). On reasoning text the matches are
+  often wrong continuations. Removed.
+- Expert gate/up variants: int8 activations (169 vs 178 GB/s), 4 rows per
+  wave (137), next-block prefetch (167). The kernel stays at ~177 GB/s; the
+  output head reaches 223 GB/s with the same lane layout on one long matrix.
+- Draft step: the MTP eh projection took 0.59 ms (rows past 8 read the matrix
+  once per row); fixed to 0.42 ms (93d8cd9). The head (1.6 ms) is at
+  bandwidth.
+
+A 2-row verify now costs +6.1 ms over plain decode, +4.9 of it routed
+experts (gate/up 1.59x, down 1.44x); dense work is +1.1 ms. The remaining
+per-row gap to halogen is mostly expert bytes and expert read rate, which
+is a format question (section on halogen's formats).
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.
