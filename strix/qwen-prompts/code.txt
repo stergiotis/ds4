@@ -1,0 +1,1 @@
+Write a Go function that parses semantic version strings and explain the edge cases.

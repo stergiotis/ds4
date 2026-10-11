@@ -1,0 +1,1 @@
+A train leaves at 9:40 and travels 315 km at an average speed of 84 km/h, then stops for 25 minutes and travels another 140 km at 70 km/h. When does it arrive? Show the steps.

@@ -11,11 +11,8 @@
  * output depends on the drafts.  Under fast math the compiler reassociates
  * and fuses differently per template instance (a T = 2 instance shares a
  * block's d * scale across tokens), so this file keeps each expression's
- * order and fuses only within an expression.  DS4_QWEN4_FP_FAST builds
- * with fast math as before. */
-#ifndef DS4_QWEN4_FP_FAST
+ * order and fuses only within an expression. */
 #pragma clang fp reassociate(off) contract(on)
-#endif
 
 namespace qwen4_rocm {
 
@@ -486,7 +483,6 @@ static uint64_t expert_row_bytes(unsigned type, unsigned K) {
     return row_bytes(type, type == 10 ? ((uint64_t)K + 255) / 256 * 256 : K);
 }
 
-template<bool WAVE>
 __global__ void router(int *selected, float *weights, const float *logits,
         const float *x, const char *gate, float *shared_gate,
         unsigned NE, unsigned NS, unsigned K, unsigned type) {
@@ -513,10 +509,10 @@ __global__ void router(int *selected, float *weights, const float *logits,
         if (!tid) shared_gate[t] = v;
     }
     __syncthreads();
-    if (WAVE && NE == 512 && NS <= 32) {
+    if (NE == 512 && NS <= 32) {
         /* one wave picks the top NS from registers (16 per lane) with
          * shuffles: the same order and ties (lower id) as the block loop
-         * below, without its ~90 barriers */
+         * below (other shapes), without its ~90 barriers */
         if (tid < 32) {
             float v[16];
             #pragma unroll
@@ -690,178 +686,21 @@ __global__ void moe_mv_reuse(float*out,const float*x,const int*selected,const ch
  }
 }
 
-/* Single-token MXFP4 down projection, K = 640 (20 blocks of 32 values).
- * Lane b < 20 owns block b of every row: it keeps its 32 x values in
- * registers and reads the block's 17 bytes (E8M0 scale, 16 nibble bytes:
- * low nibbles are values 0..15, high nibbles 16..31) as five aligned words,
- * which may read up to 3 bytes past the block.  Each wave does OR rows and
- * one wave sum per row.  Slot NS is the Q8_0 shared expert. */
+/* MXFP4 level of a nibble: E2M1 magnitude, bit 3 the sign. */
 __device__ __forceinline__ float mxfp4_level(unsigned q) {
     const unsigned mag = q & 7;
     const float l = mag < 2 ? .5f * mag : __uint_as_float(((mag / 2 + 126) << 23) | ((mag & 1) << 22));
     return q & 8 ? -l : l;
 }
 
-template<unsigned OR>
-__global__ __launch_bounds__(128) void moe_down_mxfp4(float *out, const float *x, const int *selected,
-        const char *w, const char *sh, unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb) {
-    constexpr unsigned K = 640, NB = 20;
-    const unsigned lane = threadIdx.x & 31, row0 = (blockIdx.x * 4 + threadIdx.x / 32) * OR;
-    const unsigned slot = blockIdx.y, t = blockIdx.z;
-    const uint64_t pair = (uint64_t)t * (NS + 1) + slot;
-    const float *xt = x + pair * K;
-    if (slot == NS) {
-        #pragma unroll
-        for (unsigned r = 0; r < OR; r++) {
-            const unsigned row = row0 + r;
-            if (row >= M) return;
-            const float a = dot_q8_vec(sh + row * srb, xt, K);
-            if (!lane) out[pair * M + row] = a;
-        }
-        return;
-    }
-    const int e = selected[(uint64_t)t * NS + slot];
-    const bool valid = e >= 0 && (unsigned)e < NE;
-    float xv[32];
-    if (lane < NB) {
-        #pragma unroll
-        for (unsigned k = 0; k < 8; k++) {
-            const float4 v = *(const float4 *)(xt + lane * 32 + k * 4);
-            xv[k * 4] = v.x; xv[k * 4 + 1] = v.y; xv[k * 4 + 2] = v.z; xv[k * 4 + 3] = v.w;
-        }
-    }
-    #pragma unroll
-    for (unsigned r = 0; r < OR; r++) {
-        const unsigned row = row0 + r;
-        if (row >= M) return;
-        float acc = 0;
-        if (valid && lane < NB) {
-            const uintptr_t a = (uintptr_t)(w + ((uint64_t)e * M + row) * rb + lane * 17);
-            const unsigned o = (unsigned)(a & 3);
-            const unsigned *p = (const unsigned *)(a - o);
-            unsigned wd[5];
-            #pragma unroll
-            for (unsigned i = 0; i < 5; i++) wd[i] = p[i];
-            const unsigned sb = (wd[0] >> (8 * o)) & 255;
-            const float scale = sb == 0 ? 0x1p-127f : __uint_as_float(sb << 23);
-            const unsigned q0 = (o + 1) >> 2, sh8 = 8 * ((o + 1) & 3);
-            #pragma unroll
-            for (unsigned k = 0; k < 4; k++) {
-                const unsigned nb = sh8 ? (wd[q0 + k] >> sh8) | (wd[q0 + k + 1] << (32 - sh8)) : wd[q0 + k];
-                #pragma unroll
-                for (unsigned j = 0; j < 4; j++) {
-                    const unsigned byte = (nb >> (8 * j)) & 255;
-                    acc += mxfp4_level(byte & 15) * xv[k * 4 + j] + mxfp4_level(byte >> 4) * xv[16 + k * 4 + j];
-                }
-            }
-            acc *= scale;
-        }
-        acc = sum(acc);
-        if (!lane) out[pair * M + row] = acc;
-    }
-}
-
-/* moe_down_mxfp4 for 2-3 tokens with each routed expert read once: the
- * block of the first token that selects an expert decodes each row's
- * weights once and dots them with the activations of every token that
- * selects it (held in registers); later tokens' blocks exit.  Each pair's
- * sum runs in moe_down_mxfp4's order, so results match it. */
-template<unsigned OR>
-__global__ __launch_bounds__(128) void moe_down_mxfp4_multi(float *out, const float *x, const int *selected,
-        const char *w, const char *sh, unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb, unsigned T) {
-    constexpr unsigned K = 640, NB = 20;
-    const unsigned lane = threadIdx.x & 31, row0 = (blockIdx.x * 4 + threadIdx.x / 32) * OR;
-    const unsigned slot = blockIdx.y, t0 = blockIdx.z;
-    const uint64_t pair0 = (uint64_t)t0 * (NS + 1) + slot;
-    if (slot == NS) {
-        const float *xt = x + pair0 * K;
-        #pragma unroll
-        for (unsigned r = 0; r < OR; r++) {
-            const unsigned row = row0 + r;
-            if (row >= M) return;
-            const float a = dot_q8_vec(sh + row * srb, xt, K);
-            if (!lane) out[pair0 * M + row] = a;
-        }
-        return;
-    }
-    const int e = selected[(uint64_t)t0 * NS + slot];
-    if (e < 0 || (unsigned)e >= NE) {
-        if (!lane) for (unsigned r = 0; r < OR; r++) if (row0 + r < M) out[pair0 * M + row0 + r] = 0;
-        return;
-    }
-    for (unsigned t = 0; t < t0; t++)
-        for (unsigned s = 0; s < NS; s++)
-            if (selected[(uint64_t)t * NS + s] == e) return;
-    uint64_t pairs[3] = {pair0, 0, 0};
-    unsigned n = 1;
-    for (unsigned t = t0 + 1; t < T && n < 3; t++)
-        for (unsigned s = 0; s < NS; s++)
-            if (selected[(uint64_t)t * NS + s] == e) { pairs[n++] = (uint64_t)t * (NS + 1) + s; break; }
-    float xv[3][32];
-    #pragma unroll
-    for (unsigned p = 0; p < 3; p++) {
-        if (p < n && lane < NB) {
-            const float *xt = x + pairs[p] * K;
-            #pragma unroll
-            for (unsigned k = 0; k < 8; k++) {
-                const float4 v = *(const float4 *)(xt + lane * 32 + k * 4);
-                xv[p][k * 4] = v.x; xv[p][k * 4 + 1] = v.y; xv[p][k * 4 + 2] = v.z; xv[p][k * 4 + 3] = v.w;
-            }
-        }
-    }
-    #pragma unroll
-    for (unsigned r = 0; r < OR; r++) {
-        const unsigned row = row0 + r;
-        if (row >= M) return;
-        float lv[32], scale = 0;
-        if (lane < NB) {
-            const uintptr_t a = (uintptr_t)(w + ((uint64_t)e * M + row) * rb + lane * 17);
-            const unsigned o = (unsigned)(a & 3);
-            const unsigned *pw = (const unsigned *)(a - o);
-            unsigned wd[5];
-            #pragma unroll
-            for (unsigned i = 0; i < 5; i++) wd[i] = pw[i];
-            const unsigned sb = (wd[0] >> (8 * o)) & 255;
-            scale = sb == 0 ? 0x1p-127f : __uint_as_float(sb << 23);
-            const unsigned q0 = (o + 1) >> 2, sh8 = 8 * ((o + 1) & 3);
-            #pragma unroll
-            for (unsigned k = 0; k < 4; k++) {
-                const unsigned nb = sh8 ? (wd[q0 + k] >> sh8) | (wd[q0 + k + 1] << (32 - sh8)) : wd[q0 + k];
-                #pragma unroll
-                for (unsigned j = 0; j < 4; j++) {
-                    const unsigned byte = (nb >> (8 * j)) & 255;
-                    lv[k * 4 + j] = mxfp4_level(byte & 15);
-                    lv[16 + k * 4 + j] = mxfp4_level(byte >> 4);
-                }
-            }
-        }
-        #pragma unroll
-        for (unsigned p = 0; p < 3; p++) {
-            if (p < n) {
-                float acc = 0;
-                if (lane < NB) {
-                    #pragma unroll
-                    for (unsigned k = 0; k < 4; k++) {
-                        #pragma unroll
-                        for (unsigned j = 0; j < 4; j++)
-                            acc += lv[k * 4 + j] * xv[p][k * 4 + j] + lv[16 + k * 4 + j] * xv[p][16 + k * 4 + j];
-                    }
-                    acc *= scale;
-                }
-                acc = sum(acc);
-                if (!lane) out[pairs[p] * M + row] = acc;
-            }
-        }
-    }
-}
-
-/* MXFP4 down, K = 640, for 1-3 tokens (NT = 1 for one token, 3 for a
- * verify): OR rows per wave, so x is loaded once per OR rows instead of
- * once per four, and the weight words of four rows are loaded before any is
- * decoded, so each lane keeps 20 loads in flight.  A verify reads each
- * routed expert once, from the block of the first token that selects it.
- * Each (pair, row) sum runs in moe_down_mxfp4's order, so results match it
- * bit for bit. */
+/* MXFP4 expert down, K = 640 (20 blocks of 32 values: an E8M0 scale and 16
+ * nibble bytes, low nibbles values 0..15, high 16..31), for 1-3 tokens.
+ * Lane b < 20 owns block b of every row, keeps its 32 x values in registers
+ * and reads the block's 17 bytes as five aligned words (up to 3 bytes past
+ * the block).  OR rows per wave; the weight words of four rows are loaded
+ * before any is decoded, picked by select so they stay in registers.  A
+ * verify reads each routed expert once, from the block of the first token
+ * that selects it.  Slot NS is the Q8_0 shared expert. */
 template<unsigned OR, unsigned NT>
 __global__ __launch_bounds__(128) void moe_down_mxfp4_rows(float *out, const float *x, const int *selected,
         const char *w, const char *sh, unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb, unsigned T) {
@@ -1101,55 +940,16 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
-    static int mxfp4_old = -1;
-    if (mxfp4_old < 0) mxfp4_old = getenv("DS4_QWEN4_MXFP4_OLD") != NULL;
-    /* DS4_QWEN4_MXFP4_ROWS: rows per wave of moe_down_mxfp4_rows (4, 8, 16;
-     * 0 keeps moe_down_mxfp4 and its multi-token form) */
-    static int mxfp4_rows = -1;
-    if (mxfp4_rows < 0) {
-        const char *v = getenv("DS4_QWEN4_MXFP4_ROWS");
-        mxfp4_rows = v && v[0] ? atoi(v) : 4;
-        if (mxfp4_rows != 0 && mxfp4_rows != 4 && mxfp4_rows != 8 && mxfp4_rows != 16) mxfp4_rows = 4;
-    }
-    /* moe_down_mxfp4_q8 (integer dots on int8 x) by default;
-     * DS4_QWEN4_MXFP4_Q8=0 keeps the float kernels below */
+    /* MXFP4 expert down for 1-3 tokens: integer dots on int8 x by default,
+     * DS4_QWEN4_MXFP4_Q8=0 the float kernel.  One instance serves every T,
+     * so verify rows match plain decode. */
     static int mxfp4_q8 = -1;
     if (mxfp4_q8 < 0) mxfp4_q8 = !getenv("DS4_QWEN4_MXFP4_Q8") || atoi(getenv("DS4_QWEN4_MXFP4_Q8")) != 0;
-    if (!mxfp4_old && mxfp4_q8 && down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
-        M % 16 == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
-        /* one instance for every T: under fast math a separate one-token
-         * instance may round the scales differently, and verify rows would
-         * no longer match plain decode */
-        const dim3 grid(M / 16, NS + 1, T);
-        moe_down_mxfp4_q8<3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-        return launched();
-    }
-    if (!mxfp4_old && mxfp4_rows && down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
-        M % (4u * mxfp4_rows) == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
-        const dim3 grid(M / (4u * mxfp4_rows), NS + 1, T);
-        if (T == 1) {
-            if (mxfp4_rows == 4) moe_down_mxfp4_rows<4,1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-            else if (mxfp4_rows == 8) moe_down_mxfp4_rows<8,1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-            else moe_down_mxfp4_rows<16,1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-        } else {
-            if (mxfp4_rows == 4) moe_down_mxfp4_rows<4,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-            else if (mxfp4_rows == 8) moe_down_mxfp4_rows<8,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-            else moe_down_mxfp4_rows<16,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
-        }
-        return launched();
-    }
-    if (!mxfp4_old && down && T == 1 && type == 39 && st == 8 && K == 640 && M % 16 == 0 &&
-        !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
-        const dim3 grid(M / 16, NS + 1, 1);
-        moe_down_mxfp4<4><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb);
-        return launched();
-    }
-    static int multi_old = -1;
-    if (multi_old < 0) multi_old = getenv("DS4_QWEN4_MOE_MULTI_OLD") != NULL;
-    if (!mxfp4_old && !multi_old && down && T >= 2 && T <= 3 && type == 39 && st == 8 && K == 640 &&
+    if (down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
         M % 16 == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
         const dim3 grid(M / 16, NS + 1, T);
-        moe_down_mxfp4_multi<4><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+        if (mxfp4_q8) moe_down_mxfp4_q8<3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+        else moe_down_mxfp4_rows<4,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
         return launched();
     }
     if (ds4_rocm_is_gfx1151() && T >= 2 && T <= 3 && NS == 10 && NE == 512 && st == 8 && !((uintptr_t)x&15)) {
@@ -1697,7 +1497,7 @@ __global__ __launch_bounds__(128) void matvec_q4k(float *out, const char *w, con
  * not depend on T.  M % (4 * R) == 0. */
 template<unsigned KB, unsigned R, unsigned T>
 __global__ __launch_bounds__(128) void matvec_q4k_rows(float *out, const char *w, const float *x,
-        unsigned M, uint64_t stride, bool q4k_hoist) {
+        unsigned M, uint64_t stride) {
     constexpr unsigned K = KB * 256;
     const unsigned row0 = (blockIdx.x * 4 + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
     const unsigned c = lane / 8, o = (lane % 8) * 4;
@@ -1717,25 +1517,15 @@ __global__ __launch_bounds__(128) void matvec_q4k_rows(float *out, const char *w
             h[r] = *(const uint4 *)blk;
             q[r] = *(const unsigned *)(blk + 16 + c * 32 + o);
         }
-        if (q4k_hoist) {
-            q4k_dec dec[R];
+        q4k_dec dec[R];
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) dec[r] = q4k_decode(h[r], q[r], c);
+        #pragma unroll
+        for (unsigned t = 0; t < T; t++) {
+            const float *xt = x + t * K + b * 256 + c * 64 + o;
+            const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
             #pragma unroll
-            for (unsigned r = 0; r < R; r++) dec[r] = q4k_decode(h[r], q[r], c);
-            #pragma unroll
-            for (unsigned t = 0; t < T; t++) {
-                const float *xt = x + t * K + b * 256 + c * 64 + o;
-                const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
-                #pragma unroll
-                for (unsigned r = 0; r < R; r++) acc[t][r] += q4k_apply(dec[r], xa, xb);
-            }
-        } else {
-            #pragma unroll
-            for (unsigned t = 0; t < T; t++) {
-                const float *xt = x + t * K + b * 256 + c * 64 + o;
-                const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
-                #pragma unroll
-                for (unsigned r = 0; r < R; r++) acc[t][r] += q4k_block(h[r], q[r], xa, xb, c);
-            }
+            for (unsigned r = 0; r < R; r++) acc[t][r] += q4k_apply(dec[r], xa, xb);
         }
     }
     #pragma unroll
@@ -2054,26 +1844,19 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
-    static int q4k_dense_old = -1;
-    if (q4k_dense_old < 0) q4k_dense_old = getenv("DS4_QWEN4_Q4K_DENSE_OLD") != NULL;
-    if (type == 12 && T <= 3 && (K == 2560 || K == 6144 || K == 10240) && !q4k_dense_old &&
+    /* Decode and verify rows (T <= 3) take one kernel per tensor shape for
+     * every T, each token's sum in the same order, so verify rows match
+     * plain decode bit for bit. */
+    if (type == 12 && T <= 3 && (K == 2560 || K == 6144 || K == 10240) &&
         !((uintptr_t)x&15) && !((uintptr_t)w&15)) {
-        static int ch = -1, rows = -1;
-        if (ch < 0) { const char *e = getenv("DS4_QWEN4_Q4K_CH"); ch = e ? atoi(e) : 0; }
-        if (rows < 0) { const char *e = getenv("DS4_QWEN4_Q4K_ROWS"); rows = e ? atoi(e) : 4; }
-        /* DS4_QWEN4_Q4K_HOIST=0: multi-row verify decodes each block per token */
-        static int hoist = -1;
-        if (hoist < 0) { const char *e = getenv("DS4_QWEN4_Q4K_HOIST"); hoist = !e || atoi(e) != 0; }
-        if ((rows == 2 || rows == 4) && !(M % (4u * rows))) {
-#define QWEN_Q4KR(KB, R) \
-            if (T == 1) matvec_q4k_rows<KB,R,1><<<M/(4*R),128,0,0>>>(out,w,x,M,stride,hoist); \
-            else if (T == 2) matvec_q4k_rows<KB,R,2><<<M/(4*R),128,0,0>>>(out,w,x,M,stride,hoist); \
-            else matvec_q4k_rows<KB,R,3><<<M/(4*R),128,0,0>>>(out,w,x,M,stride,hoist)
-#define QWEN_Q4KK(KB) if (rows == 2) { QWEN_Q4KR(KB,2); } else { QWEN_Q4KR(KB,4); }
-            if (K == 2560) { QWEN_Q4KK(10); }
-            else if (K == 6144) { QWEN_Q4KK(24); }
-            else { QWEN_Q4KK(40); }
-#undef QWEN_Q4KK
+        if (!(M % 16u)) {
+#define QWEN_Q4KR(KB) \
+            if (T == 1) matvec_q4k_rows<KB,4,1><<<M/16,128,0,0>>>(out,w,x,M,stride); \
+            else if (T == 2) matvec_q4k_rows<KB,4,2><<<M/16,128,0,0>>>(out,w,x,M,stride); \
+            else matvec_q4k_rows<KB,4,3><<<M/16,128,0,0>>>(out,w,x,M,stride)
+            if (K == 2560) { QWEN_Q4KR(10); }
+            else if (K == 6144) { QWEN_Q4KR(24); }
+            else { QWEN_Q4KR(40); }
 #undef QWEN_Q4KR
             return launched();
         }
@@ -2082,25 +1865,18 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         else if (T == 2) matvec_q4k<KB,CH,2><<<(M+3)/4,128,0,0>>>(out,w,x,M,stride); \
         else matvec_q4k<KB,CH,3><<<(M+3)/4,128,0,0>>>(out,w,x,M,stride)
         if (K == 2560) { QWEN_Q4K(10,5); }
-        else if (K == 6144) {
-            if (ch == 4) { QWEN_Q4K(24,4); } else if (ch == 6) { QWEN_Q4K(24,6); }
-            else if (ch == 12) { QWEN_Q4K(24,12); } else { QWEN_Q4K(24,8); }
-        } else {
-            if (ch == 4) { QWEN_Q4K(40,4); } else if (ch == 10) { QWEN_Q4K(40,10); } else { QWEN_Q4K(40,8); }
-        }
+        else if (K == 6144) { QWEN_Q4K(24,8); }
+        else { QWEN_Q4K(40,8); }
 #undef QWEN_Q4K
         return launched();
     }
-    static int q8_long_old = -1, bf16_old = -1;
-    if (q8_long_old < 0) q8_long_old = getenv("DS4_QWEN4_Q8_LONG_OLD") != NULL;
-    if (bf16_old < 0) bf16_old = getenv("DS4_QWEN4_BF16_MV_OLD") != NULL;
-    if (type == 8 && T <= 3 && K == 10240 && !(M % 2) && !q8_long_old && !((uintptr_t)x&15)) {
+    if (type == 8 && T <= 3 && K == 10240 && !(M % 2) && !((uintptr_t)x&15)) {
         if (T == 1) matvec_q8_long<2,1><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
         else if (T == 2) matvec_q8_long<2,2><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
         else matvec_q8_long<2,3><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
         return launched();
     }
-    if (type == 30 && T <= 3 && !(K % 256) && !bf16_old && !((uintptr_t)x&15) && !((uintptr_t)w&15)) {
+    if (type == 30 && T <= 3 && !(K % 256) && !((uintptr_t)x&15) && !((uintptr_t)w&15)) {
         if (T == 1) matvec_bf16<1><<<(M+3)/4,128,0,0>>>(out,w,x,K,M,stride);
         else if (T == 2) matvec_bf16<2><<<(M+3)/4,128,0,0>>>(out,w,x,K,M,stride);
         else matvec_bf16<3><<<(M+3)/4,128,0,0>>>(out,w,x,K,M,stride);
@@ -2117,32 +1893,12 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
 #undef QWEN_F32_PREFETCH
         return launched();
     }
-    // Ordered prefetch shares each dequantized Q8 weight across MTP rows.
+    /* Q8_0 projections (the vocabulary head included) run matvec_q8 below
+     * for every T.  F16 hc down still splits (matvec_f16_long for one token,
+     * matvec_f16_input_first for 2-8), so a file with F16 hc down does not
+     * keep verify rows exact. */
     if (ds4_rocm_is_gfx1151() && T <= 3 && !((uintptr_t)x&15) && !((uintptr_t)w&7)) {
-        // The wide vocabulary projection amortizes its weight read across verification rows.
-        if (type == 8 && T > 1 && K == 2560 && M == 248320) {
-            if (T == 2) matvec_prefetch<8,2,1,false,1,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
-            else matvec_prefetch<8,4,1,false,2,4><<<(M+1)/2,32,0,0>>>(out,w,x,T,K,M,stride);
-            return launched();
-        }
-        /* T-invariant Q8_0: one kernel family for every T, so verify rows
-         * match plain decode.  DS4_QWEN4_Q8_INVARIANT=prefetch runs these
-         * shapes on matvec_prefetch for T = 1 too, =off restores the split
-         * (matvec_q8 for one token, matvec_prefetch for 2-3) */
-        static int q8_inv = -1;
-        if (q8_inv < 0) {
-            const char *e = getenv("DS4_QWEN4_Q8_INVARIANT");
-            q8_inv = !e || !strcmp(e, "q8") ? 1 : !strcmp(e, "prefetch") ? 2 : 0;
-        }
-        if (type == 8 && (T > 1 || q8_inv == 2) && q8_inv != 1 &&
-            ((K == 2560 && (M == 128 || M == 512 || M == 6144 || M == 10240 || M == 12288)) || ((K == 6144 || K == 5120) && M == 2560))) {
-            if (T <= 2) matvec_prefetch<8,2,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
-            else matvec_prefetch<8,4,1><<<M,32,0,0>>>(out,w,x,T,K,M,stride);
-            return launched();
-        }
-        static int f16_long_old = -1;
-        if (f16_long_old < 0) f16_long_old = getenv("DS4_QWEN4_HCDOWN_OLD") != NULL;
-        if (type == 1 && T == 1 && M == 320 && K == 10240 && !f16_long_old && !((uintptr_t)w & 15)) {
+        if (type == 1 && T == 1 && M == 320 && K == 10240 && !((uintptr_t)w & 15)) {
             matvec_f16_long<2><<<M / 2,256,0,0>>>(out,w,x,K,M,stride);
             return launched();
         }
@@ -2602,7 +2358,7 @@ static int dense_half_tiles(float *out, const float *x, const char *w,
     const uint64_t rb = row_bytes(TYPE,K);
     for (unsigned r = 0; r < M; r += tile) {
         const unsigned n = std::min(tile,M-r);
-        if (TYPE == 12 && !(K % 2048) && !getenv("DS4_QWEN4_Q4K_PACK_OLD"))
+        if (TYPE == 12 && !(K % 2048))
             pack_half_rows_q4k<<<n,256,0,0>>>(ws,wh,w+(uint64_t)r*rb,K,rb);
         else
             pack_half_rows<TYPE><<<n,256,0,0>>>(ws,wh,w+(uint64_t)r*rb,K,rb);
@@ -3253,9 +3009,7 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
     if (!w || (type != 0 && type != 1 && type != 8)) return 0;
-    static int multi_old = -1;
-    if (multi_old < 0) multi_old = getenv("DS4_QWEN4_HC_MULTI_OLD") != NULL;
-    if (T >= 2 && T <= 3 && rank <= 512 && !multi_old) {
+    if (T >= 2 && T <= 3 && rank <= 512) {
 #define QWEN_HCM(TYPE, TM) hc_mix_multi<TYPE,TM><<<(E + 3) / 4,128,0,0>>>((float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
         if (type == 0) { if (T == 2) QWEN_HCM(0,2); else QWEN_HCM(0,3); }
@@ -3425,7 +3179,7 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         return dense_q8_blas((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
     if (type == 12 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode) {
-        if (ds4_rocm_is_gfx1151() && !(K%256) && !getenv("DS4_QWEN4_Q4K_DIRECT_OLD"))
+        if (ds4_rocm_is_gfx1151() && !(K%256))
             return dense_q4k_direct((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
         return dense_half_tiles<12>((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
     }
@@ -3480,11 +3234,7 @@ extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_ten
         !tensor(sel, (uint64_t)T*NS*4) || !tensor(weights, (uint64_t)T*NS*4) || !tensor(logits, (uint64_t)T*NE*4)) return 0;
     const char *wg = K ? weight(map, size, off, row_bytes(type, K)) : NULL;
     if (K && (!wg || !tensor(x, (uint64_t)T*K*4) || !tensor(sg, (uint64_t)T*4))) return 0;
-    static int old = -1;   /* DS4_QWEN4_ROUTER_OLD=1: the block-wide top-k loop */
-    if (old < 0) old = getenv("DS4_QWEN4_ROUTER_OLD") != NULL;
-    if (old) router<false><<<T,256,0,0>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
-        K ? (const float *)x->ptr : NULL, wg, K ? (float *)sg->ptr : NULL, NE, NS, K, type);
-    else router<true><<<T,256,0,0>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+    router<<<T,256,0,0>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
         K ? (const float *)x->ptr : NULL, wg, K ? (float *)sg->ptr : NULL, NE, NS, K, type);
     return launched();
 }
@@ -3587,10 +3337,8 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
         !tensor(qkv,(uint64_t)T*C*4) || !tensor(state,hb) ||
         (snap && (st >= T || !tensor(snap,hb))) || (snap2 && (st2 >= T || !tensor(snap2,hb)))) return 0;
     const char *w = weight(map,size,co,C*CK*4);
-    static int gates_old = -1;
-    if (gates_old < 0) gates_old = getenv("DS4_QWEN4_GDN_GATES_OLD") != NULL;
     if (!w) return 0;
-    const char *wa = T <= 3 && type == 0 && !(K % 512) && !gates_old ? weight(map,size,ao,(uint64_t)K*Hv*4) : NULL;
+    const char *wa = T <= 3 && type == 0 && !(K % 512) ? weight(map,size,ao,(uint64_t)K*Hv*4) : NULL;
     const char *wb = wa ? weight(map,size,bo,(uint64_t)K*Hv*4) : NULL;
     if (wa && wb && !(((uintptr_t)wa | (uintptr_t)wb | (uintptr_t)mixed->ptr) & 15) &&
         tensor(ga,(uint64_t)T*Hv*4) && tensor(gb,(uint64_t)T*Hv*4) && tensor(mixed,(uint64_t)T*K*4)) {
@@ -3779,7 +3527,5 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
     return launched();
 }
 
-#ifndef DS4_QWEN4_FP_FAST
 /* back to the fast-math defaults for the files included after this one */
 #pragma clang fp reassociate(on) contract(fast)
-#endif

@@ -1,0 +1,8 @@
+Refactor this Python into idiomatic, typed code and explain each change:
+
+def f(l):
+    r = []
+    for i in range(len(l)):
+        if l[i] != None and l[i] % 2 == 0:
+            r.append(l[i] * l[i])
+    return r

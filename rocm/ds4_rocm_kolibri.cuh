@@ -1244,15 +1244,12 @@ extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *s1 = down ? NULL : weight(map, size, so1, srb * M);
     if (!w0 || !s0 || (!down && (!w1 || !s1))) return 0;
     if (((uintptr_t)w0 | (uintptr_t)(w1 ? w1 : w0) | (uintptr_t)x->ptr) & 15) return -1;
-    static int rows_r = -1;
-    if (rows_r < 0) { const char *v = getenv("DS4_QWEN4_MOE_ROWS"); rows_r = v ? atoi(v) : 2; }
-    if (!down && K == 2560 && T <= 3 && (rows_r == 2 || rows_r == 4) && !(M % (4u * rows_r))) {
-        const dim3 g(M / (4u * rows_r), NO, T);
-#define KOLIBRI_MOE_ROWS(R, SHT) moe_q4k_rows<10, R, SHT><<<g, 128, 0, 0>>>((float *)out->ptr, \
-        (const float *)x->ptr, (const int *)sel->ptr, w0, w1, s0, s1, NE, NS, M, rb, srb, T)
-        if (rows_r == 2) { if (shared_type == 8) KOLIBRI_MOE_ROWS(2, 8); else KOLIBRI_MOE_ROWS(2, 200); }
-        else { if (shared_type == 8) KOLIBRI_MOE_ROWS(4, 8); else KOLIBRI_MOE_ROWS(4, 200); }
-#undef KOLIBRI_MOE_ROWS
+    if (!down && K == 2560 && T <= 3 && !(M % 8u)) {
+        const dim3 g(M / 8u, NO, T);
+        if (shared_type == 8) moe_q4k_rows<10, 2, 8><<<g, 128, 0, 0>>>((float *)out->ptr,
+            (const float *)x->ptr, (const int *)sel->ptr, w0, w1, s0, s1, NE, NS, M, rb, srb, T);
+        else moe_q4k_rows<10, 2, 200><<<g, 128, 0, 0>>>((float *)out->ptr,
+            (const float *)x->ptr, (const int *)sel->ptr, w0, w1, s0, s1, NE, NS, M, rb, srb, T);
         return launched();
     }
     const dim3 grid((M + 3) / 4, NO, T);
