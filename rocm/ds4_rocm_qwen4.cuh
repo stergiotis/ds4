@@ -1599,6 +1599,31 @@ __device__ __forceinline__ float q4k_block(uint4 h, unsigned q, float4 xa, float
     return d * (s0 * lo + s1 * hi) - dm * (m0 * (xa.x + xa.y + xa.z + xa.w) + m1 * (xb.x + xb.y + xb.z + xb.w));
 }
 
+/* q4k_block split into the per-row decode (scales, mins, nibbles), done
+ * once, and the per-token dot, which evaluates q4k_block's expression in
+ * the same order, so a T-row kernel decodes each block once, not T times. */
+struct q4k_dec { float d, dm, s0, m0, s1, m1, n[8]; };
+
+__device__ __forceinline__ q4k_dec q4k_decode(uint4 h, unsigned q, unsigned c) {
+    q4k_dec r;
+    r.d = __half2float(__ushort_as_half((unsigned short)(h.x & 0xffff)));
+    r.dm = __half2float(__ushort_as_half((unsigned short)(h.x >> 16)));
+    q4k_scale_min(h, 2 * c, r.s0, r.m0);
+    q4k_scale_min(h, 2 * c + 1, r.s1, r.m1);
+    #pragma unroll
+    for (unsigned j = 0; j < 4; j++) {
+        r.n[j] = (float)((q >> (8 * j)) & 15);
+        r.n[4 + j] = (float)((q >> (8 * j + 4)) & 15);
+    }
+    return r;
+}
+
+__device__ __forceinline__ float q4k_apply(const q4k_dec &r, float4 xa, float4 xb) {
+    const float lo = r.n[0] * xa.x + r.n[1] * xa.y + r.n[2] * xa.z + r.n[3] * xa.w;
+    const float hi = r.n[4] * xb.x + r.n[5] * xb.y + r.n[6] * xb.z + r.n[7] * xb.w;
+    return r.d * (r.s0 * lo + r.s1 * hi) - r.dm * (r.m0 * (xa.x + xa.y + xa.z + xa.w) + r.m1 * (xb.x + xb.y + xb.z + xb.w));
+}
+
 /* Q8_0 row dot, four values per lane per step (n % 128 == 0, x 16-byte
  * aligned; Q8_0 rows need only 2-byte alignment, which value4 respects). */
 __device__ __forceinline__ float dot_q8_vec(const char *row, const float *x, unsigned n) {
@@ -1656,7 +1681,7 @@ __global__ __launch_bounds__(128) void matvec_q4k(float *out, const char *w, con
  * not depend on T.  M % (4 * R) == 0. */
 template<unsigned KB, unsigned R, unsigned T>
 __global__ __launch_bounds__(128) void matvec_q4k_rows(float *out, const char *w, const float *x,
-        unsigned M, uint64_t stride) {
+        unsigned M, uint64_t stride, bool q4k_hoist) {
     constexpr unsigned K = KB * 256;
     const unsigned row0 = (blockIdx.x * 4 + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
     const unsigned c = lane / 8, o = (lane % 8) * 4;
@@ -1676,12 +1701,25 @@ __global__ __launch_bounds__(128) void matvec_q4k_rows(float *out, const char *w
             h[r] = *(const uint4 *)blk;
             q[r] = *(const unsigned *)(blk + 16 + c * 32 + o);
         }
-        #pragma unroll
-        for (unsigned t = 0; t < T; t++) {
-            const float *xt = x + t * K + b * 256 + c * 64 + o;
-            const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
+        if (q4k_hoist) {
+            q4k_dec dec[R];
             #pragma unroll
-            for (unsigned r = 0; r < R; r++) acc[t][r] += q4k_block(h[r], q[r], xa, xb, c);
+            for (unsigned r = 0; r < R; r++) dec[r] = q4k_decode(h[r], q[r], c);
+            #pragma unroll
+            for (unsigned t = 0; t < T; t++) {
+                const float *xt = x + t * K + b * 256 + c * 64 + o;
+                const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
+                #pragma unroll
+                for (unsigned r = 0; r < R; r++) acc[t][r] += q4k_apply(dec[r], xa, xb);
+            }
+        } else {
+            #pragma unroll
+            for (unsigned t = 0; t < T; t++) {
+                const float *xt = x + t * K + b * 256 + c * 64 + o;
+                const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
+                #pragma unroll
+                for (unsigned r = 0; r < R; r++) acc[t][r] += q4k_block(h[r], q[r], xa, xb, c);
+            }
         }
     }
     #pragma unroll
@@ -2007,11 +2045,14 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         static int ch = -1, rows = -1;
         if (ch < 0) { const char *e = getenv("DS4_QWEN4_Q4K_CH"); ch = e ? atoi(e) : 0; }
         if (rows < 0) { const char *e = getenv("DS4_QWEN4_Q4K_ROWS"); rows = e ? atoi(e) : 4; }
+        /* DS4_QWEN4_Q4K_HOIST=0: multi-row verify decodes each block per token */
+        static int hoist = -1;
+        if (hoist < 0) { const char *e = getenv("DS4_QWEN4_Q4K_HOIST"); hoist = !e || atoi(e) != 0; }
         if ((rows == 2 || rows == 4) && !(M % (4u * rows))) {
 #define QWEN_Q4KR(KB, R) \
-            if (T == 1) matvec_q4k_rows<KB,R,1><<<M/(4*R),128,0,0>>>(out,w,x,M,stride); \
-            else if (T == 2) matvec_q4k_rows<KB,R,2><<<M/(4*R),128,0,0>>>(out,w,x,M,stride); \
-            else matvec_q4k_rows<KB,R,3><<<M/(4*R),128,0,0>>>(out,w,x,M,stride)
+            if (T == 1) matvec_q4k_rows<KB,R,1><<<M/(4*R),128,0,0>>>(out,w,x,M,stride,hoist); \
+            else if (T == 2) matvec_q4k_rows<KB,R,2><<<M/(4*R),128,0,0>>>(out,w,x,M,stride,hoist); \
+            else matvec_q4k_rows<KB,R,3><<<M/(4*R),128,0,0>>>(out,w,x,M,stride,hoist)
 #define QWEN_Q4KK(KB) if (rows == 2) { QWEN_Q4KR(KB,2); } else { QWEN_Q4KR(KB,4); }
             if (K == 2560) { QWEN_Q4KK(10); }
             else if (K == 6144) { QWEN_Q4KK(24); }
