@@ -21,11 +21,17 @@ Two types exist only for --simulate (no GGUF encoding yet):
        chosen by mean squared error), and rotated back. 4.125 bits a weight.
   q6a  6-bit affine: groups of 64 with an f16 scale and minimum. 6.5 bits.
 
+--hgn FILE (with --simulate) takes the values of every trunk ht matrix from a
+halogen v2 checkpoint (attention, indexer, GDN projections, shared expert,
+lm_head; decoded with strix/hgn, value heads reordered to GGUF order) and
+stores them as Q8_0, to measure that checkpoint's dense quality in ds4.
+
   qwen4_requant.py --model Q4.gguf --output out.gguf \\
       --set 'blk.*.hc_*.weight=q8_0' --set 'blk.*.ffn_gate_inp.weight=bf16' [--simulate]
 """
 
 import argparse
+import sys
 import ctypes
 import fnmatch
 import math
@@ -225,6 +231,21 @@ def requant(args):
         raise ValueError(f'{out} or its .incomplete file already exists')
     q = Quantizer(args.lib)
     imatrix = read_imatrix(args.imatrix) if args.imatrix else {}
+    hgn_over, hgn_get = {}, None
+    if args.hgn:
+        if not args.simulate:
+            raise ValueError('--hgn needs --simulate')
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'strix' / 'hgn'))
+        import hgn, ht, hmap
+        ht_table, _ = hgn.table(args.hgn)
+        f16 = lambda n: np.frombuffer(bytes(hgn.payload(args.hgn, ht_table[n])), '<f2').astype(np.float32)
+        hgn_over = hmap.gguf_overrides(ht_table)
+        def hgn_get(name):
+            base, fix, rows = hgn_over[name]
+            W = hmap.ht_decode(args.hgn, ht_table, base, f16, ht)
+            if rows: W = W[rows[0]:rows[1]]
+            return (fix(W) if fix else W).reshape(-1)
+        print(f'{len(hgn_over)} tensors from {args.hgn}', flush=True)
 
     alignment = model.kv.get('general.alignment', 32)
     align = lambda n: (n + alignment - 1) // alignment * alignment
@@ -232,7 +253,7 @@ def requant(args):
     for name, (kind, dims, old) in model.tensors.items():
         if name == NGRAM:
             continue
-        stored, rounding = plan_tensor(name, kind, dims, rules, args.simulate)
+        stored, rounding = (Q8_0, Q8_0) if name in hgn_over else plan_tensor(name, kind, dims, rules, args.simulate)
         if rounding is not None:
             nbytes(rounding, dims)  # the rounding type must tile the rows
         size = nbytes(stored, dims)
@@ -265,7 +286,7 @@ def requant(args):
             if rounding is None:
                 dst.write(raw.tobytes())
                 continue
-            x = dequant(kind, raw, math.prod(dims))
+            x = hgn_get(name) if name in hgn_over else dequant(kind, raw, math.prod(dims))
             weights = imatrix.get(name)
             if weights is not None and (len(weights) != dims[0] or not np.all(np.isfinite(weights))):
                 raise ValueError(f'{name}: imatrix has {len(weights)} columns, tensor {dims[0]}')
@@ -298,6 +319,7 @@ def main():
     parser.add_argument('--set', action='append', default=[], metavar='GLOB=TYPE')
     parser.add_argument('--simulate', action='store_true')
     parser.add_argument('--imatrix')
+    parser.add_argument('--hgn')
     parser.add_argument('--lib', default=Path(__file__).resolve().with_name('libds4quants.so'))
     args = parser.parse_args()
     try:

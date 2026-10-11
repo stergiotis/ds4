@@ -509,6 +509,15 @@ hc at 6 bits is the one cheap trade: +0.4% perplexity for ~0.16 GB/token.
   2560x6144 and 12288x2560: our Q4_K kernels' rate on 4.0 instead of 4.5
   bits a weight, and a verify can decode each weight once for 2-3 tokens.
 
+**halogen's dense 4-bit keeps quality (2026-10-11).** `qwen4_requant.py
+--simulate --hgn v2.hgn` replaces all 325 trunk `ht` matrices (attention,
+indexer, GDN projections, shared expert, lm_head) with halogen's decoded
+values (stored Q8_0) on top of V3. Against the reference: ppl x1.0187, KL
+0.0511, top-1 89.5% (V3: x1.0172, 0.0626, 88.3%). With o_proj and the
+shared expert at 4 bits it matches V3's perplexity and beats its KL, where
+our rotated round-to-nearest lost 5%. These tensors drop from 4.5-8.5 to
+4.0 bits a weight, ~0.43 GB/token. Next: an HT4 tensor type and kernels.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.
