@@ -434,6 +434,26 @@ draft today) and the dense/small-kernel share of a verify row; (2) deeper
 verify (T up to 5) once rows are cheap; (3) prompt-lookup drafts for code
 and edits; (4) bytes (hc at 6 bits) for plain decode.
 
+**halogen's formats (hgn-spec).** [jtsylve/hgn-spec](https://github.com/jtsylve/hgn-spec)
+is a clean-room specification (MIT or CC BY 4.0, no halogen code) of the
+HGN checkpoint format, written from the published files and halogen-flash
+0.16.2's observable behaviour. The v2 checkpoint stores:
+
+| Tensors | halogen v2 | ds4 V3 |
+|---|---|---|
+| routed experts | `i4r`: 4-bit codes, f16 scale per 128, rotated: 4.125 bpw | Q4_K 4.5 / MXFP4 4.25 |
+| shared expert, attention o_proj | `ht`: 4-bit trellis codes in a 128-point Hadamard basis, no scales: 4.0 bpw | Q8_0 8.5 |
+| GDN qkv/z/out, attention q/k/v, indexer, lm_head | `ht` 4.0 | Q4_K 4.5 |
+| hyper-connection mixes, final mixer | `q6g64`: 6.5 bpw | Q8_0 8.5 |
+| MTP head dense projections | `q8g64` | Q8_0 / Q4_K |
+
+The rotation (sign and scale vectors per tensor, `suh`/`svh`) is what lets
+o_proj and the shared expert live at 4 bits, where plain Q4_K cost us
+quality. These differences account for the 0.51 GB/token gap. The weights
+are published (Hugging Face card: Apache-2.0, derived from the Qwen
+licence); the spec describes formats only, so reading HGN payloads with our
+own kernels stays within the "do not port halogen's kernels" courtesy.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.
