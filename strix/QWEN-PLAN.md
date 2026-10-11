@@ -403,6 +403,37 @@ own 4/8-bit layout; `docs/how-it-got-fast.md`). What transfers:
 - Both: prefill on WMMA with on-the-fly dequantization, 4-8K-token chunks
   with the next chunk's n-gram rows prefetched.
 
+**How halogen leads with speculation (2026-10-11, measured).** halogen's
+per-request log line (`serve_api: mtp N tok in Xs | R rounds, commit C/round
+| ... | K tok with the head off`) and `timings.draft_n / draft_n_accepted`,
+against ds4-server with `DS4_QWEN4_SPEC_TRACE=1`, same 4 prompts, thinking
+on, temperature 1.0 (scripts `~/.local/share/ds4/qwen-prof/halo/`):
+
+| t = 1.0 | halogen rows / accept / commit / ms per round | ds4 rows / accept / commit / ms per cycle | ratio |
+|---|---|---|---:|
+| code | 3.1 / 88% / 2.82 / 39.6 | 2.35 / 77% / 2.05 / 43.0 | 1.49x |
+| prose | 2.46 / 62% / 1.90 / 35.7 | 2.13 / 68% / 1.77 / 40.5 | 1.22x |
+| math | 3.43 / 88% / 3.15 / 41.9 | 2.72 / 89% / 2.53 / 47.1 | 1.40x |
+| refactor | 3.0 / 85% / 2.70 / 39.6 | 2.12 / 69% / 1.78 / 40.5 | 1.55x |
+
+A least-squares fit over halogen's requests gives **22.2 ms per round +
+5.5 ms per row**, drafting included; ds4's cycles fit about 16.6 + 11.2 ms
+per row. halogen's extra row costs little more than the extra experts it
+reads (the union grows ~0.6x T=1 expert bytes per row, ~4.7 ms at 200
+GB/s); ds4 adds ~7 ms of verify and ~2 ms of drafting per row. Because
+rows are cheap halogen drafts deeper (2.1 drafts per round at t = 1.0,
+2.8 at t = 0) and still accepts 85-90% on code and refactor; on math the
+two accept alike (88-89%), on refactor halogen accepts 85% to ds4's 69%,
+the signature of prompt lookup (refactor copies the prompt's code). The
+~26 tokens "with the head off" are per request, not an adaptive pause.
+Plain decode is a bytes story (halogen 37.6 tok/s at 4.27 GB/token, ds4
+~34.5 at 4.78; both ~160-165 GB/s); speculation is not.
+
+Levers, in order: (1) the cost of an extra row: drafting (~2.7 ms per
+draft today) and the dense/small-kernel share of a verify row; (2) deeper
+verify (T up to 5) once rows are cheap; (3) prompt-lookup drafts for code
+and edits; (4) bytes (hc at 6 bits) for plain decode.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.
