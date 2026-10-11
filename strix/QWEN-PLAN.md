@@ -530,6 +530,21 @@ own in-tile order. Tiles can be reordered losslessly, values inside a tile
 cannot (the trellis state runs in stream order), so EXL3 files would need
 a kernel variant for EXL3's in-tile order rather than a byte repack.
 
+**Launch fusion, first pass (2026-10-11).** Committed: hc combine + norm in
+one launch for decode and verify (76e7b56), BF16 router matvec + top-k in
+one launch for single tokens (ed4ad1d). Plain 29.55 -> 29.24 ms GPU, 3-row
+verify 43.0 -> 42.8 ms; plain output byte-identical, identity script passes.
+Rejected: the router fusion at verify rows (one block runs the 3 top-ks in
+turn, +0.6 ms); the MoE reduce + next-layer hc norm (+1.3 ms: the norm needs
+the whole stream per block, so the 11-expert sum runs 8x over in 32 blocks);
+a vectorized hc_norm with merged reductions (-0.05 ms, noise). Lesson: on
+this GPU a dependent kernel costs ~10-16 us however little it does, and the
+summed kernel time equals wall time, so the floor is per kernel, not launch
+gaps. ~660 kernels per token. The next real win removes kernels outright:
+fold the hc norm into hc down (per-stream partial dots of gamma*R, the four
+inject rows as extra output rows, inv_s applied by the consumers) would drop
+97 kernels (~1.5 ms).
+
 **halogen's 6-bit hc (q6g64) costs quality (2026-10-11).** `--hgn-hc`
 (decoded, stored F16) on top of V3 + HT4: ppl x1.0151, KL 0.054 against the
 reference (V3 + HT4: x1.0085, 0.047), for ~0.16 GB/token. Parked behind the
