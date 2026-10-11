@@ -14579,8 +14579,11 @@ decode_again:
             }
         }
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
-            /* Logits after a rewind belong to the discarded suffix. Re-eval
+            /* Logits after a rewind belong to the discarded suffix, unless
+             * the session restores them with the state.  Otherwise re-eval
              * the last kept token before sampling under a different mode. */
+            if (resample && ds4_session_rewind_restores_logits(slot->session, block_start + kept))
+                resample = false;
             int pos = block_start + kept - (resample ? 1 : 0);
             if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
                 (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {

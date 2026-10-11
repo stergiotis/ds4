@@ -334,6 +334,42 @@ depth 2 only (one draft) and snapshots the full recurrent state each
 verify. Next levers: chained exact acceptance for a second draft, n-gram
 prompt-lookup drafts and an acceptance-based pause (strix/QWEN-RESEARCH.md).
 
+**Chained exact MTP (2026-10-11).** Under `--mtp-exact-sampling` the cycle
+now (a) accepts the second draft after the first: d1 with p0(d1), then d2
+with p1(d2), the first rejection drawing from that row's residual; (b) no
+longer replays the residual sample: it becomes the next cycle's first
+token, and the cycle draws the token after every committed block itself
+and leaves it pending for the caller's next `ds4_session_sample`, so a
+draft is always conditioned on the real next token (before, a sampled
+token other than the argmax dropped the draft); (c) drops the per-verify
+full-state snapshot: a server resample rewinds to the row snapshot, whose
+logits the verify kept (`ds4_session_rewind_restores_logits`).
+`DS4_QWEN4_EXACT_OLD=1` restores the old cycle.
+
+Exactness: 1,500 completions of six tokens at temperature 1.0 / top-p
+0.95 / top-k 20 with MTP on (seeds 200001+, 2,846 accepts and 1,330
+rejects) and off (seeds 100001+): two-sample chi-square p 0.48-0.99 per
+position and on the joint text, the same range as an off-vs-off control.
+(Shared seeds correlate the two samples and give p ~ 1 regardless.)
+Greedy output is byte-identical to plain decode at depth 2 and 3.
+
+Speed at temperature 1.0, single CLI runs, 512 tokens, no thinking:
+
+| tok/s | plain | old | auto | depth 2 | depth 3 |
+|---|---:|---:|---:|---:|---:|
+| code | 31.8 | 40.1 | 43.7 | 42.5 | 44.5 |
+| prose | 30.3 | 33.2 | 34.3 | 35.3 | 32.5 |
+
+Over the API (thinking on, two rounds after a warm-up) the gain is within
+noise: code 34.9 / 36.4 old against 36.1 / 36.1 new, prose 33.3 / 35.4
+against 34.5 / 36.8; temperature 0 code 40.6 -> 41.7. halogen: 52.0 /
+45.5. The replay was not waste: it bought a whole token for one T = 1
+forward (31 ms), and a 2-row verify costs ~47 ms. With acceptance a, old
+gives 2 / (V + (1 - a) F), new (1 + a) / V; at a = 0.7 both are ~36 tok/s.
+**The limit is the verify cost, ~1.5x a plain token**; halogen's numbers
+need ~1.15x at depth 2 or deeper drafts. Next: dense verify work at
+~1.05x T = 1 and the expert union (strix/QWEN-RESEARCH.md items 1-2).
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.

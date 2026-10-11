@@ -593,6 +593,9 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* True when rewinding to pos restores the logits there as well, so the
+ * caller can sample at pos without re-evaluating the token before it. */
+bool ds4_session_rewind_restores_logits(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
