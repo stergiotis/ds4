@@ -370,6 +370,39 @@ gives 2 / (V + (1 - a) F), new (1 + a) / V; at a = 0.7 both are ~36 tok/s.
 need ~1.15x at depth 2 or deeper drafts. Next: dense verify work at
 ~1.05x T = 1 and the expert union (strix/QWEN-RESEARCH.md items 1-2).
 
+**Verify anatomy and the new bar (2026-10-11).** `DS4_GPU_TRACE` now
+reports verify passes apart from prefill. Code prompt, greedy: plain 31.6 ms
+GPU per token, 2-row verify 41.9 (1.33x), 3-row 52.1 (1.65x). Routed experts
+are ~70% of the extra: distinct experts per verify layer are 1.60x T=1 for
+2 rows and 2.14x for 3 (`DS4_QWEN4_UNION_STATS=1`), and gate/up time grows
+exactly with them (1.59x / 2.12x), while down grew 1.93x / 2.59x and reads
+at only 122 GB/s even at T=1. Loading four rows before decoding
+(`moe_down_mxfp4_rows`, 1340ea3) took down to 3.91 ms and the 3-row verify
+down to 9.21 ms.
+
+halogen 0.17.5 (pinned 2026-10-11, same v2 checkpoint), API, thinking on:
+code 72.0 tok/s at temperature 0 and 64.7 at 1.0, prose 50 / 53.5; 0.15.3
+was 58.3 / 52.0 / 43.5 / 45.5.
+
+Two open engines run this model on gfx1151:
+[gufo](https://github.com/gufo-org/gufo) (MIT, Q4_K_XL GGUF, credits ds4;
+65 tok/s MTP decode, 1,703 prefill; `docs/models/qwen3.8-flash-next/EXPERIMENTS.md`
+logs every kept and rejected change) and
+[strixite](https://github.com/shawnshekari/strixite) (AGPL-3.0, ideas only;
+own 4/8-bit layout; `docs/how-it-got-fast.md`). What transfers:
+
+- strixite's plain decode is 31.5 tok/s, ds4's 31.3. Its lead is drafting
+  depth: 1 / 3 / 4 drafts give 43.6 / 51.8 / 53.4 tok/s, with drafting
+  stopped when the draft head's top-2 margin is small; 5 drafts in agent
+  use. ds4 stops at 2 drafts (T <= 3 verify kernels).
+- gufo: producer kernels write Q8_1 activation rows, so decode matvecs use
+  integer dots; with up-front loads and DPP reductions, +6-7% decode.
+  Integer-WMMA Q8 for verify widths up to 48 rows.
+- strixite: the draft head scores the 65,536 most frequent tokens (3.9 ->
+  1.7 ms per draft); ds4 already gathers a draft head.
+- Both: prefill on WMMA with on-the-fly dequantization, 4-8K-token chunks
+  with the next chunk's n-gram rows prefetched.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.
