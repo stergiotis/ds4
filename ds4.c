@@ -60954,13 +60954,16 @@ static bool qwen4_moe_mm_gate_up(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
                                            DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) != 0;
 }
 
-static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
-                               const ds4_tensor *norm, const ds4_tensor *down,
-                               const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
-    bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
-                                           inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
-                                           T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
-              qwen4_mark("hc norm", 0) &&
+/* normed: g->xn (and the injection partials) already hold the norm, as
+ * after ds4_gpu_qwen4_hc_combine_norm_tensor */
+static bool qwen4_graph_hc_mix_ex(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                  const ds4_tensor *norm, const ds4_tensor *down,
+                                  const ds4_tensor *up, const ds4_tensor *inject, uint32_t T, bool normed) {
+    bool ok = (normed ||
+               (ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
+                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
+                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
+                qwen4_mark("hc norm", 0))) &&
               qwen4_gemv(g->lo, m, down, g->xn, T) &&
               qwen4_mark("hc down 10240->320", down->bytes);
 #ifdef DS4_ROCM_BUILD
@@ -61005,6 +61008,12 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                                   up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
 }
 
+
+static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                               const ds4_tensor *norm, const ds4_tensor *down,
+                               const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
+    return qwen4_graph_hc_mix_ex(g, m, norm, down, up, inject, T, false);
+}
 static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                uint32_t il, uint32_t T) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
@@ -61551,6 +61560,18 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                     qwen4_mark("hc down 10240->320", l->hc_ffn_down->bytes) &&
                     ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size,
                         l->hc_ffn_up->abs_offset, l->hc_ffn_up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+            }
+        } else if (T <= 3u && DS4_N_HC == 4u) {
+            /* decode and verify rows: the residual combine and the norm in
+             * one launch, into the second residual and injection buffers */
+            if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj, g->xn, g->inj_alt, g->R,
+                m->map, m->size, l->hc_ffn_norm->abs_offset, l->hc_ffn_inject->abs_offset,
+                l->hc_ffn_inject->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS) != 0 &&
+                qwen4_mark("hc combine+norm", 0);
+            if (ok) {
+                ds4_gpu_tensor *swap = g->R; g->R = g->hc_u; g->hc_u = swap;
+                swap = g->inj; g->inj = g->inj_alt; g->inj_alt = swap;
+                ok = qwen4_graph_hc_mix_ex(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T, true);
             }
         } else {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&

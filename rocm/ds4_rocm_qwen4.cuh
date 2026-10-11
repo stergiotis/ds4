@@ -2791,6 +2791,45 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     }
 }
 
+/* hc_combine then hc_norm in one launch: Rn = R + w_s * out (w_s from the
+ * previous injection partials), and xn / the new partials from Rn, each
+ * value computed by the same expressions as the two kernels.  Rn and inj
+ * must not alias R and oldinj (every block reads all of R and oldinj). */
+__global__ void hc_norm_comb(float *xn, float *inj, float *Rn, const float *R, const float *out,
+                             const float *oldinj, const float *gamma, const char *wi, unsigned type,
+                             unsigned E, unsigned hc, unsigned ni, float eps) {
+    const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
+    const unsigned tid = threadIdx.x, dim = E * hc;
+    const uint64_t base = ((uint64_t)tok * hc + stream) * E;
+    const float *ot = out + (uint64_t)tok * E;
+    __shared__ float red[32];
+    __shared__ float wsh;
+    if (!tid) wsh = injection(oldinj + (uint64_t)tok * hc * hc * 8, hc, stream);
+    __syncthreads();
+    const float w = wsh;
+    const unsigned per = (E + 7) / 8, c0 = chunk * per, end = min(E, (chunk + 1) * per);
+    float ss = 0;
+    for (unsigned i = tid; i < E; i += blockDim.x) {
+        float v = R[base + i];
+        v += w * ot[i];
+        ss += v * v;
+        if (i >= c0 && i < end) Rn[base + i] = v;
+    }
+    const float inv = rsqrtf(block_sum(ss, red) / E + eps);
+    float acc[4] = {};
+    for (unsigned i = c0 + tid; i < end; i += blockDim.x) {
+        float r = R[base + i];
+        r += w * ot[i];
+        const float v = r * inv * gamma[stream * E + i];
+        xn[base + i] = v;
+        for (unsigned j = 0; j < ni; j++) acc[j] += scalar(wi, j * dim + stream * E + i, type) * v;
+    }
+    for (unsigned j = 0; j < ni; j++) {
+        const float v = block_sum(acc[j], red);
+        if (!tid) inj[((uint64_t)tok * hc * 8 + stream * 8 + chunk) * ni + j] = v;
+    }
+}
+
 __global__ void hc_norm_one(float *xn, float *inj, const float *R, const float *gamma,
                         const char *wi, unsigned type, unsigned E, unsigned hc,
                         unsigned ni, float eps) {
@@ -3614,6 +3653,18 @@ extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const 
     const uint64_t bytes = (uint64_t)T*E*hc*4;
     if (!qwen4_rocm::tensor(next,bytes) || !qwen4_rocm::tensor(R,bytes) || next->ptr == R->ptr ||
         !inj || !oldinj || inj->ptr == oldinj->ptr) return 0;
+    using namespace qwen4_rocm;
+    if (T < 128 && E == 2560 && hc == 4 && ni <= 4 && (type == 0 || type == 1 || type == 8) &&
+        tensor(blk,(uint64_t)T*E*4) && tensor(oldinj,(uint64_t)T*hc*hc*8*4) &&
+        tensor(xn,bytes) && tensor(inj,(uint64_t)T*hc*8*ni*4)) {
+        const char *gamma = weight(map, size, go, (uint64_t)E * hc * 4);
+        const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
+        if (!gamma || !wi) return 0;
+        hc_norm_comb<<<dim3(hc * 8, T), 128, 0, 0>>>((float *)xn->ptr, (float *)inj->ptr, (float *)next->ptr,
+            (const float *)R->ptr, (const float *)blk->ptr, (const float *)oldinj->ptr, (const float *)gamma,
+            wi, type, E, hc, ni, eps);
+        return launched();
+    }
     if (!cuda_ok(cudaMemcpyAsync(next->ptr,R->ptr,bytes,cudaMemcpyDeviceToDevice,0),"Qwen HC copy")) return 0;
     return ds4_gpu_qwen4_hc_combine_tensor(next,blk,oldinj,T,E,hc) &&
            ds4_gpu_qwen4_hc_norm_tensor(xn,inj,next,map,size,go,io,type,T,E,hc,ni,eps);
