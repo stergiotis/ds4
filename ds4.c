@@ -61436,7 +61436,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                         l->hc_ffn_up->abs_offset, l->hc_ffn_up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
             }
         } else {
-            if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
+            if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&
+                         qwen4_mark("hc combine", 0);
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
         if (ok) ok = qwen4_mark("hc up+gate mix", l->hc_ffn_up->bytes);

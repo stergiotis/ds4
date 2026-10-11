@@ -475,6 +475,7 @@ static uint64_t expert_row_bytes(unsigned type, unsigned K) {
     return row_bytes(type, type == 10 ? ((uint64_t)K + 255) / 256 * 256 : K);
 }
 
+template<bool WAVE>
 __global__ void router(int *selected, float *weights, const float *logits,
         const float *x, const char *gate, float *shared_gate,
         unsigned NE, unsigned NS, unsigned K, unsigned type) {
@@ -501,6 +502,36 @@ __global__ void router(int *selected, float *weights, const float *logits,
         if (!tid) shared_gate[t] = v;
     }
     __syncthreads();
+    if (WAVE && NE == 512 && NS <= 32) {
+        /* one wave picks the top NS from registers (16 per lane) with
+         * shuffles: the same order and ties (lower id) as the block loop
+         * below, without its ~90 barriers */
+        if (tid < 32) {
+            float v[16];
+            #pragma unroll
+            for (unsigned i = 0; i < 16; i++) v[i] = p[tid + 32 * i];
+            for (unsigned s = 0; s < NS; s++) {
+                float best = -1;
+                unsigned id = UINT_MAX, slot = 0;
+                #pragma unroll
+                for (unsigned i = 0; i < 16; i++) if (v[i] > best) { best = v[i]; id = tid + 32 * i; slot = i; }
+                float bb = best;
+                unsigned bi = id;
+                #pragma unroll
+                for (unsigned off = 16; off; off /= 2) {
+                    const float ob = __shfl_xor(bb, off, 32);
+                    const unsigned oi = __shfl_xor(bi, off, 32);
+                    if (ob > bb || (ob == bb && oi < bi)) { bb = ob; bi = oi; }
+                }
+                if (bi == id) {
+                    #pragma unroll
+                    for (unsigned i = 0; i < 16; i++) if (i == slot) v[i] = -1;
+                }
+                if (!tid) { selected[(uint64_t)t * NS + s] = bi; weights[(uint64_t)t * NS + s] = bb; }
+            }
+        }
+        __syncthreads();
+    } else
     for (unsigned s = 0; s < NS; s++) {
         float best = -1;
         unsigned id = UINT_MAX;
@@ -3378,7 +3409,11 @@ extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_ten
         !tensor(sel, (uint64_t)T*NS*4) || !tensor(weights, (uint64_t)T*NS*4) || !tensor(logits, (uint64_t)T*NE*4)) return 0;
     const char *wg = K ? weight(map, size, off, row_bytes(type, K)) : NULL;
     if (K && (!wg || !tensor(x, (uint64_t)T*K*4) || !tensor(sg, (uint64_t)T*4))) return 0;
-    router<<<T,256,0,0>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+    static int old = -1;   /* DS4_QWEN4_ROUTER_OLD=1: the block-wide top-k loop */
+    if (old < 0) old = getenv("DS4_QWEN4_ROUTER_OLD") != NULL;
+    if (old) router<false><<<T,256,0,0>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+        K ? (const float *)x->ptr : NULL, wg, K ? (float *)sg->ptr : NULL, NE, NS, K, type);
+    else router<true><<<T,256,0,0>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
         K ? (const float *)x->ptr : NULL, wg, K ? (float *)sg->ptr : NULL, NE, NS, K, type);
     return launched();
 }
