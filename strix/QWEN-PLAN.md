@@ -495,6 +495,20 @@ dense tensors are trellis codes (QTIP-style), presumably chosen with an
 activation-aware method; that, not the rotation alone, carries its quality.
 hc at 6 bits is the one cheap trade: +0.4% perplexity for ~0.16 GB/token.
 
+**Reading halogen's v2 weights is feasible (2026-10-11).** `strix/hgn/`:
+- Decoding per the spec reproduces our GGUF tensors: layer-3 o_proj, the
+  shared-expert gate and GDN out_proj correlate 0.996 with the Q8_0 copies
+  of the same weights (relative error 8-9%, the 4-bit level). GDN tensors
+  need the value-head permutation the spec names (GGUF tiled, HGN grouped:
+  grouped head g is tiled head (g % 3) * 16 + g / 3).
+- A first `ht` matvec kernel (one wave per 16-row tile, lane word plus the
+  previous word by shuffle, states by alignbit, codebook by udot4 and one
+  packed f16 FMA per two values, dot by fdot2, 8 column tiles of words
+  loaded ahead, Hadamard of the band's 128 outputs in LDS) matches numpy to
+  2.5e-4 relative (x in f16) and runs at 199 / 184 / 202 GB/s on 10240x2560,
+  2560x6144 and 12288x2560: our Q4_K kernels' rate on 4.0 instead of 4.5
+  bits a weight, and a verify can decode each weight once for 2-3 tokens.
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.
