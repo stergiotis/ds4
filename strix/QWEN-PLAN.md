@@ -530,6 +530,24 @@ own in-tile order. Tiles can be reordered losslessly, values inside a tile
 cannot (the trellis state runs in stream order), so EXL3 files would need
 a kernel variant for EXL3's in-tile order rather than a byte repack.
 
+**halogen measured directly (2026-10-11).**
+- Exactness: greedy output with `drafter: serial` vs `mtp` (API field) is
+  byte-identical on the 4 identity prompts x 512 tokens. Its speculation is
+  exact; the speed is not a quality trade in the verify.
+- Cost model from its own `timings` counters (rounds = predicted - accepted):
+  25.6 ms per round + 6.0 ms per drafted token, drafting included (MTP-only
+  fit 27.6 + 5.3). It drafts ~2.9 deep at ~81% acceptance (code), ~2.0 deep
+  on prose. ds4: ~29.2 ms + ~9.4 ms per drafted token (6.8 verify row, of
+  which experts 4.8, plus ~2.6 drafting). The gap is ~3.4 ms per drafted
+  token, not 2x as the earlier fit said.
+- It drafts on a short vocabulary list (`/opt/halogen/draft-vocab.lists`,
+  counters `draft_list_tokens` / `draft_list_misses`) and adds prompt lookup
+  for greedy requests.
+- Quality, its own `ppl` mode on the same 8,823 ids (aligned per position
+  against base.dump): prefill path (chunk 1024) ppl x1.0207, 8-row path
+  (chunk 8, nearer its decode kernels) x1.0272. ds4 V3 + HT4: x1.0085. Its
+  prefill scored 8,823 tokens in 9.0 s.
+
 **Launch fusion, first pass (2026-10-11).** Committed: hc combine + norm in
 one launch for decode and verify (76e7b56), BF16 router matvec + top-k in
 one launch for single tokens (ed4ad1d). Plain 29.55 -> 29.24 ms GPU, 3-row
