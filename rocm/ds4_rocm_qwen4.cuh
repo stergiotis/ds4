@@ -813,12 +813,145 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4_multi(float *out, const fl
     }
 }
 
+/* MXFP4 down, K = 640, for 1-3 tokens (NT = 1 for one token, 3 for a
+ * verify): OR rows per wave, so x is loaded once per OR rows instead of
+ * once per four, and the weight words of four rows are loaded before any is
+ * decoded, so each lane keeps 20 loads in flight.  A verify reads each
+ * routed expert once, from the block of the first token that selects it.
+ * Each (pair, row) sum runs in moe_down_mxfp4's order, so results match it
+ * bit for bit. */
+template<unsigned OR, unsigned NT>
+__global__ __launch_bounds__(128) void moe_down_mxfp4_rows(float *out, const float *x, const int *selected,
+        const char *w, const char *sh, unsigned NE, unsigned NS, unsigned M, uint64_t rb, uint64_t srb, unsigned T) {
+    constexpr unsigned K = 640, NB = 20;
+    const unsigned lane = threadIdx.x & 31, row0 = (blockIdx.x * 4 + threadIdx.x / 32) * OR;
+    const unsigned slot = blockIdx.y, t0 = blockIdx.z;
+    const uint64_t pair0 = (uint64_t)t0 * (NS + 1) + slot;
+    if (slot == NS) {
+        const float *xt = x + pair0 * K;
+        for (unsigned r = 0; r < OR; r++) {
+            const unsigned row = row0 + r;
+            if (row >= M) return;
+            const float a = dot_q8_vec(sh + row * srb, xt, K);
+            if (!lane) out[pair0 * M + row] = a;
+        }
+        return;
+    }
+    const int e = selected[(uint64_t)t0 * NS + slot];
+    if (e < 0 || (unsigned)e >= NE) {
+        if (!lane) for (unsigned r = 0; r < OR; r++) if (row0 + r < M) out[pair0 * M + row0 + r] = 0;
+        return;
+    }
+    uint64_t pairs[NT];
+    pairs[0] = pair0;
+    unsigned n = 1;
+    if (NT > 1) {
+        for (unsigned t = 0; t < t0; t++)
+            for (unsigned s = 0; s < NS; s++)
+                if (selected[(uint64_t)t * NS + s] == e) return;
+        for (unsigned t = t0 + 1; t < T && n < NT; t++)
+            for (unsigned s = 0; s < NS; s++)
+                if (selected[(uint64_t)t * NS + s] == e) { pairs[n++] = (uint64_t)t * (NS + 1) + s; break; }
+    }
+    float xv[NT][32];
+    #pragma unroll
+    for (unsigned p = 0; p < NT; p++) {
+        if (p < n && lane < NB) {
+            const float *xt = x + pairs[p] * K;
+            #pragma unroll
+            for (unsigned k = 0; k < 8; k++) {
+                const float4 v = *(const float4 *)(xt + lane * 32 + k * 4);
+                xv[p][k * 4] = v.x; xv[p][k * 4 + 1] = v.y; xv[p][k * 4 + 2] = v.z; xv[p][k * 4 + 3] = v.w;
+            }
+        }
+    }
+    const char *we = w + (uint64_t)e * M * rb + lane * 17;
+    for (unsigned rc = 0; rc < OR; rc += 4) {
+        unsigned wd[4][5], o[4];
+        #pragma unroll
+        for (unsigned r = 0; r < 4; r++) {
+            const uintptr_t a = (uintptr_t)(we + (uint64_t)(row0 + rc + r) * rb);
+            o[r] = (unsigned)(a & 3);
+            if (lane < NB && row0 + rc + r < M) {
+                const unsigned *pw = (const unsigned *)(a - o[r]);
+                #pragma unroll
+                for (unsigned i = 0; i < 5; i++) wd[r][i] = pw[i];
+            }
+        }
+        #pragma unroll
+        for (unsigned r = 0; r < 4; r++) {
+            const unsigned row = row0 + rc + r;
+            if (row >= M) return;
+            float lv[32], scale = 0;
+            if (lane < NB) {
+                const unsigned sb = (wd[r][0] >> (8 * o[r])) & 255;
+                scale = sb == 0 ? 0x1p-127f : __uint_as_float(sb << 23);
+                /* nibble word k sits at byte o + 1 + 4k: words picked by
+                 * select, not by index, so wd stays in registers */
+                const bool q1 = o[r] == 3;
+                const unsigned sh8 = 8 * ((o[r] + 1) & 3);
+                #pragma unroll
+                for (unsigned k = 0; k < 4; k++) {
+                    const unsigned lo = q1 ? wd[r][k + 1] : wd[r][k];
+                    const unsigned hi = q1 ? (k + 2 < 5 ? wd[r][k + 2] : 0u) : wd[r][k + 1];
+                    const unsigned nb = __funnelshift_r(lo, hi, sh8);
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; j++) {
+                        const unsigned byte = (nb >> (8 * j)) & 255;
+                        lv[k * 4 + j] = mxfp4_level(byte & 15);
+                        lv[16 + k * 4 + j] = mxfp4_level(byte >> 4);
+                    }
+                }
+            }
+            #pragma unroll
+            for (unsigned p = 0; p < NT; p++) {
+                if (p < n) {
+                    float acc = 0;
+                    if (lane < NB) {
+                        #pragma unroll
+                        for (unsigned k = 0; k < 4; k++) {
+                            #pragma unroll
+                            for (unsigned j = 0; j < 4; j++)
+                                acc += lv[k * 4 + j] * xv[p][k * 4 + j] + lv[16 + k * 4 + j] * xv[p][16 + k * 4 + j];
+                        }
+                        acc *= scale;
+                    }
+                    acc = sum(acc);
+                    if (!lane) out[pairs[p] * M + row] = acc;
+                }
+            }
+        }
+    }
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     static int mxfp4_old = -1;
     if (mxfp4_old < 0) mxfp4_old = getenv("DS4_QWEN4_MXFP4_OLD") != NULL;
+    /* DS4_QWEN4_MXFP4_ROWS: rows per wave of moe_down_mxfp4_rows (4, 8, 16;
+     * 0 keeps moe_down_mxfp4 and its multi-token form) */
+    static int mxfp4_rows = -1;
+    if (mxfp4_rows < 0) {
+        const char *v = getenv("DS4_QWEN4_MXFP4_ROWS");
+        mxfp4_rows = v && v[0] ? atoi(v) : 4;
+        if (mxfp4_rows != 0 && mxfp4_rows != 4 && mxfp4_rows != 8 && mxfp4_rows != 16) mxfp4_rows = 4;
+    }
+    if (!mxfp4_old && mxfp4_rows && down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
+        M % (4u * mxfp4_rows) == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
+        const dim3 grid(M / (4u * mxfp4_rows), NS + 1, T);
+        if (T == 1) {
+            if (mxfp4_rows == 4) moe_down_mxfp4_rows<4,1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+            else if (mxfp4_rows == 8) moe_down_mxfp4_rows<8,1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+            else moe_down_mxfp4_rows<16,1><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+        } else {
+            if (mxfp4_rows == 4) moe_down_mxfp4_rows<4,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+            else if (mxfp4_rows == 8) moe_down_mxfp4_rows<8,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+            else moe_down_mxfp4_rows<16,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
+        }
+        return launched();
+    }
     if (!mxfp4_old && down && T == 1 && type == 39 && st == 8 && K == 640 && M % 16 == 0 &&
         !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
         const dim3 grid(M / 16, NS + 1, 1);

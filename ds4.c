@@ -61102,6 +61102,41 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+/* DS4_QWEN4_UNION_STATS=1: distinct routed experts per layer in each 2- and
+ * 3-row pass (verify), printed at exit.  Reads the selection back, so it
+ * stalls every layer; for measurement only. */
+static uint64_t qwen4_union_hist[4][97];   /* up to 3 rows x 32 experts */
+static void qwen4_union_report(void) {
+    for (uint32_t T = 2; T <= 3; T++) {
+        uint64_t n = 0, sum = 0;
+        for (uint32_t u = 0; u < 97u; u++) { n += qwen4_union_hist[T][u]; sum += u * qwen4_union_hist[T][u]; }
+        if (!n) continue;
+        fprintf(stderr, "ds4: Qwen expert union T=%u: %llu layer passes, mean %.2f of %u (%.3fx T=1); histogram",
+                T, (unsigned long long)n, (double)sum / n, T * DS4_N_EXPERT_USED, (double)sum / n / DS4_N_EXPERT_USED);
+        for (uint32_t u = DS4_N_EXPERT_USED; u <= T * DS4_N_EXPERT_USED; u++)
+            if (qwen4_union_hist[T][u]) fprintf(stderr, " %u:%.3f", u, (double)qwen4_union_hist[T][u] / n);
+        fprintf(stderr, "\n");
+    }
+}
+static void qwen4_union_observe(const ds4_qwen4_gpu_graph *g, uint32_t T) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("DS4_QWEN4_UNION_STATS") != NULL;
+        if (on) atexit(qwen4_union_report);
+    }
+    if (!on || T < 2u || T > 3u) return;
+    int32_t sel[96];
+    if (DS4_N_EXPERT_USED > 32u) return;
+    if (!ds4_gpu_tensor_read(g->selected, 0, sel, (uint64_t)T * DS4_N_EXPERT_USED * sizeof(sel[0]))) return;
+    uint32_t u = 0;
+    for (uint32_t i = 0; i < T * DS4_N_EXPERT_USED; i++) {
+        bool seen = false;
+        for (uint32_t j = 0; j < i && !seen; j++) seen = sel[j] == sel[i];
+        u += !seen;
+    }
+    qwen4_union_hist[T][u]++;
+}
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
@@ -61113,6 +61148,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]) &&
               qwen4_mark("router softmax+top-k", l->ffn_gate_inp_shexp->bytes);
+    if (ok) qwen4_union_observe(g, T);
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
