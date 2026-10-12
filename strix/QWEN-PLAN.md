@@ -540,8 +540,10 @@ through the decode matvec 16 rows at a time (58% of prefill).
 - dfa02e9: MXFP4 expert down at >= 2048 rows through matrix_down_tile
   (per-tile item rows, float4 activations, LDS-staged contiguous stores,
   staging aliased onto the operand tiles for occupancy): 48.5 -> 31.4 ms
-  per layer at an 8192-row chunk. Larger tiles were slower (occupancy); a
-  k-step of 32 looked 2x faster but was wrong and is not kept.
+  per layer at an 8192-row chunk. Larger tiles were slower (occupancy). A
+  k-step of 32 first looked 2x faster and wrong: the experiment built its
+  tile list for 64-item tiles while launching 32-item tiles, skipping half
+  the items. Measured properly it matches k-step 64 exactly, at no gain.
 - e712a35: the direct Q8 kernel for any K % 32, which moves the hc up GEMM
   (K = 320) off hipBLAS: 6.9 -> 2.3 ms per call.
 - Rejected: three hc down launch shapes for M = 320 (all slower).
