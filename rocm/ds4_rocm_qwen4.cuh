@@ -2678,7 +2678,7 @@ static int dense_q4k_direct(float *out, const float *x, const char *w,
 
 static int dense_q8_blas(float *out, const float *x, const char *w,
         unsigned T, unsigned K, unsigned M) {
-    if (T>=32 && !(K%128) && ds4_rocm_is_gfx1151()) {
+    if (T>=32 && !(K%32) && ds4_rocm_is_gfx1151()) {
         const uint64_t xn=(uint64_t)T*K;
         const uint64_t xbytes=(xn*sizeof(__half)+15)&~UINT64_C(15);
         __half *xh=(__half *)cuda_tmp_alloc(xbytes+((uint64_t)T+M)*sizeof(float),

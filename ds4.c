@@ -60974,7 +60974,9 @@ static bool qwen4_graph_hc_mix_ex(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     if (T > 8u && up_gemm) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
+               qwen4_mark("hc lo act", 0) &&
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
+               qwen4_mark("hc up gemm", up->bytes) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
     if (T == 3u && g->verify_rows_exact) {
