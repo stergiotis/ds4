@@ -2396,10 +2396,11 @@ __global__ void qwen_q8_direct(float *out,
     const unsigned tid=threadIdx.x, wave=tid>>5, lane=tid&31, lane16=lane&15;
     const unsigned row0=block_m+wave*16, my_row=row0+lane16;
     const unsigned safe_row=my_row<M ? my_row : M-1;
-    /* WT 8: Q8_0 blocks of 32; WT 12: Q4_K blocks of 256; WT 200: F8_B128 blocks of 512 */
-    const uint64_t rb=WT==200 ? (uint64_t)(K/512)*528 : WT==12 ? (uint64_t)(K/256)*144 : (uint64_t)(K/32)*34;
+    /* WT 8: Q8_0 blocks of 32; WT 12: Q4_K blocks of 256; WT 200: F8_B128 blocks of 512;
+     * WT 1: F16 rows (no row scale, ws unused) */
+    const uint64_t rb=WT==1 ? (uint64_t)K*2 : WT==200 ? (uint64_t)(K/512)*528 : WT==12 ? (uint64_t)(K/256)*144 : (uint64_t)(K/32)*34;
     const unsigned char *wr=w+(uint64_t)safe_row*rb;
-    const float winv=1.0f/ws[safe_row];
+    const float winv=WT==1 ? 1.0f : 1.0f/ws[safe_row];
     __shared__ _Float16 sx[NT][KT+PAD];
     float8 acc[NF]={};
     for (unsigned k0=0;k0<length;k0+=KT) {
@@ -2416,7 +2417,11 @@ __global__ void qwen_q8_direct(float *out,
         for (unsigned kb=0;kb<KT/32;kb++) {
             if (k0+kb*32>=length) break;
             half16 a0,a1;
-            if (WT==200) {
+            if (WT==1) {
+                const _Float16 *hp=(const _Float16 *)wr+begin+k0+kb*32;
+                a0=*(const half16 *)hp;
+                a1=*(const half16 *)(hp+16);
+            } else if (WT==200) {
                 const unsigned kk=begin+k0+kb*32;
                 const unsigned char *bp=wr+(uint64_t)(kk/512)*528;
                 const float sc=((const float *)bp)[kk%512/128]*256.0f*winv;
@@ -2472,7 +2477,7 @@ __global__ void qwen_q8_direct(float *out,
             const unsigned row=row0+2*j+(lane>>4);
             if (row<M) {
                 const uint64_t dst=(uint64_t)tok*M+row;
-                const float v=acc[f][j]*xs[tok]*ws[row];
+                const float v=acc[f][j]*xs[tok]*(WT==1 ? 1.0f : ws[row]);
                 out[dst]=begin ? out[dst]+v : v;
             }
         }
@@ -3465,6 +3470,116 @@ extern "C" int ds4_gpu_qwen4_sumsq_tensor(ds4_gpu_tensor *acc, const ds4_gpu_ten
     return launched();
 }
 
+namespace qwen4_rocm {
+/* 128-point Sylvester FWHT of v[0..3] held by a wave at index lane*4 + q */
+__device__ __forceinline__ void ht4_fwht_wave(float v[4]) {
+    const unsigned lane = threadIdx.x & 31;
+    float a = v[0], b = v[1];
+    v[0] = a + b; v[1] = a - b;
+    a = v[2]; b = v[3];
+    v[2] = a + b; v[3] = a - b;
+    a = v[0]; b = v[2];
+    v[0] = a + b; v[2] = a - b;
+    a = v[1]; b = v[3];
+    v[1] = a + b; v[3] = a - b;
+    #pragma unroll
+    for (unsigned m = 1; m < 32; m <<= 1) {
+        #pragma unroll
+        for (unsigned q = 0; q < 4; q++) {
+            const float o = __shfl_xor(v[q], m, 32);
+            v[q] = (lane & m) ? o - v[q] : v[q] + o;
+        }
+    }
+}
+
+/* HT4 to f16 W[N][K] in GGUF order, one 128 x 128 block per workgroup: the
+ * trellis block M decoded into LDS (columns XOR-swizzled by row), Hn M Hn
+ * by row and column transforms, scaled by sv and su, written to output band
+ * rperm[b] and input block cperm[j]. */
+__global__ __launch_bounds__(256) void ht4_unpack(__half *out, const unsigned *w, const __half *su,
+        const __half *sv, const int *rperm, const int *cperm, unsigned K) {
+    constexpr float RS2 = 1.0f / 128.0f;
+    __shared__ float L[128 * 128];
+    const unsigned b = blockIdx.x, jb = blockIdx.y, tid = threadIdx.x, wave = tid / 32, lane = tid & 31;
+    const unsigned ctiles = K / 16;
+#define HT4_S(r, c) ((r) * 128 + ((c) ^ ((r) & 31)))
+    #pragma unroll
+    for (unsigned q = 0; q < 8; q++) {
+        const unsigned idx = tid + 256 * q, tile = idx / 32, l = idx & 31;
+        const unsigned rt = tile % 8, ctl = tile / 8;
+        const unsigned *tw = w + ((uint64_t)(b * ctiles + jb * 8 + ctl) * 8 + rt) * 32;
+        const unsigned cur = tw[l], prev = tw[(l + 31) & 31];
+        const unsigned r = rt * 16 + (l & 15), c0 = ctl * 16 + 8 * (l / 16);
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j += 2) {
+            const ht4_h2 m = ht4_pair(__builtin_amdgcn_alignbit(prev, cur, 28 - 4 * j) & 0xFFFFu,
+                                      __builtin_amdgcn_alignbit(prev, cur, 24 - 4 * j) & 0xFFFFu);
+            L[HT4_S(r, c0 + j)] = (float)m.x;
+            L[HT4_S(r, c0 + j + 1)] = (float)m.y;
+        }
+    }
+    __syncthreads();
+    for (unsigned r = wave * 16; r < wave * 16 + 16; r++) {
+        float v[4];
+        #pragma unroll
+        for (unsigned q = 0; q < 4; q++) v[q] = L[HT4_S(r, lane * 4 + q)];
+        ht4_fwht_wave(v);
+        #pragma unroll
+        for (unsigned q = 0; q < 4; q++) L[HT4_S(r, lane * 4 + q)] = v[q];
+    }
+    __syncthreads();
+    for (unsigned c = wave * 16; c < wave * 16 + 16; c++) {
+        float v[4];
+        #pragma unroll
+        for (unsigned q = 0; q < 4; q++) v[q] = L[HT4_S(lane * 4 + q, c)];
+        ht4_fwht_wave(v);
+        const float cs = __half2float(su[jb * 128 + c]) * RS2;
+        #pragma unroll
+        for (unsigned q = 0; q < 4; q++)
+            L[HT4_S(lane * 4 + q, c)] = v[q] * cs * __half2float(sv[b * 128 + lane * 4 + q]);
+    }
+    __syncthreads();
+    const unsigned ob = rperm ? (unsigned)rperm[b] : b, oj = cperm ? (unsigned)cperm[jb] : jb;
+    for (unsigned i = tid; i < 128 * 128; i += 256) {
+        const unsigned r = i / 128, c = i & 127;
+        out[(uint64_t)(ob * 128 + r) * K + oj * 128 + c] = __float2half(L[HT4_S(r, c)]);
+    }
+#undef HT4_S
+}
+
+/* bulk rows: unpack to f16 and run the f16 projection; 0 when not taken */
+static int ht4_bulk(float *y, const float *x, const unsigned *w, const __half *su, const __half *sv,
+        const int *rp, const int *cp, unsigned T, unsigned K, unsigned N) {
+    static __half *buf;
+    static uint64_t cap;
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_QWEN4_HT4_NO_BULK") != NULL;
+    const uint64_t need = (uint64_t)N * K * 2;
+    if (off || T < 32 || !g_cublas_ready || g_quality_mode || K % 128 || N % 128 ||
+        need > (UINT64_C(256) << 20) || T > INT_MAX) return 0;
+    if (need > cap) {
+        if (buf) { (void)cudaFree(buf); buf = NULL; cap = 0; }
+        if (cudaMalloc((void **)&buf, need) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+        cap = need;
+    }
+    ht4_unpack<<<dim3(N / 128, K / 128), 256, 0, 0>>>(buf, w, su, sv, rp, cp, K);
+    if (!launched()) return 0;
+    if (!ds4_rocm_is_gfx1151()) return dense_f16_blas(y, x, buf, T, K, N);
+    const uint64_t xbytes = ((uint64_t)T * K * sizeof(__half) + 15) & ~UINT64_C(15);
+    __half *xh = (__half *)cuda_tmp_alloc(xbytes + (uint64_t)T * sizeof(float), "Qwen HT4 bulk activations");
+    if (!xh) return 0;
+    float *xs = (float *)((char *)xh + xbytes);
+    pack_half_rows<0><<<T, 256, 0, 0>>>(xs, xh, (const char *)x, K, (uint64_t)K * 4);
+    if (!launched()) return 0;
+    const unsigned segment = K > 4096 ? 1024 : K;
+    for (unsigned begin = 0; begin < K; begin += segment)
+        if (!launch_qwen_q8_direct<1>(y, (const unsigned char *)buf, xh, xs, xs, T, K, N, begin,
+                                      std::min(segment, K - begin))) return 0;
+    return 1;
+}
+
+}  // namespace qwen4_rocm
+
 extern "C" int ds4_gpu_qwen4_ht4_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t w_off, uint64_t su_off, uint64_t sv_off,
         uint64_t rperm_off, uint64_t cperm_off, uint32_t T, uint32_t K, uint32_t N) {
@@ -3479,6 +3594,7 @@ extern "C" int ds4_gpu_qwen4_ht4_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_te
     ht4_set set = {};
     set.w[0] = (const unsigned *)w; set.sv[0] = sv; set.rperm[0] = rp; set.y[0] = (float *)out->ptr;
     set.band0[0] = 0; set.band0[1] = N / 128; set.n = 1;
+    if (ht4_bulk((float *)out->ptr, (const float *)x->ptr, (const unsigned *)w, su, sv, rp, cp, T, K, N)) return 1;
     return ht4_dispatch(set, (const float *)x->ptr, su, cp, T, K);
 }
 
@@ -3501,6 +3617,13 @@ extern "C" int ds4_gpu_qwen4_ht4_multi_tensor(const ds4_gpu_tensor *x, uint32_t 
         if (!set.w[i] || !set.sv[i] || (rperm_offs[i] != UINT64_MAX && !set.rperm[i])) return 0;
         set.y[i] = (float *)outs[i]->ptr;
         set.band0[i + 1] = set.band0[i] + N / 128;
+    }
+    if (T >= 32) {
+        bool all = true;
+        for (unsigned i = 0; i < n && all; i++)
+            all = ht4_bulk(set.y[i], (const float *)x->ptr, set.w[i], su, set.sv[i], set.rperm[i], NULL, T, K,
+                           (set.band0[i + 1] - set.band0[i]) * 128) != 0;
+        if (all) return 1;
     }
     return ht4_dispatch(set, (const float *)x->ptr, su, NULL, T, K);
 }
