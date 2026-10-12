@@ -737,6 +737,156 @@ Kernels this needed (each A/B'd; greedy identical where the math is):
 - The hc up GEMM at prefill now also takes Q8_0 (it excluded Q8_0, which
   cost 6.3 s per 8K chunk).
 
+## Prefill plan after reading gufo (night of 2026-10-12)
+
+[gufo](https://github.com/gufo-org/gufo) (MIT, read at 2599ad6) prefills
+this model at ~1,700 tok/s (pp2048) on gfx1151 from the Unsloth Q4_K_XL
+GGUF. Code-reading notes with file:line citations: `strix/gufo/prefill.md`
+and `strix/gufo/decode-mtp.md`. gufo is MIT, so kernels may be ported with
+its copyright notice (unlike halogen); designs below are re-derived for our
+formats either way.
+
+**Where the 2x is.** gufo's d0 pp2048 kernel time is 1,195 ms (routed MoE
+34%, dense F16 29%, HC combine 10.7%, GDN scan 8.7%, int8 dense 7.4%,
+attention ~5%), 99.6% GPU-busy, ~32 launches per layer, no hipGraph. Scaled
+to one 8K chunk (gufo runs 4096-token chunks; per-op cost is linear in
+tokens at these widths) against ours at ~10.5 s per 8K chunk (shares from
+the noon trace, to be re-measured as true per-call times, step 0):
+
+| op group | ours ms / 8K | gufo-equivalent ms / 8K | gufo design |
+|---|---:|---:|---|
+| routed experts gate/up + down | ~2,530 | ~1,630 | paired gate+up with SwiGLU in the epilogue, packed codes in LDS decoded per wave, 128-row x 48/64/128-token tiles, tokens read by index (no gather), host-built exact tile list per layer |
+| GDN qkv+z projection | ~1,470 | ~660 (conv included) | 256x128 tiles, 64x64 per wave, both operands in LDS (Q8 dequantized to F16 at LDS commit), swizzled LDS, one stage of register prefetch, row-group launch order, conv+SiLU in the epilogue |
+| hc norm + mix + combine + MoE reduce | ~1,710 | ~510 + mix in hc-up epilogue | one combine kernel: MoE reduce + residual update + next norm, writes F16 (and tiled Q8) inputs for the next GEMMs; ~200 GB/s |
+| GDN scan | ~880 | ~250 | sequential FP32, 4 lanes x 2 rows, S.k and S.q in one pass (k.q precomputed), 3 windows of loads in flight, DPP reductions |
+| GDN norm + out projection | ~840 | ~245 | norm/gate epilogue writes padded F16 rows; GEMM with row-group order (5.7 -> 3.4 ms at 4K) |
+| hc down 10240->320 | ~630 | ~155 | int8 WMMA, 64x128 tiles, SiLU(x/4) epilogue writing F16 |
+| attention projections | ~480 | ~175 | one fused GEMM, RMSNorm + RoPE + KV store in the epilogue |
+| GDN conv + gates | ~400 | (in GEMM) + small | conv in the qkv GEMM epilogue; gates as two tiny kernels |
+| hc up | ~390 | ~300 (incl. mix) | 256x128 F16 GEMM, sigmoid mix epilogue |
+| attention core / index / select | ~620 | ~500 at 8K depth | not a priority |
+
+Our routed experts are only ~1.5x behind; the rest is ~2.5x behind. Two
+structural differences explain most of it:
+
+1. **Our direct GEMM re-streams the weights.** `qwen_q8_direct` gives each
+   wave 16 rows and all NT tokens, loads the A fragment from global per lane
+   and walks M fastest in the grid. An HT4 matrix unpacked to F16 (GDN
+   qkv+z: 16384 x 2560 x 2 B = 84 MB) exceeds the 32 MB MALL, so each of the
+   64 token tiles of an 8K chunk reads it again: ~5 GB per call, i.e. the
+   GEMM runs at DRAM speed (~17 TFLOP/s) rather than WMMA speed. The plain
+   grid swap failed because it moves the re-streaming to the activations;
+   grouped ordering bounds both. (L2 2 MB, MALL 32 MB, 40 CUs at 2.9 GHz.)
+2. **We run everything in F32 between kernels and repack per GEMM.** Each
+   direct GEMM first runs `pack_half_rows` (row max, then F16) over its F32
+   input; hc norm, mix, combine and MoE reduce are separate F32 passes, and
+   `hc_norm` re-reads each stream's row 8 times (one per chunk block).
+   gufo's producers write the consumer's input format once.
+
+### Steps, in order (each with the usual gates)
+
+Gates for every step: perplexity on the eval file (32-row batches; report
+vs the HT4 dump and the reference), decode output identical and ~29.2 ms,
+`strix/qwen-identity.sh` passes, warm prefill at 2K and 8K (alternate
+builds, discard a warm-up run). Kernels the perplexity run does not reach
+(T >= 256 / 2048 paths) get an on-device comparison against the old kernel
+on the same inputs. Keep `DS4_QWEN4_*` switches back to the old path.
+
+**Step 0 - baseline, 07:10 (~30 min).** Per-call true times at 2,048 and
+8,192 rows: a 2,040-token prompt (one forward) with `DS4_GPU_TRACE=1`,
+`DS4_QWEN4_MOE_PROFILE=1` at 8K, rocprof (`rocprofv3 --kernel-trace`) if
+available for per-kernel names. Add a trace mark for `pack_half_rows` and
+the HT4 unpack so their share is known. Output: a table like gufo's per
+shape (16384x2560, 2560x6144, 13312x2560, 10240x320, 320x10240) in ms at
+2,048 rows, directly comparable with `executor.cpp:108-115`.
+
+**Step 1 - grouped launch order in `qwen_q8_direct` (~1 h, low risk).**
+Remap blockIdx so that G row tiles x all token tiles of a column group run
+together (Triton-style GROUP_M; 40 resident blocks cover e.g. 8 row tiles x
+5 token tiles). Prediction: GDN qkv+z 41 -> <= 30 ms per 8K call, GDN out
+and hc up similar; arithmetic unchanged, output byte-identical. If it gains
+< 5% on the 16384 x 2560 shape, hypothesis 1 is wrong: measure DRAM bytes
+with `strix/dram_bw.sh` during the GEMM before going on.
+
+**Step 2 - GDN scan rewrite (~2-3 h).** New prefill kernel (T >= 64,
+`DS4_QWEN4_SCAN_OLD=1` back): 4 lanes per 128-wide state row and 2 rows per
+lane (32 keys per lane in registers), 4 waves per block, grid (D / 64, Hv);
+per token u = S.k and p = S.q in the same pass after the decay, delta =
+(v - u) beta, o = p + delta (k.q) with k.q from `gdn_prep`; q/k/v/decay/beta
+staged per 4-token window through LDS with 2-3 windows of loads in flight;
+xor/DPP reductions over 4 lanes. Same FP32 math, different summation
+order: expect ppl within +-0.002, state rel diff ~1e-6 (compare with the
+old kernel on the 8K prompt). MTP snapshots (st, st2) kept. Prediction:
+~24 -> ~7 ms per 8K layer, ~-0.6 s per 8K chunk (+6%).
+
+**Step 3 - new dense GEMM for the wide shapes (1-2 days).** Replace
+`qwen_q8_direct` at T >= 1024 for M >= 2048 (16384x2560, 2560x6144,
+13312x2560, 10240x320 (K=320), 2560x2560): 256x128 block tile, 8 waves,
+64x64 per wave (4x4 WMMA fragments: 8 fragment loads per 16 WMMAs instead
+of 1 per 1), both operands in LDS ([k][rows][4 x 16 B] with chunk XOR
+swizzle), weights fetched one stage ahead in registers and converted at LDS
+commit (Q8_0: byte-permute into 1152 + hfma2; F16 from the HT4 bulk buffer:
+copy; Q4_K: decode), F16 activation rows from the producer, LDS-transposed
+128 B stores, row-group order from step 1. Target 30+ TFLOP/s (gufo:
+16384x2560 at 2,048 rows in 4.6 ms = 37 TFLOP/s). Prediction: dense total
+~3.2 s -> ~1.5 s per 8K chunk (+15-20%). Risk: VGPR pressure (gufo: 221;
+their double buffering spilled and lost 3-14%).
+
+**Step 4 - one combine kernel and F16 inputs (1 day).** Fuse MoE reduce +
+`hc_combine` + next `hc_norm` (+ inject dots) into one per-token kernel
+(float4, one read of R, the expert partials and the shared output; one
+write of R; xn written as F16 rows for the GEMMs, so `pack_half_rows`
+disappears for those consumers). The earlier fused combine+norm at prefill
+lost (6.83 vs 2.98+3.57 ms) because it kept hc_norm's 8-chunk structure;
+this one is one block per token with the 4 stream sums in registers. Then
+the hc-mix epilogue writes F16 for the GDN/attention projections. Our F16
+packs use a per-row power-of-two scale; keep it (the producer knows the row
+max) so the GEMM arithmetic stays as today. Prediction: ~1.7 -> ~0.7 s per
+8K (+10%).
+
+**Step 5 - hc down as int8 (~half day).** 320 x 10240 (K long, M small):
+gufo's int8 WMMA kernel takes 0.40 ms at 2,048 rows against 1.3 ms in F16.
+Q8_0 weights times per-32 Q8 activations, F32 epilogue per block, SiLU(x/4)
+written as F16 for hc up. Prediction ~-0.45 s per 8K (+4%). Quality: the
+activations become 8-bit (gufo passes its gates with it); ppl decides.
+
+**Step 6 - experts (1 day).** Pair gate and up in one kernel with SwiGLU in
+the epilogue writing F16 rows for down; activations read by token index
+(drop the gather copy); exact non-empty tile list (we already build lists
+on the device). Down stays MXFP4 (`matrix_down_tile`, 14 TFLOP/s): try 48 /
+64-token tiles with codes kept packed in LDS and decoded per wave.
+Prediction ~2.5 -> ~1.8 s per 8K (+7%).
+
+**Step 7 - fusions into epilogues (later).** Conv + SiLU into the qkv GEMM
+epilogue; GDN norm/gate into a kernel that writes the padded F16 rows the
+out GEMM reads; attention q/k norm + RoPE + KV store into the projection
+epilogue.
+
+If steps 1-6 land as predicted, an 8K chunk goes from ~10.5 s to ~5.5-6 s
+(~1,400-1,500 tok/s). Order is by gain per hour; step 1 is a cheap test of
+the central hypothesis, so it runs first after the baseline.
+
+### Decode and speculation ideas from gufo (Track B, after prefill)
+
+- Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
+  permlanex16 reductions + up-front loads: +5.8-7.2% tg in gufo
+  (`EXPERIMENTS.md:50`). Our decode reads F32 activations into F16/F32
+  dots; worth one experiment on the Q8_0 hc / shared-expert matvecs first.
+- Their marginal cost per draft is ~8.3-8.8 ms with a full Q8 head (~3.1 ms
+  of it); a verify row is then ~4.5-5 ms vs our 6.8. Their routed gate/up
+  at T = 2..8 reads each distinct expert once with a per-token slot mask and
+  decodes the Q4_K fragment once per expert (`mmvq.hip.cpp:357-548`); we
+  already read each expert once (`moe_q4k_rows`), so compare per-row GB/s
+  before porting anything.
+- GDN at verify: state in registers across the T rows, read and written
+  once; rollback by replay from the anchor state plus per-token operands.
+- The MTP catch-up pass also emits the first draft (one MTP pass saved per
+  cycle). Check whether our cycle already does this.
+- No prompt lookup and no shortlist in gufo; their depth controller
+  (`mtp_policy.hpp`: decayed per-depth success counts, probing 2x deeper
+  after a full accept, 16 plain tokens when speculation does not pay) is a
+  candidate for our `--mtp` auto depth.
+
 ## How changes are checked
 
 - **Speed:** `ds4-bench --rocm` at 512 / 8K / 32K, three runs, before and
