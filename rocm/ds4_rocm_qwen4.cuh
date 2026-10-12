@@ -2525,14 +2525,28 @@ __global__ void qwen_q8_direct(float *out,
     const uint64_t rb=WT==1 || WT==30 ? (uint64_t)K*2 : WT==200 ? (uint64_t)(K/512)*528 : WT==12 ? (uint64_t)(K/256)*144 : (uint64_t)(K/32)*34;
     const unsigned char *wr=w+(uint64_t)safe_row*rb;
     const float winv=WT==1 || WT==30 ? 1.0f : 1.0f/ws[safe_row];
-    __shared__ _Float16 sx[NT][KT+PAD];
+    __shared__ __align__(16) _Float16 sx[NT][KT+PAD];
     float8 acc[NF]={};
     for (unsigned k0=0;k0<length;k0+=KT) {
         for (unsigned j=tid*VEC;j<NT*KT;j+=WAVES*32*VEC) {
             const unsigned tok=j/KT, kk=j%KT;
+            const unsigned gt=block_t+tok, gk=begin+k0+kk;
+            if (VEC==8 && !(K%8) && !(begin%8) && (KT+PAD)%8==0 && kk+8<=KT) {
+                /* eight activations in one 16-byte load (a tail past the K range stays scalar) */
+                uint4 v=make_uint4(0,0,0,0);
+                if (gt<T && gk+8<=begin+length) v=*(const uint4 *)(x+(uint64_t)gt*K+gk);
+                else if (gt<T) {
+                    _Float16 h[8];
+                    #pragma unroll
+                    for (unsigned z=0;z<8;z++) h[z]=gk+z<begin+length ? (_Float16)x[(uint64_t)gt*K+gk+z] : (_Float16)0;
+                    __builtin_memcpy(&v,h,16);
+                }
+                *(uint4 *)&sx[tok][kk]=v;
+                continue;
+            }
             #pragma unroll
             for (unsigned z=0;z<VEC;z++) {
-                const unsigned gt=block_t+tok, gk=begin+k0+kk+z;
+                const unsigned gk=begin+k0+kk+z;
                 if (kk+z<KT) sx[tok][kk+z]=(gt<T && gk<begin+length) ? (_Float16)x[(uint64_t)gt*K+gk] : (_Float16)0;
             }
         }
