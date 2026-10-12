@@ -2490,10 +2490,10 @@ __global__ void qwen_q8_direct(float *out,
     const unsigned row0=block_m+wave*16, my_row=row0+lane16;
     const unsigned safe_row=my_row<M ? my_row : M-1;
     /* WT 8: Q8_0 blocks of 32; WT 12: Q4_K blocks of 256; WT 200: F8_B128 blocks of 512;
-     * WT 1: F16 rows (no row scale, ws unused) */
-    const uint64_t rb=WT==1 ? (uint64_t)K*2 : WT==200 ? (uint64_t)(K/512)*528 : WT==12 ? (uint64_t)(K/256)*144 : (uint64_t)(K/32)*34;
+     * WT 1 / 30: F16 / BF16 rows (no row scale, ws unused) */
+    const uint64_t rb=WT==1 || WT==30 ? (uint64_t)K*2 : WT==200 ? (uint64_t)(K/512)*528 : WT==12 ? (uint64_t)(K/256)*144 : (uint64_t)(K/32)*34;
     const unsigned char *wr=w+(uint64_t)safe_row*rb;
-    const float winv=WT==1 ? 1.0f : 1.0f/ws[safe_row];
+    const float winv=WT==1 || WT==30 ? 1.0f : 1.0f/ws[safe_row];
     __shared__ _Float16 sx[NT][KT+PAD];
     float8 acc[NF]={};
     for (unsigned k0=0;k0<length;k0+=KT) {
@@ -2514,6 +2514,18 @@ __global__ void qwen_q8_direct(float *out,
                 const _Float16 *hp=(const _Float16 *)wr+begin+k0+kb*32;
                 a0=*(const half16 *)hp;
                 a1=*(const half16 *)(hp+16);
+            } else if (WT==30) {
+                const uint4 *bp=(const uint4 *)((const uint16_t *)wr+begin+k0+kb*32);
+                #pragma unroll
+                for (unsigned q=0;q<4;q++) {
+                    const uint4 v=bp[q];
+                    const unsigned u[4]={v.x,v.y,v.z,v.w};
+                    #pragma unroll
+                    for (unsigned h=0;h<4;h++) {
+                        const _Float16 lo=(_Float16)__uint_as_float(u[h]<<16), hi=(_Float16)__uint_as_float(u[h]&0xffff0000u);
+                        if (q<2) { a0[q*8+2*h]=lo; a0[q*8+2*h+1]=hi; } else { a1[(q-2)*8+2*h]=lo; a1[(q-2)*8+2*h+1]=hi; }
+                    }
+                }
             } else if (WT==200) {
                 const unsigned kk=begin+k0+kb*32;
                 const unsigned char *bp=wr+(uint64_t)(kk/512)*528;
@@ -2570,7 +2582,7 @@ __global__ void qwen_q8_direct(float *out,
             const unsigned row=row0+2*j+(lane>>4);
             if (row<M) {
                 const uint64_t dst=(uint64_t)tok*M+row;
-                const float v=acc[f][j]*xs[tok]*(WT==1 ? 1.0f : ws[row]);
+                const float v=acc[f][j]*xs[tok]*(WT==1 || WT==30 ? 1.0f : ws[row]);
                 out[dst]=begin ? out[dst]+v : v;
             }
         }
@@ -3642,6 +3654,24 @@ __global__ __launch_bounds__(256) void ht4_unpack(__half *out, const unsigned *w
 #undef HT4_S
 }
 
+/* rows of F16 (WT 1) or BF16 (WT 30) weights through qwen_q8_direct */
+template<unsigned WT>
+static int direct_plain(float *y, const float *x, const char *w, unsigned T, unsigned K, unsigned N) {
+    const uint64_t xbytes = ((uint64_t)T * K * sizeof(__half) + 15) & ~UINT64_C(15);
+    __half *xh = (__half *)cuda_tmp_alloc(xbytes + (uint64_t)T * sizeof(float), "Qwen direct activations");
+    if (!xh) return 0;
+    float *xs = (float *)((char *)xh + xbytes);
+    pack_half_rows<0><<<T, 256, 0, 0>>>(xs, xh, (const char *)x, K, (uint64_t)K * 4);
+    if (!launched()) return 0;
+    static int whole = -1;
+    if (whole < 0) whole = getenv("DS4_QWEN4_Q8_SEGMENT_K") == NULL;
+    const unsigned segment = K > 4096 && !whole ? 1024 : K;
+    for (unsigned begin = 0; begin < K; begin += segment)
+        if (!launch_qwen_q8_direct<WT>(y, (const unsigned char *)w, xh, xs, xs, T, K, N, begin,
+                                       std::min(segment, K - begin))) return 0;
+    return 1;
+}
+
 /* bulk rows: unpack to f16 and run the f16 projection; 0 when not taken */
 static int ht4_bulk(float *y, const float *x, const unsigned *w, const __half *su, const __half *sv,
         const int *rp, const int *cp, unsigned T, unsigned K, unsigned N) {
@@ -3660,19 +3690,7 @@ static int ht4_bulk(float *y, const float *x, const unsigned *w, const __half *s
     ht4_unpack<<<dim3(N / 128, K / 128), 256, 0, 0>>>(buf, w, su, sv, rp, cp, K);
     if (!launched()) return 0;
     if (!ds4_rocm_is_gfx1151()) return dense_f16_blas(y, x, buf, T, K, N);
-    const uint64_t xbytes = ((uint64_t)T * K * sizeof(__half) + 15) & ~UINT64_C(15);
-    __half *xh = (__half *)cuda_tmp_alloc(xbytes + (uint64_t)T * sizeof(float), "Qwen HT4 bulk activations");
-    if (!xh) return 0;
-    float *xs = (float *)((char *)xh + xbytes);
-    pack_half_rows<0><<<T, 256, 0, 0>>>(xs, xh, (const char *)x, K, (uint64_t)K * 4);
-    if (!launched()) return 0;
-    static int whole = -1;
-    if (whole < 0) whole = getenv("DS4_QWEN4_Q8_SEGMENT_K") == NULL;
-    const unsigned segment = K > 4096 && !whole ? 1024 : K;
-    for (unsigned begin = 0; begin < K; begin += segment)
-        if (!launch_qwen_q8_direct<1>(y, (const unsigned char *)buf, xh, xs, xs, T, K, N, begin,
-                                      std::min(segment, K - begin))) return 0;
-    return 1;
+    return direct_plain<1>(y, x, (const char *)buf, T, K, N);
 }
 
 }  // namespace qwen4_rocm
@@ -3734,6 +3752,11 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
     if (T <= 8 || (type == 8 && T <= 16)) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M);
+    static int bf16_direct = -1;
+    if (bf16_direct < 0) bf16_direct = getenv("DS4_QWEN4_BF16_NO_DIRECT") == NULL;
+    if (type == 30 && bf16_direct && T >= 32 && !(K % 32) && !((uintptr_t)w & 15) && ds4_rocm_is_gfx1151() &&
+        !g_quality_mode)
+        return direct_plain<30>((float *)out->ptr, (const float *)x->ptr, w, T, K, M);
     if (type == 1 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode)
         return dense_f16_blas((float *)out->ptr,(const float *)x->ptr,(const __half *)w,T,K,M);
