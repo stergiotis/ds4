@@ -2688,7 +2688,9 @@ static int dense_q8_blas(float *out, const float *x, const char *w,
         pack_half_rows<0><<<T,256,0,0>>>(xs,xh,(const char *)x,K,(uint64_t)K*4);
         qwen_dense_row_scales<8><<<M,256,0,0>>>(ws,w,K,row_bytes(8,K));
         if (!launched()) return 0;
-        const unsigned segment=K>4096 ? 1024 : K;
+        static int whole = -1;
+        if (whole < 0) whole = getenv("DS4_QWEN4_Q8_SEGMENT_K") == NULL;
+        const unsigned segment=K>4096 && !whole ? 1024 : K;
         for (unsigned begin=0;begin<K;begin+=segment) {
             const unsigned length=std::min(segment,K-begin);
             if (!launch_qwen_q8_direct(out,(const unsigned char *)w,xh,xs,ws,
@@ -3664,7 +3666,9 @@ static int ht4_bulk(float *y, const float *x, const unsigned *w, const __half *s
     float *xs = (float *)((char *)xh + xbytes);
     pack_half_rows<0><<<T, 256, 0, 0>>>(xs, xh, (const char *)x, K, (uint64_t)K * 4);
     if (!launched()) return 0;
-    const unsigned segment = K > 4096 ? 1024 : K;
+    static int whole = -1;
+    if (whole < 0) whole = getenv("DS4_QWEN4_Q8_SEGMENT_K") == NULL;
+    const unsigned segment = K > 4096 && !whole ? 1024 : K;
     for (unsigned begin = 0; begin < K; begin += segment)
         if (!launch_qwen_q8_direct<1>(y, (const unsigned char *)buf, xh, xs, xs, T, K, N, begin,
                                       std::min(segment, K - begin))) return 0;
