@@ -1255,22 +1255,51 @@ __global__ void matrix_down_tile(float *out, const float *x, const char *w0,
     }
     __syncthreads();
     float8 acc[NT/16]={};
-    for (unsigned k0=0;k0<K;k0+=KS) {
-        for (unsigned i=tid*4;i<NR*KS;i+=256*4) {
-            const unsigned row=r0+i/KS, k=k0+i%KS;
-            float4 av={};
-            if (row<M) av=value4<TYPE>(w0+((uint64_t)e*M+row)*rb,k,NULL,NULL);
-            _Float16 *d=&a[i/KS][i%KS];
-            d[0]=(_Float16)av.x; d[1]=(_Float16)av.y; d[2]=(_Float16)av.z; d[3]=(_Float16)av.w;
+    /* the next k step's raw MXFP4 words and activations are loaded into
+     * registers before this step's products and decoded after them */
+    constexpr unsigned NA = NR*KS/(256*4), NB = NT*KS/(256*4);
+    static_assert(TYPE == 39 && NA*256*4 == NR*KS && NB*256*4 == NT*KS, "MXFP4 tiles");
+    unsigned ra[NA], rs[NA];
+    float4 rx[NB];
+    auto load = [&](unsigned k0) {
+        #pragma unroll
+        for (unsigned n=0;n<NA;n++) {
+            const unsigned i=tid*4+n*1024, row=r0+i/KS, k=k0+i%KS;
+            ra[n]=0; rs[n]=0;
+            if (row<M) {
+                const uint8_t *bp=(const uint8_t *)(w0+((uint64_t)e*M+row)*rb)+(k/32)*17;
+                rs[n]=bp[0];
+                memcpy(&ra[n],bp+1+k%16,4);
+            }
         }
-        for (unsigned i=tid*4;i<NT*KS;i+=256*4) {
-            const unsigned t=i/KS, k=i%KS;
-            float4 xv={};
-            if (valid[t]) xv=*(const float4 *)(x+(uint64_t)orow[t]*K+k0+k);
-            _Float16 *d=&b[t][k];
-            d[0]=(_Float16)xv.x; d[1]=(_Float16)xv.y; d[2]=(_Float16)xv.z; d[3]=(_Float16)xv.w;
+        #pragma unroll
+        for (unsigned n=0;n<NB;n++) {
+            const unsigned i=tid*4+n*1024, t=i/KS, k=i%KS;
+            rx[n]=valid[t] ? *(const float4 *)(x+(uint64_t)orow[t]*K+k0+k) : make_float4(0,0,0,0);
+        }
+    };
+    load(0);
+    for (unsigned k0=0;k0<K;k0+=KS) {
+        #pragma unroll
+        for (unsigned n=0;n<NA;n++) {
+            const unsigned i=tid*4+n*1024, k=k0+i%KS;
+            const float scale=rs[n]==0 ? 0x1p-127f : __uint_as_float(rs[n]<<23);
+            _Float16 *d=&a[i/KS][i%KS];
+            #pragma unroll
+            for (unsigned j=0;j<4;j++) {
+                const unsigned q=(ra[n]>>(j*8+(k%32/16)*4))&15, mag=q&7;
+                const float level=mag<2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+                d[j]=(_Float16)((q&8 ? -level : level)*scale);
+            }
+        }
+        #pragma unroll
+        for (unsigned n=0;n<NB;n++) {
+            const unsigned i=tid*4+n*1024;
+            _Float16 *d=&b[i/KS][i%KS];
+            d[0]=(_Float16)rx[n].x; d[1]=(_Float16)rx[n].y; d[2]=(_Float16)rx[n].z; d[3]=(_Float16)rx[n].w;
         }
         __syncthreads();
+        if (k0+KS<K) load(k0+KS);
         #pragma unroll
         for (unsigned k=0;k<KS;k+=16) {
             half16 av;
@@ -1433,14 +1462,16 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             const bool grouped = T > 256 &&
                 (T < 2048 || (type == 12 && !down && T < 7168));
             const unsigned passes = grouped ? (down ? 3 : 4) : 1;
-            if (type == 39 && down && T >= 2048) {
+            static unsigned down_min = 0;
+            if (!down_min) down_min = getenv("DS4_QWEN4_DOWN_MIN") ? (unsigned)atoi(getenv("DS4_QWEN4_DOWN_MIN")) : 256;
+            if (type == 39 && down && T >= down_min) {
                 unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
                 if (!tiles) return 0;
-                expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,32);
+                expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,64);
                 if (!launched()) return 0;
-                const uint64_t blocks = (((uint64_t)T*NS+31)/32+NE)*((M+127)/128);
+                const uint64_t blocks = (((uint64_t)T*NS+63)/64+NE)*((M+127)/128);
                 if (blocks > INT_MAX) return 0;
-                matrix_down_tile<39,32,128,64><<<blocks,256,0,0>>>(out,x,w0,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+                matrix_down_tile<39,64,128,64><<<blocks,256,0,0>>>(out,x,w0,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
                 return launched();
             }
             for (unsigned pass = 0; pass < passes; pass++) {
