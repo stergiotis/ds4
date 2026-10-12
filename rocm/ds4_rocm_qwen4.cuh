@@ -1285,11 +1285,16 @@ __global__ void matrix_down_tile(float *out, const float *x, const char *w0,
             const unsigned i=tid*4+n*1024, k=k0+i%KS;
             const float scale=rs[n]==0 ? 0x1p-127f : __uint_as_float(rs[n]<<23);
             _Float16 *d=&a[i/KS][i%KS];
+            /* the four codes' f32 level bits from two byte lookups: top bytes
+             * 00 3F 3F 3F 40 40 40 40, next bytes 00 00 80 C0 00 40 80 C0 for
+             * magnitudes 0 .5 1 1.5 2 3 4 6 (value<39>'s levels) */
+            const unsigned codes=(ra[n]>>((k%32/16)*4))&0x0F0F0F0Fu, mags=codes&0x07070707u;
+            const unsigned top=__builtin_amdgcn_perm(0x40404040u,0x3F3F3F00u,mags);
+            const unsigned nxt=__builtin_amdgcn_perm(0xC0804000u,0xC0800000u,mags);
             #pragma unroll
             for (unsigned j=0;j<4;j++) {
-                const unsigned q=(ra[n]>>(j*8+(k%32/16)*4))&15, mag=q&7;
-                const float level=mag<2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
-                d[j]=(_Float16)((q&8 ? -level : level)*scale);
+                const unsigned bits=((top>>(8*j))&0xFFu)<<24 | ((nxt>>(8*j))&0xFFu)<<16 | ((codes>>(8*j+3))&1u)<<31;
+                d[j]=(_Float16)(__uint_as_float(bits)*scale);
             }
         }
         #pragma unroll
