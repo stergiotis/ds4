@@ -1221,6 +1221,89 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
     }
 }
 
+/* Expert down projection over one expert's token tile: matrix_half_tile's
+ * product (NR rows x NT items, 8 waves, f16 WMMA, k steps of KS), with each
+ * item's activation row and output row computed once per tile,
+ * activations read as float4, and the result staged through LDS (reusing
+ * the operand tiles, 64 rows at a time) so every item's outputs are stored
+ * contiguously. */
+template<unsigned TYPE, unsigned NT, unsigned NR, unsigned KS>
+__launch_bounds__(256)
+__global__ void matrix_down_tile(float *out, const float *x, const char *w0,
+        const int *lists, const int *counts, const unsigned *tiles, unsigned NE,
+        unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    static_assert(NR == 128 && NT % 16 == 0 && KS % 16 == 0, "eight 16-row waves");
+    const unsigned tid=threadIdx.x, wave=tid/32, lane=tid%32, lane16=lane%16;
+    const unsigned nr=(M+NR-1)/NR, job=blockIdx.x/nr;
+    if (job >= tiles[NE]) return;
+    unsigned e=0, end=NE;
+    while (e<end) { const unsigned mid=(e+end)/2; if (tiles[mid+1]<=job) e=mid+1; else end=mid; }
+    const unsigned count=counts[e], t0=(job-tiles[e])*NT, r0=(blockIdx.x%nr)*NR;
+    constexpr unsigned LD = KS + 8, LO = 64 + 4;
+    constexpr unsigned AB = (NR + NT) * LD * 2, OB = NT * LO * 4;
+    __shared__ __align__(16) unsigned char smem[AB > OB ? AB : OB];
+    _Float16 (*a)[LD] = (_Float16 (*)[LD])smem;
+    _Float16 (*b)[LD] = (_Float16 (*)[LD])(smem + NR * LD * 2);
+    float (*o)[LO] = (float (*)[LO])smem;
+    __shared__ unsigned orow[NT];
+    __shared__ int valid[NT];
+    if (tid < NT) {
+        const unsigned item=t0+tid;
+        const unsigned pair=item<count ? (unsigned)lists[(uint64_t)e*cap+item] : 0;
+        orow[tid]=(pair/NS)*NO+pair%NS;
+        valid[tid]=item<count;
+    }
+    __syncthreads();
+    float8 acc[NT/16]={};
+    for (unsigned k0=0;k0<K;k0+=KS) {
+        for (unsigned i=tid*4;i<NR*KS;i+=256*4) {
+            const unsigned row=r0+i/KS, k=k0+i%KS;
+            float4 av={};
+            if (row<M) av=value4<TYPE>(w0+((uint64_t)e*M+row)*rb,k,NULL,NULL);
+            _Float16 *d=&a[i/KS][i%KS];
+            d[0]=(_Float16)av.x; d[1]=(_Float16)av.y; d[2]=(_Float16)av.z; d[3]=(_Float16)av.w;
+        }
+        for (unsigned i=tid*4;i<NT*KS;i+=256*4) {
+            const unsigned t=i/KS, k=i%KS;
+            float4 xv={};
+            if (valid[t]) xv=*(const float4 *)(x+(uint64_t)orow[t]*K+k0+k);
+            _Float16 *d=&b[t][k];
+            d[0]=(_Float16)xv.x; d[1]=(_Float16)xv.y; d[2]=(_Float16)xv.z; d[3]=(_Float16)xv.w;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned k=0;k<KS;k+=16) {
+            half16 av;
+            #pragma unroll
+            for (unsigned j=0;j<16;j++) av[j]=a[wave*16+lane16][k+j];
+            #pragma unroll
+            for (unsigned c=0;c<NT/16;c++) {
+                half16 bv;
+                #pragma unroll
+                for (unsigned j=0;j<16;j++) bv[j]=b[c*16+lane16][k+j];
+                acc[c]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av,bv,acc[c]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned half=0;half<2;half++) {
+        if (wave/4==half) {
+            #pragma unroll
+            for (unsigned c=0;c<NT/16;c++) {
+                #pragma unroll
+                for (unsigned j=0;j<8;j++) o[c*16+lane16][(wave%4)*16+2*j+lane/16]=acc[c][j];
+            }
+        }
+        __syncthreads();
+        for (unsigned i=tid;i<NT*64;i+=256) {
+            const unsigned t=i/64, r=half*64+i%64;
+            if (valid[t] && r0+r<M) out[(uint64_t)orow[t]*M+r0+r]=o[t][i%64];
+        }
+        __syncthreads();
+    }
+}
+
 /* Stage the next gate block in registers while consuming the LDS tile. */
 template<unsigned TYPE, bool DOWN, unsigned NT, unsigned NR = 64>
 __launch_bounds__(256)
@@ -1350,6 +1433,16 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             const bool grouped = T > 256 &&
                 (T < 2048 || (type == 12 && !down && T < 7168));
             const unsigned passes = grouped ? (down ? 3 : 4) : 1;
+            if (type == 39 && down && T >= 2048) {
+                unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
+                if (!tiles) return 0;
+                expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,32);
+                if (!launched()) return 0;
+                const uint64_t blocks = (((uint64_t)T*NS+31)/32+NE)*((M+127)/128);
+                if (blocks > INT_MAX) return 0;
+                matrix_down_tile<39,32,128,64><<<blocks,256,0,0>>>(out,x,w0,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+                return launched();
+            }
             for (unsigned pass = 0; pass < passes; pass++) {
                 const unsigned nt = grouped ? 16u << pass :
                     T >= 2048 ? (down ? 32 : 128) : T <= 256 ? 16 : 32;
