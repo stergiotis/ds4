@@ -558,6 +558,35 @@ through the decode matvec 16 rows at a time (58% of prefill).
   8.2%, hc down 7.9%, GDN out 7.6%, GDN scan 6.9%, hc norm 4.8%, attention
   projections 4.5%, MoE reduce 4.0%, GDN conv+gates 3.2%, router 3.2%.
 
+**Prefill, day 1 continued (2026-10-12).** 8K 600 -> ~690 tok/s, 2K 554
+-> ~623.
+- 73d50f3: the direct WMMA projections accumulate the whole K in one
+  launch (the 1024-wide segments were for hipBLASLt): hc down 5.8 -> 3.8
+  ms, GDN out 15.2 -> 13.6 ms per call.
+- d421f1f: BF16 router projection through the direct kernel (WT 30).
+- 963887e: indexer block scores on WMMA (254 -> 83 ms per traced forward;
+  99.99% of selected blocks agree with the f32 kernel on the 8K prompt).
+- bddc050: expert down pipelined (next k step's raw MXFP4 words and
+  activations in registers before the products) with 64-item tiles: 31.4
+  -> 21.5 ms per layer at 8192 rows; used from 256 rows.
+- Rejected: token-tile-fastest block order for the direct GEMM (correct
+  once both grid and kernel swap, but 606 -> 548 tok/s); six tile shapes
+  for the large-M projections (the current one is best); hc down launch
+  shapes for M = 320; block-wise MXFP4 decode in the down kernel (no gain:
+  latency, not decode, was the limit); prefetching the GDN scan's inputs
+  (no gain: the scan is bound by its per-row lane reductions, ~1.8 TFLOP/s;
+  a chunked gated-delta formulation is the real fix, ~8% of 8K prefill).
+- Perplexity drifts within about +-0.002 NLL per floating-point path change
+  in either direction; the current build: x1.0125 vs the reference, KL
+  0.0466 (the matvec path this morning: x1.0085, KL 0.0474).
+- Note on the trace: "per forward" averages the 8K chunk with a small
+  second forward, so shares are right but absolute times are about half
+  of the 8K chunk's.
+- Remaining 8K shares: GDN qkv+z 17%, expert gate/up 12%, expert down 11%,
+  GDN out 8%, GDN scan 8%, hc down 6%, hc norm 5%, attention projections
+  5%, attention core 5%, MoE reduce 5%, GDN conv+gates 4%, hc up 3.5%, hc
+  mix 3%, hc combine 2%.
+
 **halogen measured directly (2026-10-11).**
 - Exactness: greedy output with `drafter: serial` vs `mtp` (API field) is
   byte-identical on the 4 identity prompts x 512 tokens. Its speculation is
