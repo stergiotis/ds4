@@ -3519,6 +3519,48 @@ extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
     return launched();
 }
 
+namespace qwen4_rocm {
+/* idx_score for many rows on WMMA (D = 128, H <= 4): a workgroup takes 16
+ * rows and 64 blocks, the rows' f16 queries staged in LDS, each wave one 16
+ * x 16 tile of row-block dot products per head, relu'd and summed over the
+ * heads; tiles entirely past the causal limit only write the mask value. */
+__global__ __launch_bounds__(128) void idx_score_wmma(float *out, const float *q, const __half *key,
+        unsigned N, unsigned H, unsigned T, unsigned pos0, unsigned ratio) {
+    constexpr unsigned D = 128, LQ = 4 * D + 8;
+    __shared__ __align__(16) _Float16 qs[16][LQ];
+    const unsigned tid = threadIdx.x, wave = tid / 32, lane = tid & 31, lane16 = lane & 15;
+    const unsigned t0 = blockIdx.y * 16, b0 = blockIdx.x * 64 + wave * 16;
+    for (unsigned i = tid; i < 16 * H * D; i += 128) {
+        const unsigned r = i / (H * D), c = i % (H * D);
+        qs[r][c] = (_Float16)(t0 + r < T ? q[(uint64_t)(t0 + r) * H * D + c] : 0.0f);
+    }
+    __syncthreads();
+    const unsigned tlast = min(T - 1, t0 + 15);
+    float tot[8] = {};
+    if (b0 < (pos0 + tlast + 1) / ratio) {
+        const unsigned bk = b0 + lane16;
+        const _Float16 *kr = (const _Float16 *)key + (uint64_t)(bk < N ? bk : 0) * D;
+        for (unsigned h = 0; h < H; h++) {
+            float8 acc = {};
+            #pragma unroll
+            for (unsigned k = 0; k < D; k += 16) {
+                const half16 a = *(const half16 *)&qs[lane16][h * D + k];
+                half16 b = *(const half16 *)(kr + k);
+                if (bk >= N) b = (half16){};
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+            }
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) tot[j] += fmaxf(acc[j], 0.0f);
+        }
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < 8; j++) {
+        const unsigned t = t0 + 2 * j + lane / 16, b = b0 + lane16;
+        if (t < T && b < N) out[(uint64_t)t * N + b] = b >= (pos0 + t + 1) / ratio ? -3e38f : tot[j];
+    }
+}
+}  // namespace qwen4_rocm
+
 extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *tiles,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *key, uint32_t T, uint32_t N,
         uint32_t H, uint32_t D, uint32_t pos0, uint32_t ratio) {
@@ -3527,6 +3569,12 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     if (!T || !N || !H || !D || !ratio || !tensor(out, (uint64_t)T * N * 4) ||
         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(key, (uint64_t)N * D * 2) ||
         (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
+    static int wm = -1;
+    if (wm < 0) wm = getenv("DS4_QWEN4_IDX_NO_WMMA") == NULL;
+    if (wm && T >= 16 && D == 128 && H <= 4 && !((uintptr_t)key->ptr & 31) && ds4_rocm_is_gfx1151())
+        idx_score_wmma<<<dim3((N + 63) / 64, (T + 15) / 16), 128, 0, 0>>>((float *)out->ptr,
+            (const float *)q->ptr, (const __half *)key->ptr, N, H, T, pos0, ratio);
+    else
     idx_score<<<dim3((N + 3) / 4, T), 128, 0, 0>>>((float *)out->ptr,
         (const float *)q->ptr, (const __half *)key->ptr, N, H, D, pos0, ratio);
     if (!launched()) return 0;
