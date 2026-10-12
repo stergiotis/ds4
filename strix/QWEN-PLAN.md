@@ -587,6 +587,27 @@ through the decode matvec 16 rows at a time (58% of prefill).
   5%, attention core 5%, MoE reduce 5%, GDN conv+gates 4%, hc up 3.5%, hc
   mix 3%, hc combine 2%.
 
+**Chunked GDN scan: verified, slower, parked (2026-10-12).** The scan's
+recurrence in chunks of 32: with G the in-chunk prefix sum of log decay
+and S0 the entering state, (I + L) Dl = R with L_ti = beta_t e^{G_t-G_i}
+(k_t.k_i) (i < t), R_t = beta_t (v_t - e^{G_t} S0 k_t); o_t = e^{G_t} S0
+q_t + sum_{i<=t} e^{G_t-G_i} (q_t.k_i) d_i; S_end = e^{G_last} S0 +
+sum_i e^{G_last-G_i} d_i k_i^T. Decays that underflow to 0 must be
+clamped (log FLT_MIN), or the prefix-sum differences give NaN. A f32
+version (workgroup = value head x 32 state rows, K/Q chunk in LDS,
+triangular solve by one wave) matched the sequential kernel on the 8K
+prompt (output rel RMS ~1e-6, state ~4e-6) but ran 32 ms vs 13.6 ms per
+traced call: 256 VGPRs with spills and 60 KB LDS, so one block per WGP
+over only 192 blocks. A competitive version needs WMMA tiles and more,
+smaller blocks; worth ~8% of 8K prefill.
+
+**Prefill state at noon (2026-10-12).** 97e297d (direct GEMM activation
+fill in 16-byte loads, byte-identical) brought 8K to ~727 tok/s. Vectorized
+activation loads in the gate/up tile kernel: identical, 22.7 -> 22.1 ms,
+not kept. Speculation draft breakdown (Track B): 5.6 ms per cycle, two
+draft forwards of 2.6 ms GPU each, the full-vocabulary draft head 1.5 ms
+(58%) of each.
+
 **halogen measured directly (2026-10-11).**
 - Exactness: greedy output with `drafter: serial` vs `mtp` (API field) is
   byte-identical on the 4 identity prompts x 512 tokens. Its speculation is
