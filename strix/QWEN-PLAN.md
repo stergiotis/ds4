@@ -866,6 +866,46 @@ If steps 1-6 land as predicted, an 8K chunk goes from ~10.5 s to ~5.5-6 s
 (~1,400-1,500 tok/s). Order is by gain per hour; step 1 is a cheap test of
 the central hypothesis, so it runs first after the baseline.
 
+### Night results (2026-10-12/13, standalone microbenchmarks, min of 10)
+
+Code is in the working trees, not committed: grouped launch order for
+`qwen_q8_direct` (`DS4_QWEN4_GEMM_GROUP`, default 0) and `gdn_scan_long`
+(`DS4_QWEN4_SCAN_OLD` / `DS4_QWEN4_SCAN_MIN`, default T >= 64) in main;
+those plus `dense_wide` (`DS4_QWEN4_WIDE_MIN`, default 0 = off;
+`DS4_QWEN4_WIDE_GROUP`, default 8) in `~/.local/share/ds4/wt-dev`. The
+model-level A/B and gates run from 07:10 (`qwen-prof/pf/m1.sh`, `m2b.sh`).
+
+- `gdn_scan_long` against `gdn_scan<8,128>` on random normalized inputs,
+  1,000 tokens, 48 heads: output rel RMS 1.6e-7, state 7e-8; 0.78 vs
+  2.25 ms (2.9x; gufo's rate is 0.85 us per token per layer).
+- `dense_wide` is bit-identical to `qwen_q8_direct` (same K order) and
+  matches a CPU reference within F16 rounding. 248-250 VGPRs, no spills,
+  48 KB LDS (2 blocks per WGP).
+
+| shape (rows x K), tokens | qwen_q8_direct | dense_wide (group) |
+|---|---:|---:|
+| 16384 x 2560 F16, 8192 | 36-41 ms (~17 TF) | 23.4 ms (8), 29 TF; group 16/32 slower |
+| 12288 x 2560 F16, 8192 | 30 ms | 17.0 ms (4) |
+| 16384 x 2560 F16, 2048 | 10.1 ms | 6.0 ms (4) |
+| 10240 x 320 Q8_0, 8192 | 3.6 ms | 2.3 ms |
+| 2560 x 6144 Q8_0, 8192 | 8.5 ms (30 TF) | 7.9 ms |
+| 2560 x 6144 F16, 8192 | 13.3 ms (19 TF) | 12.3 ms (4) |
+
+Hypothesis 1 holds for the tall F16 shapes: the old kernel reaches 30 TF on
+a Q8_0 shape whose weights fit the MALL and ~17 TF on 84 MB of F16
+weights; grouping alone does not fix the old kernel's layout, the wide
+tiles plus grouping do. GDN out (2560 x 6144) as F16 is 31 MB and stays at
+~20 TF in both kernels while its Q8_0 twin runs at 31 TF: unpacking that
+HT4 matrix to Q8_0 rows instead of F16 (one more rounding, ppl decides)
+or 256-token tiles are the next tries. Microbenchmark noise was large at
+night (the unchanged old kernel ranged 36-89 ms with last-of-3 timing), so
+the model-level runs decide.
+
+Two small costs seen while wiring it: a multi-output HT4 projection
+(GDN qkv and z) runs `pack_half_rows` once per output on the same input,
+and every Q8_0 direct call recomputes `qwen_dense_row_scales` (a full read
+of the weight matrix) instead of caching it per tensor.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
