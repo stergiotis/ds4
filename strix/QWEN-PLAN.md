@@ -780,8 +780,9 @@ structural differences explain most of it:
 2. **We run everything in F32 between kernels and repack per GEMM.** Each
    direct GEMM first runs `pack_half_rows` (row max, then F16) over its F32
    input; hc norm, mix, combine and MoE reduce are separate F32 passes, and
-   `hc_norm` re-reads each stream's row 8 times (one per chunk block).
-   gufo's producers write the consumer's input format once.
+   the prefill norm (`hc_norm_one`, one 128-thread block per stream and
+   token) runs 32 block reductions with scalar loads, so it is
+   latency-bound. gufo's producers write the consumer's input format once.
 
 ### Steps, in order (each with the usual gates)
 
