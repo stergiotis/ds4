@@ -687,6 +687,32 @@ combine + norm and router + top-k).
 reference (V3 + HT4: x1.0085, 0.047), for ~0.16 GB/token. Parked behind the
 routed experts.
 
+**End-to-end, stock vs now (2026-10-12, 22:41-22:51).** Same machine and
+harness, halogen stopped, warm-up run discarded. Stock is cb70021 (the
+2026-10-09 baseline build, Qwen3.8-Flash-Next-Q4.gguf, worktree
+`~/.local/share/ds4/wt-stock`); now is 754bfd4 with qwen-v3-ht4.gguf. Logs
+in `~/.local/share/ds4/qwen-prof/final/`.
+
+`ds4-bench`, promessi_sposi, 128 greedy tokens (two 8K runs each):
+
+| | stock | now | gain |
+|---|---:|---:|---:|
+| prefill 2K | 434 tok/s | 670 | 1.54x |
+| prefill 8K | 404 / 436 | 795 / 778 | 1.88x |
+| decode at 2K | 20.6 tok/s | 34.7 | 1.69x |
+| decode at 8K | 19.7 / 20.5 | 32.7 / 34.6 | 1.67x |
+
+`ds4` CLI, 512 greedy tokens, no thinking, `--mtp` output byte-identical
+to plain in both builds:
+
+| tok/s | stock plain | stock MTP | now plain | now MTP | now MTP / stock plain |
+|---|---:|---:|---:|---:|---:|
+| code | 20.8 | 34.8 | 36.1 | 58.2 | 2.80x |
+| prose | 20.4 | 27.8 | 36.0 | 46.2 | 2.26x |
+
+Quality: stock is the reference; now is ppl x1.0125, KL 0.047 (halogen's
+own ppl mode: x1.021-1.027).
+
 The eval harness's "greedy" speed bench sends no temperature, so with
 thinking on both ds4 and halogen sample at temperature 1.0; its "greedy"
 numbers are sampled.
