@@ -530,6 +530,32 @@ own in-tile order. Tiles can be reordered losslessly, values inside a tile
 cannot (the trellis state runs in stream order), so EXL3 files would need
 a kernel variant for EXL3's in-tile order rather than a byte repack.
 
+**Prefill, day 1 (2026-10-12).** On qwen-v3-ht4.gguf the HT4 file had
+halved prefill: 8K 294 tok/s, 2K 297, because the HT4 dense rows went
+through the decode matvec 16 rows at a time (58% of prefill).
+- acfc312: HT4 bulk rows (>= 32) unpacked to f16 per call (ht4_unpack: one
+  128 x 128 block per workgroup, both Hadamard transforms in LDS) and run
+  through qwen_q8_direct with a new F16 weight variant. hipBLAS(Lt) f16
+  managed only ~4 TFLOP/s on these shapes; the direct WMMA kernel ~12-24.
+- dfa02e9: MXFP4 expert down at >= 2048 rows through matrix_down_tile
+  (per-tile item rows, float4 activations, LDS-staged contiguous stores,
+  staging aliased onto the operand tiles for occupancy): 48.5 -> 31.4 ms
+  per layer at an 8192-row chunk. Larger tiles were slower (occupancy); a
+  k-step of 32 looked 2x faster but was wrong and is not kept.
+- e712a35: the direct Q8 kernel for any K % 32, which moves the hc up GEMM
+  (K = 320) off hipBLAS: 6.9 -> 2.3 ms per call.
+- Rejected: three hc down launch shapes for M = 320 (all slower).
+- Result: 8K 294 -> 600 tok/s, 2K 297 -> 554. Decode unchanged (29.3 ms,
+  output identical), identity script passes. Perplexity x1.0029 against
+  the matvec path (KL to the reference 0.0474 -> 0.0479).
+- The perplexity gate runs 32-row batches, so it exercises the HT4 bulk
+  and direct Q8 paths but not the >= 2048-row expert kernels; those were
+  checked against the old kernel on the same inputs.
+- 8K per-forward breakdown now (8192-row chunk): GDN qkv+z 14.6% (~23.6
+  TFLOP/s), experts down 14.0%, gate/up 10.8% (~19 TFLOP/s), attention core
+  8.2%, hc down 7.9%, GDN out 7.6%, GDN scan 6.9%, hc norm 4.8%, attention
+  projections 4.5%, MoE reduce 4.0%, GDN conv+gates 3.2%, router 3.2%.
+
 **halogen measured directly (2026-10-11).**
 - Exactness: greedy output with `drafter: serial` vs `mtp` (API field) is
   byte-identical on the 4 identity prompts x 512 tokens. Its speculation is
