@@ -587,6 +587,41 @@ through the decode matvec 16 rows at a time (58% of prefill).
   5%, attention core 5%, MoE reduce 5%, GDN conv+gates 4%, hc up 3.5%, hc
   mix 3%, hc combine 2%.
 
+**Prefill, day 1 result (2026-10-12).** 8K prefill 294 -> ~747 tok/s
+through ds4-server (8,773-token prompt, TTFT 11.7 s warm), 2K 297 -> ~647.
+Last commits: 9e2fb98 (MXFP4 down decodes FP4 levels by byte-permute
+lookups, byte-identical; down 21.5 -> 19.0 ms at 8192 rows) and e608c62
+(attention trace marks: prep + block keys, dense core, index score,
+select, sparse core). The expert FF dimension is 640 (not 512): expert
+GEMM rates are gate/up ~24 TFLOP/s, down ~14 at 8K.
+- Rejected: a dedicated Q4_K gate/up tile kernel (slower than the Kolibri
+  tile the gate/up already uses: 2K 11.7 vs 8.6 ms, 8K 29.3 vs 22.3); a
+  Kolibri-style MXFP4 down (weights decoded straight into A fragments,
+  packed f16 activations: correct to 7e-8, 2K 8.45 -> 7.82 ms but 8K 19.0
+  -> 22.5); 32-item down tiles at 2K; combine + norm fused at prefill
+  (6.83 ms vs 2.98 + 3.57).
+- The chunked GDN scan in f32 cannot win much: per token it needs about the
+  sequential kernel's FMA and LDS count and only drops the lane
+  reductions; the large gain needs f16 WMMA for the state products, a
+  precision question for a recurrence over thousands of tokens.
+
+**Track B, day 1 (2026-10-12).**
+- Draft cost: 5.6 ms per cycle, two draft forwards of 2.6 ms GPU; the full
+  draft head is 1.5 ms (58%) of each.
+- H-S1 shortlist + fallback: measured negative. With the full head
+  computed on every draft (4 prompts, depth 3, 512 tokens), the argmax
+  falls outside the 65,536-row prefix for 20 of 1,610 drafts (code 0.5%,
+  prose 2.7%, math 0, refactor 1.3%), and the misses do not concentrate at
+  low prefix confidence (7 of 20 at p >= 0.9; a p < 0.7 gate computes the
+  full head for ~20% of drafts and still lets half the misses through).
+  Each miss rejects the chain and resets the depth window (+8% verify
+  cycles for the bare prefix), so the gate roughly breaks even.
+- H-S3 depth 4: within +-2% of depth 3 on all four prompts (59.1/58.1,
+  45.4/46.0, 60.1/59.5, 56.1/54.0 tok/s). Negative at today's row cost.
+- H-S2 (expert kernels at 2-3 rows) not attempted today; yesterday's
+  variants (int8 activations, 4 rows per wave, next-block prefetch) all
+  lost.
+
 **Chunked GDN scan: verified, slower, parked (2026-10-12).** The scan's
 recurrence in chunks of 32: with G the in-chunk prefix sum of log decay
 and S0 the entering state, (I + L) Dl = R with L_ti = beta_t e^{G_t-G_i}
