@@ -61085,6 +61085,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
     const uint32_t clast = cpos0 + cT - 1u;
     const uint32_t n_dense = clast < sparse_pos ? cT : (sparse_pos > cpos0 ? sparse_pos - cpos0 : 0u);
+    if (cT > 3u && !qwen4_mark("attn prep+block keys", 0)) return false;
     if (n_dense > 0 &&
         !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
                                           g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
@@ -61092,6 +61093,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                                           scale)) {
         return false;
     }
+    if (cT > 3u && n_dense > 0 && !qwen4_mark("attn dense core", 0)) return false;
     if (n_dense >= cT) return true;
     const uint32_t n_sparse = cT - n_dense;
     const uint32_t sp0 = cpos0 + n_dense;
@@ -61108,10 +61110,12 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
         ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
                                        g->layer_block_key[il], n_sparse, n_blocks_after,
                                        DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
+        (n_sparse <= 3u || qwen4_mark("attn index score", 0)) &&
         qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&
+        (n_sparse <= 3u || qwen4_mark("attn select+expand", 0)) &&
         ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
