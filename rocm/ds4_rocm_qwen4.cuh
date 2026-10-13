@@ -2518,10 +2518,19 @@ template<unsigned WAVES, unsigned NT, unsigned KT, unsigned PAD, unsigned VEC, u
 __launch_bounds__(WAVES*32u,1)
 __global__ void qwen_q8_direct(float *out,
         const unsigned char *w, const __half *x, const float *xs, const float *ws,
-        unsigned T, unsigned K, unsigned M, unsigned begin, unsigned length) {
+        unsigned T, unsigned K, unsigned M, unsigned begin, unsigned length, unsigned group) {
     static_assert(KT%32==0 && NT%16==0);
     constexpr unsigned NF=NT/16, MT=WAVES*16;
-    const unsigned block_m=blockIdx.x*MT, block_t=blockIdx.y*NT;
+    /* group > 0: blocks run in bands of `group` row tiles, all token tiles of a
+     * band before the next band, so a band's weights stay in the MALL while
+     * the activations stream (row tiles still vary fastest inside a band) */
+    unsigned bx=blockIdx.x, by=blockIdx.y;
+    if (group) {
+        const unsigned b=blockIdx.y*gridDim.x+blockIdx.x, per=group*gridDim.y;
+        const unsigned first=b/per*group, size=min(group,gridDim.x-first), r=b%per;
+        bx=first+r%size; by=r/size;
+    }
+    const unsigned block_m=bx*MT, block_t=by*NT;
     const unsigned tid=threadIdx.x, wave=tid>>5, lane=tid&31, lane16=lane&15;
     const unsigned row0=block_m+wave*16, my_row=row0+lane16;
     const unsigned safe_row=my_row<M ? my_row : M-1;
@@ -2643,34 +2652,37 @@ template<unsigned WT = 8>
 static int launch_qwen_q8_direct(float *out, const unsigned char *w,
         const __half *x, const float *xs, const float *ws, unsigned T,
         unsigned K, unsigned M, unsigned begin, unsigned length) {
+    static int group_env = -1;
+    if (group_env < 0) group_env = getenv("DS4_QWEN4_GEMM_GROUP") ? atoi(getenv("DS4_QWEN4_GEMM_GROUP")) : 4;
+    const unsigned group = (unsigned)group_env;
     if (T<=64) {
         if (M<=2560) {
             qwen_q8_direct<8,16,64,8,4,WT><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
-                out,w,x,xs,ws,T,K,M,begin,length);
+                out,w,x,xs,ws,T,K,M,begin,length,group);
         } else if (M==6144 || M==10240 || M==12288) {
             qwen_q8_direct<24,32,256,8,4,WT><<<dim3((M+383)/384,(T+31)/32),768,0,0>>>(
-                out,w,x,xs,ws,T,K,M,begin,length);
+                out,w,x,xs,ws,T,K,M,begin,length,group);
         } else {
             qwen_q8_direct<16,64,128,8,4,WT><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
-                out,w,x,xs,ws,T,K,M,begin,length);
+                out,w,x,xs,ws,T,K,M,begin,length,group);
         }
     } else if (M<=640 && T<=128) {
         qwen_q8_direct<8,16,64,8,4,WT><<<dim3((M+127)/128,(T+15)/16),256,0,0>>>(
-            out,w,x,xs,ws,T,K,M,begin,length);
+            out,w,x,xs,ws,T,K,M,begin,length,group);
     } else if ((M==640 && T>=768 && T<1536) ||
             (M==2560 && !(T>=256 && T<768))) {
         qwen_q8_direct<16,64,256,8,8,WT><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
-            out,w,x,xs,ws,T,K,M,begin,length);
+            out,w,x,xs,ws,T,K,M,begin,length,group);
     } else if ((M==640 && T>=1536) || (M==6144 && T>=256) ||
             ((M==10240 || M==12288) && T>=128 && T<1536)) {
         qwen_q8_direct<16,128,128,8,8,WT><<<dim3((M+255)/256,(T+127)/128),512,0,0>>>(
-            out,w,x,xs,ws,T,K,M,begin,length);
+            out,w,x,xs,ws,T,K,M,begin,length,group);
     } else if ((M==10240 || M==12288) && T>=1536) {
         qwen_q8_direct<24,128,128,8,8,WT><<<dim3((M+383)/384,(T+127)/128),768,0,0>>>(
-            out,w,x,xs,ws,T,K,M,begin,length);
+            out,w,x,xs,ws,T,K,M,begin,length,group);
     } else {
         qwen_q8_direct<16,64,128,8,4,WT><<<dim3((M+255)/256,(T+63)/64),512,0,0>>>(
-            out,w,x,xs,ws,T,K,M,begin,length);
+            out,w,x,xs,ws,T,K,M,begin,length,group);
     }
     return launched();
 }
