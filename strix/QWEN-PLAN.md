@@ -1024,6 +1024,48 @@ temperature 0 unless noted: 8,773-token prompt TTFT 8.67-8.81 s (yesterday
 44.4 (t 1.0: 46.4), prose 42.7 (t 1.0: 41.2) tok/s. halogen for scale:
 1,694-1,844 tok/s prefill, 52-72 tok/s decode over its API.
 
+### kyojin and CIRU-STRIX-IU4 (read 2026-10-13 night; notes in strix/refs/)
+
+[kyojin](https://github.com/Yamz-Labs/kyojin) (MIT, exllamav3 fork,
+18cdd3c) runs this model from EXL3 trellis weights (95 GB, ~3.47 bpw):
+prefill 1,481 / 1,477 / 1,347 tok/s at 8K / 32K / 256K, plain decode 27.3,
+MTP 45.7-66.8 tok/s, ~74 tok/s total at batch 5; KL 0.0216 vs the official
+FP8 release (gufo 0.0156 on their panel). Routed experts decode the trellis
+inside a grouped WMMA GEMM (128 x 256 tiles, per-wave LDS decode, Hadamards
+moved to the activations, 8 launches per MoE layer); dense layers unpack to
+F16 scratch like ds4.
+[CIRU-STRIX-IU4](https://github.com/ciru-ai/Qwen3.8-Flash-CIRU-STRIX-IU4)
+(MIT, llama.cpp fork, bac7ad8): "IU4" is a mix of standard types (Q4_1
+experts, Q5_K/Q8_0 core); prefill 889-1,001 tok/s, decode 24 tok/s, MTP
+44-66; ~104 GB RAM; KL 0.060 vs BF16. Its prefill kernels are pwilkin's
+(BF16 WMMA, fused gate+up+SwiGLU, BF16 intermediates).
+
+Checked against ds4 and dropped: int8 mixer weights (ds4's hc matrices are
+already Q8_0); the incremental indexer block-key cache (ds4 already pools
+only the blocks a chunk completes); decode matvec tricks (ds4 is at
+~150 GB/s, kyojin ~135).
+
+To test, ranked:
+1. Compiler: kyojin measures ~20% prefill from the ROCm SDK (TheRock)
+   compiler instead of the system one. ds4 builds with Ubuntu clang 21; AMD
+   clang 23 from the ROCm 10 image (`~/.local/share/ds4/rocm10-llvm`,
+   wrapper `hipcc23`, host ROCm 7.1 headers/runtime) builds it
+   (`wt-cc23`). VGPRs change: Q4_K gate/up tile 245 -> 179 (occupancy
+   5 -> 6), MXFP4 down 177 -> 123, qwen_q8_direct<16,128,128> 117 -> 242.
+   A/B queued (`pf/m13.sh`).
+2. The sparse-attention WMMA kernel (WmmaCausalAttentionKernel<4,16,true>)
+   spills 64 VGPRs with both compilers; 0.5 s per 8K forward.
+3. Activation row pitch K + 64 elements (kyojin: half-rate pitch hazard at
+   power-of-two-ish pitches; 50 -> 87-90% of peak in their GEMM). Cheap to
+   try on the wide GEMM's F16 rows (K 2560 / 6144 / 10240).
+4. Routed experts after kyojin's mpw2 and pwilkin's fused GLU: larger tiles
+   (128 x 256), activations double-buffered with LDS-only barriers, fused
+   gate+up+SwiGLU, 128 + 32 tile split for 160 rows per expert.
+5. MTP draft head: CIRU's dynamic shortlist (lowest 16K ids + top 16K of
+   the target's last logits) instead of the static prefix that lost (H-S1);
+   kyojin's depth rule on the drafter's own probability (0.6/0.3, 0.95/0.85
+   past depth 3) and n-gram drafts.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
