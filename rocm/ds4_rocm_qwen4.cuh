@@ -3287,6 +3287,127 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv,
         for (unsigned i = 0; i < npt; i++) state[idx+(uint64_t)r*D+i] = s[r][i];
 }
 
+/* gdn_scan for long prefill chunks, D = 128.  A lane holds two state rows x
+ * 32 keys (key j*16 + q*4 + e for lane quarter q), so a row is reduced over
+ * four lanes.  After the decay, S.k, S.q and k.q are reduced together and the
+ * output is S.q + delta (k.q), which equals the updated state times q; one
+ * reduction step per token instead of two.  q/k/v/decay/beta of the next
+ * eight tokens are loaded into registers while the current eight run from
+ * LDS.  Grid (D / 64, Hv), 128 threads. */
+__global__ __launch_bounds__(128) void gdn_scan_long(float *out, float *state, const float *qkv,
+        const float *a, const float *b, unsigned T, unsigned Hk, unsigned Hv,
+        float *snap, unsigned st, float *snap2, unsigned st2) {
+    constexpr unsigned D = 128, W = 8, PER = 80; /* float4 per token: k 32, q 32, v 16 */
+    const unsigned tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, g = lane >> 2, qq = lane & 3;
+    const unsigned h = blockIdx.y, kh = h % Hk, rbase = blockIdx.x * 64;
+    const unsigned lrow = wave * 16 + g * 2, row = rbase + lrow;
+    const unsigned C = (2 * Hk + Hv) * D;
+    __shared__ __align__(16) float4 sm[2][W * PER];
+    __shared__ float sdec[2][W], sbeta[2][W];
+    float4 s[2][8];
+    const uint64_t sidx = ((uint64_t)h * D + row) * D;
+    #pragma unroll
+    for (unsigned r = 0; r < 2; r++)
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) s[r][j] = *(const float4 *)(state + sidx + (uint64_t)r * D + j * 16 + qq * 4);
+    float4 pre[5];
+    float pdb = 0;
+    auto fetch = [&](unsigned t0) {
+        #pragma unroll
+        for (unsigned i = 0; i < 5; i++) {
+            const unsigned item = tid + i * 128, t = t0 + item / PER, o = item % PER;
+            float4 v = make_float4(0, 0, 0, 0);
+            if (t < T) {
+                const float *rowp = qkv + (uint64_t)t * C;
+                v = o < 32 ? *(const float4 *)(rowp + Hk * D + kh * D + o * 4)
+                  : o < 64 ? *(const float4 *)(rowp + kh * D + (o - 32) * 4)
+                  : *(const float4 *)(rowp + 2 * Hk * D + h * D + rbase + (o - 64) * 4);
+            }
+            pre[i] = v;
+        }
+        if (tid < 2 * W) {
+            const unsigned t = t0 + tid % W;
+            pdb = t < T ? (tid < W ? a : b)[(uint64_t)t * Hv + h] : 0.0f;
+        }
+    };
+    auto commit = [&](unsigned buf) {
+        #pragma unroll
+        for (unsigned i = 0; i < 5; i++) sm[buf][tid + i * 128] = pre[i];
+        if (tid < W) sdec[buf][tid] = pdb; else if (tid < 2 * W) sbeta[buf][tid - W] = pdb;
+    };
+    fetch(0);
+    commit(0);
+    __syncthreads();
+    for (unsigned t0 = 0, buf = 0; t0 < T; t0 += W, buf ^= 1) {
+        const bool more = t0 + W < T;
+        if (more) fetch(t0 + W);
+        const unsigned n = min(W, T - t0);
+        for (unsigned i = 0; i < n; i++) {
+            const float4 *kp = &sm[buf][i * PER], *qp = kp + 32;
+            const float decay = sdec[buf][i], beta = sbeta[buf][i];
+            float u[2] = {0, 0}, pq[2] = {0, 0}, kq = 0;
+            float4 k4[8];
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const float4 k = kp[j * 4 + qq], q = qp[j * 4 + qq];
+                k4[j] = k;
+                kq += k.x * q.x + k.y * q.y + k.z * q.z + k.w * q.w;
+                #pragma unroll
+                for (unsigned r = 0; r < 2; r++) {
+                    float4 &x = s[r][j];
+                    x.x *= decay; x.y *= decay; x.z *= decay; x.w *= decay;
+                    u[r] += x.x * k.x + x.y * k.y + x.z * k.z + x.w * k.w;
+                    pq[r] += x.x * q.x + x.y * q.y + x.z * q.z + x.w * q.w;
+                }
+            }
+#if defined(__gfx1151__)
+            kq += qwen_dpp_xor<1>(kq); kq += qwen_dpp_xor<2>(kq);
+            #pragma unroll
+            for (unsigned r = 0; r < 2; r++) {
+                u[r] += qwen_dpp_xor<1>(u[r]); u[r] += qwen_dpp_xor<2>(u[r]);
+                pq[r] += qwen_dpp_xor<1>(pq[r]); pq[r] += qwen_dpp_xor<2>(pq[r]);
+            }
+#else
+            #pragma unroll
+            for (unsigned m = 1; m <= 2; m *= 2) {
+                kq += __shfl_xor(kq, m, 32);
+                #pragma unroll
+                for (unsigned r = 0; r < 2; r++) { u[r] += __shfl_xor(u[r], m, 32); pq[r] += __shfl_xor(pq[r], m, 32); }
+            }
+#endif
+            const float *vp = (const float *)(kp + 64);
+            float o[2];
+            #pragma unroll
+            for (unsigned r = 0; r < 2; r++) {
+                const float delta = (vp[lrow + r] - u[r]) * beta;
+                o[r] = pq[r] + delta * kq;
+                #pragma unroll
+                for (unsigned j = 0; j < 8; j++) {
+                    float4 &x = s[r][j];
+                    x.x += k4[j].x * delta; x.y += k4[j].y * delta; x.z += k4[j].z * delta; x.w += k4[j].w * delta;
+                }
+            }
+            const unsigned t = t0 + i;
+            if (!qq) *(float2 *)(out + ((uint64_t)t * Hv + h) * D + row) = make_float2(o[0], o[1]);
+            #pragma unroll
+            for (unsigned c = 0; c < 2; c++) {
+                float *dst = c ? snap2 : snap;
+                if (!dst || t != (c ? st2 : st)) continue;
+                #pragma unroll
+                for (unsigned r = 0; r < 2; r++)
+                    #pragma unroll
+                    for (unsigned j = 0; j < 8; j++) *(float4 *)(dst + sidx + (uint64_t)r * D + j * 16 + qq * 4) = s[r][j];
+            }
+        }
+        if (more) commit(buf ^ 1);
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < 2; r++)
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) *(float4 *)(state + sidx + (uint64_t)r * D + j * 16 + qq * 4) = s[r][j];
+}
+
 __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, unsigned D, float eps) {
     const unsigned h = blockIdx.x, t = blockIdx.y, npt = D / 32, k0 = threadIdx.x * npt;
     const uint64_t idx = ((uint64_t)t * H + h) * D + k0;
@@ -3387,6 +3508,15 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 #define QWEN_GDN(ROWS, DIM) gdn_scan<ROWS,DIM><<<dim3((DIM+4*ROWS-1)/(4*ROWS),Hv),128,0,0>>>((float *)out->ptr, \
         (float *)state->ptr,(const float *)qkv->ptr,(const float *)a->ptr,(const float *)b->ptr, \
         T,Hk,Hv,snap ? (float *)snap->ptr : NULL,st,snap2 ? (float *)snap2->ptr : NULL,st2)
+    static int scan_min = -1;
+    if (scan_min < 0) scan_min = getenv("DS4_QWEN4_SCAN_OLD") ? 0 :
+        getenv("DS4_QWEN4_SCAN_MIN") ? atoi(getenv("DS4_QWEN4_SCAN_MIN")) : 64;
+    if (D == 128 && scan_min && T >= (uint32_t)scan_min && !(2 * Hk * D % 4)) {
+        gdn_scan_long<<<dim3(D / 64, Hv), 128, 0, 0>>>((float *)out->ptr, (float *)state->ptr,
+            (const float *)qkv->ptr, (const float *)a->ptr, (const float *)b->ptr, T, Hk, Hv,
+            snap ? (float *)snap->ptr : NULL, st, snap2 ? (float *)snap2->ptr : NULL, st2);
+        return launched();
+    }
     // Use eight state rows per wave for gfx1151 prefill.
     if (D == 128 && T > 8 && ds4_rocm_is_gfx1151()) {
         QWEN_GDN(8,128);
