@@ -1297,17 +1297,25 @@ extern "C" int ds4_gpu_kolibri_moe_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     __half *xh = (__half *)tmp;
     float *xs = (float *)(tmp + xbytes);
     unsigned *tiles = (unsigned *)(xs + rows);
-    constexpr unsigned NT = 64, WAVES = 8;
+    constexpr unsigned WAVES = 8;
+    /* DS4_KOLIBRI_Q4K_NT32_MAX (default 4096, 0 = never): Q4_K gate/up chunks up to this many rows use
+     * 32-token tiles (fewer empty rows when experts get ~40 tokens) */
+    static int nt32_max = -1;
+    if (nt32_max < 0) nt32_max = getenv("DS4_KOLIBRI_Q4K_NT32_MAX") ? atoi(getenv("DS4_KOLIBRI_Q4K_NT32_MAX")) : 4096;
+    const unsigned NT = q4k && !down && T <= (uint32_t)nt32_max ? 32 : 64;
     qwen4_rocm::pack_half_rows<0><<<(unsigned)rows, 256, 0, 0>>>(xs, xh, (const char *)x->ptr, K, (uint64_t)K * 4);
     qwen4_rocm::expert_tiles<<<1, 1, 0, 0>>>(tiles, (const int *)counts->ptr, NE, NT);
     if (!launched()) return 0;
     const uint64_t jobs = ((uint64_t)T * NS + NT - 1) / NT + NE;
     const uint64_t blocks = jobs * ((M + WAVES * 16 - 1) / (WAVES * 16));
     if (blocks > INT_MAX) return 0;
-#define KOLIBRI_TILE(KERNEL, DOWN, W1) KERNEL<DOWN, NT, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>( \
+#define KOLIBRI_TILE(KERNEL, DOWN, W1) KERNEL<DOWN, 64, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>( \
         (float *)out->ptr, xh, xs, w0, W1, (const int *)lists->ptr, (const int *)counts->ptr, tiles, \
         NE, NS, NO, K, M, cap)
     if (f8) { if (down) KOLIBRI_TILE(moe_f8_tile, true, NULL); else KOLIBRI_TILE(moe_f8_tile, false, w1); }
+    else if (NT == 32) moe_q4k_tile<false, 32, WAVES><<<(unsigned)blocks, WAVES * 32, 0, 0>>>(
+        (float *)out->ptr, xh, xs, w0, w1, (const int *)lists->ptr, (const int *)counts->ptr, tiles,
+        NE, NS, NO, K, M, cap);
     else { if (down) KOLIBRI_TILE(moe_q4k_tile, true, NULL); else KOLIBRI_TILE(moe_q4k_tile, false, w1); }
 #undef KOLIBRI_TILE
     return launched();
