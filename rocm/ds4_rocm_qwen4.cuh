@@ -290,6 +290,11 @@ __device__ __forceinline__ float sum(float x) {
     return x;
 }
 
+__device__ __forceinline__ float qwen_wave_max(float x) {
+    for (int d = 16; d; d >>= 1) x = fmaxf(x, __shfl_xor(x, d, 32));
+    return x;
+}
+
 __device__ __forceinline__ float block_sum(float x, float *shared) {
     x = sum(x);
     if (!(threadIdx.x & 31)) shared[threadIdx.x / 32] = x;
@@ -3233,6 +3238,96 @@ __global__ void hc_norm_one(float *xn, float *inj, const float *R, const float *
     }
 }
 
+/* Prefill residual combine and the next hyper-connection norm in one pass,
+ * one 256-thread block per token, E = 2560, hc = 4, F16 injection rows.
+ * Wave c owns chunk c (320 values) of every stream, so the eight injection
+ * partials per stream and row come from wave reductions as in hc_norm_one.
+ * The source is either a block output (part == NULL: v = src) or the MoE
+ * result (v = sum_k w_k part_k + sigmoid(gate) shared, also stored to
+ * blk_out).  R is updated in place, R += injection_s * v, then normed; xn is
+ * written as F32 and as F16 rows scaled like pack_half_rows<0> (xh, xs). */
+__global__ __launch_bounds__(256) void hc_comb_norm_wide(float *R, float *xn, __half *xh, float *xs,
+        float *inj, const float *oldinj, const float *src, const float *part, const float *weights,
+        const float *gate, const float *shared, unsigned NS, unsigned stride, float *blk_out,
+        const float *gamma, const __half *wi, float eps) {
+    constexpr unsigned E = 2560, HC = 4, PER = 10;
+    const unsigned tok = blockIdx.x, tid = threadIdx.x, c = tid >> 5, lane = tid & 31;
+    __shared__ float wsh[HC], red[8][HC], inv[HC], mxs[8];
+    if (tid < HC) wsh[tid] = injection(oldinj + (uint64_t)tok * HC * HC * 8, HC, tid);
+    __syncthreads();
+    float v[PER], r[HC][PER];
+    #pragma unroll
+    for (unsigned i = 0; i < PER; i++) {
+        const unsigned d = c * 320 + lane + 32 * i;
+        float x;
+        if (part) {
+            x = 0;
+            for (unsigned k = 0; k < NS; k++) x += weights[(uint64_t)tok * NS + k] * part[((uint64_t)tok * stride + k) * E + d];
+            if (gate) x += sigmoid(gate[tok]) * (shared ? shared[(uint64_t)tok * E + d] : part[((uint64_t)tok * stride + NS) * E + d]);
+            if (blk_out) blk_out[(uint64_t)tok * E + d] = x;
+        } else x = src[(uint64_t)tok * E + d];
+        v[i] = x;
+    }
+    float ss[HC];
+    #pragma unroll
+    for (unsigned s = 0; s < HC; s++) {
+        float *Rs = R + ((uint64_t)tok * HC + s) * E;
+        ss[s] = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < PER; i++) {
+            const unsigned d = c * 320 + lane + 32 * i;
+            float x = Rs[d];
+            x += wsh[s] * v[i];
+            Rs[d] = x;
+            r[s][i] = x;
+            ss[s] += x * x;
+        }
+        ss[s] = sum(ss[s]);
+    }
+    if (!lane) for (unsigned s = 0; s < HC; s++) red[c][s] = ss[s];
+    __syncthreads();
+    if (tid < HC) {
+        float t = 0;
+        for (unsigned w = 0; w < 8; w++) t += red[w][tid];
+        inv[tid] = rsqrtf(t / E + eps);
+    }
+    __syncthreads();
+    float mx = 0;
+    #pragma unroll
+    for (unsigned s = 0; s < HC; s++) {
+        float acc[HC] = {};
+        float *xs_row = xn + ((uint64_t)tok * HC + s) * E;
+        #pragma unroll
+        for (unsigned i = 0; i < PER; i++) {
+            const unsigned d = c * 320 + lane + 32 * i;
+            const float x = r[s][i] * inv[s] * gamma[s * E + d];
+            r[s][i] = x;
+            xs_row[d] = x;
+            mx = fmaxf(mx, fabsf(x));
+            #pragma unroll
+            for (unsigned j = 0; j < HC; j++) acc[j] += __half2float(wi[(uint64_t)j * E * HC + s * E + d]) * x;
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < HC; j++) {
+            const float t = sum(acc[j]);
+            if (!lane) inj[((uint64_t)tok * HC * 8 + s * 8 + c) * HC + j] = t;
+        }
+    }
+    mx = qwen_wave_max(mx);
+    if (!lane) mxs[c] = mx;
+    __syncthreads();
+    float m = 0;
+    for (unsigned w = 0; w < 8; w++) m = fmaxf(m, mxs[w]);
+    const int e = m > 0 ? max(-120, min(120, (int)((__float_as_uint(m) >> 23) & 255) - 127)) : 0;
+    const float sc = ldexpf(1, -e);
+    if (!tid) xs[tok] = ldexpf(1, e);
+    #pragma unroll
+    for (unsigned s = 0; s < HC; s++)
+        #pragma unroll
+        for (unsigned i = 0; i < PER; i++)
+            xh[((uint64_t)tok * HC + s) * E + c * 320 + lane + 32 * i] = __float2half_rn(r[s][i] * sc);
+}
+
 template<unsigned TYPE>
 __global__ void hc_mix(float *out, const float *xn, const float *lo,
                        const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
@@ -4291,6 +4386,61 @@ extern "C" int ds4_gpu_qwen4_moe_reduce_tensor(ds4_gpu_tensor *out, const ds4_gp
         (const float *)weights->ptr, sg ? (const float *)sg->ptr : NULL, sh ? (const float *)sh->ptr : NULL,
         NS,stride,D,hc);
     return launched();
+}
+
+/* Prefill combine (src) or MoE reduce (part, ...) plus the next hc norm in
+ * one launch (hc_comb_norm_wide).  xh holds T x hc x E halves, then T F32
+ * row scales at the next 16-byte boundary.  inj may alias the old partials.
+ * 1 when launched, -1 when the shape or DS4_QWEN4_COMB_OLD rule it out,
+ * 0 on error. */
+extern "C" int ds4_gpu_qwen4_hc_comb_norm_wide_tensor(ds4_gpu_tensor *R, ds4_gpu_tensor *xn,
+        ds4_gpu_tensor *xh, ds4_gpu_tensor *inj, const ds4_gpu_tensor *src,
+        const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *sg,
+        const ds4_gpu_tensor *sh, uint32_t NS, uint32_t stride, ds4_gpu_tensor *blk_out,
+        const void *map, uint64_t size, uint64_t gamma_off, uint64_t inject_off, uint32_t inject_type,
+        uint32_t T, uint32_t E, uint32_t hc, float eps) {
+    using namespace qwen4_rocm;
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_QWEN4_COMB_OLD") != NULL;
+    if (off || E != 2560 || hc != 4 || inject_type != 1 || !T || !ds4_rocm_is_gfx1151()) return -1;
+    const uint64_t n = (uint64_t)T * hc * E, hbytes = (n * 2 + 15) & ~UINT64_C(15);
+    if (!tensor(R, n * 4) || !tensor(xn, n * 4) || !tensor(xh, hbytes + (uint64_t)T * 4) ||
+        !tensor(inj, (uint64_t)T * hc * 8 * hc * 4)) return 0;
+    if (part) {
+        if (!NS || stride < NS + (sg && !sh) || !tensor(part, (uint64_t)T * stride * E * 4) ||
+            !tensor(weights, (uint64_t)T * NS * 4) || (sg && !tensor(sg, (uint64_t)T * 4)) ||
+            (sh && !tensor(sh, (uint64_t)T * E * 4)) || (blk_out && !tensor(blk_out, (uint64_t)T * E * 4))) return 0;
+    } else if (!tensor(src, (uint64_t)T * E * 4)) return 0;
+    const float *gamma = (const float *)weight(map, size, gamma_off, (uint64_t)E * hc * 4);
+    const __half *wi = (const __half *)weight(map, size, inject_off, (uint64_t)E * hc * hc * 2);
+    if (!gamma || !wi) return 0;
+    hc_comb_norm_wide<<<T, 256, 0, 0>>>((float *)R->ptr, (float *)xn->ptr, (__half *)xh->ptr,
+        (float *)((char *)xh->ptr + hbytes), (float *)inj->ptr, (const float *)inj->ptr,
+        part ? NULL : (const float *)src->ptr, part ? (const float *)part->ptr : NULL,
+        part ? (const float *)weights->ptr : NULL, part && sg ? (const float *)sg->ptr : NULL,
+        part && sh ? (const float *)sh->ptr : NULL, NS, stride,
+        part && blk_out ? (float *)blk_out->ptr : NULL, gamma, wi, eps);
+    return launched() ? 1 : 0;
+}
+
+/* Q8_0 projection of rows already packed by hc_comb_norm_wide (xh layout as
+ * there): the direct / wide GEMM without its own pack_half_rows. */
+extern "C" int ds4_gpu_qwen4_dense_mm_packed_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *xh,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    using namespace qwen4_rocm;
+    const uint64_t hbytes = ((uint64_t)T * K * 2 + 15) & ~UINT64_C(15);
+    if (type != 8 || T < 32 || K % 32 || !tensor(out, (uint64_t)T * M * 4) ||
+        !tensor(xh, hbytes + (uint64_t)T * 4) || !ds4_rocm_is_gfx1151()) return 0;
+    const char *w = weight(map, size, off, row_bytes(8, K) * M);
+    float *ws = (float *)cuda_tmp_alloc((uint64_t)M * sizeof(float), "Qwen packed Q8 row scales");
+    if (!w || !ws) return 0;
+    const __half *xhp = (const __half *)xh->ptr;
+    const float *xs = (const float *)((const char *)xh->ptr + hbytes);
+    qwen_dense_row_scales<8><<<M, 256, 0, 0>>>(ws, w, K, row_bytes(8, K));
+    if (!launched()) return 0;
+    const int wide = launch_dense_wide<8>((float *)out->ptr, (const unsigned char *)w, xhp, xs, ws, T, K, M);
+    if (wide) return wide > 0;
+    return launch_qwen_q8_direct((float *)out->ptr, (const unsigned char *)w, xhp, xs, ws, T, K, M, 0, K);
 }
 
 extern "C" int ds4_gpu_qwen4_moe_build_lists_tensor(ds4_gpu_tensor *lists, ds4_gpu_tensor *counts,

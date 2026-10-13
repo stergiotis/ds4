@@ -3548,6 +3548,14 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
 /* shared_gate NULL: no shared expert; shared NULL: the shared output is part
  * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
  * token in part. */
+int ds4_gpu_qwen4_hc_comb_norm_wide_tensor(ds4_gpu_tensor *R, ds4_gpu_tensor *xn,
+        ds4_gpu_tensor *xh, ds4_gpu_tensor *inj, const ds4_gpu_tensor *src,
+        const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *sg,
+        const ds4_gpu_tensor *sh, uint32_t NS, uint32_t stride, ds4_gpu_tensor *blk_out,
+        const void *map, uint64_t size, uint64_t gamma_off, uint64_t inject_off, uint32_t inject_type,
+        uint32_t T, uint32_t E, uint32_t hc, float eps);
+int ds4_gpu_qwen4_dense_mm_packed_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *xh,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M);
 int ds4_gpu_qwen4_moe_reduce_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,
