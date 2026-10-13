@@ -2661,10 +2661,11 @@ __global__ void qwen_q8_direct(float *out,
  * divided out as in qwen_q8_direct.  The epilogue transposes through LDS so
  * each lane stores 32 consecutive rows of one token.  group > 0 runs bands
  * of `group` row tiles over all token tiles. */
-template<unsigned WT>
+template<unsigned WT, bool MIX = false>
 __launch_bounds__(256,1)
 __global__ void dense_wide(float *out, const unsigned char *w, const __half *x, const float *xs,
-        const float *ws, unsigned T, unsigned K, unsigned M, unsigned group) {
+        const float *ws, unsigned T, unsigned K, unsigned M, unsigned group,
+        const float *xn = nullptr, unsigned E = 0) {
     constexpr unsigned BM = 256, BN = 128, BK = 64;
     __shared__ __align__(16) uint4 smem[(BM + BN) * 8];
     uint4 *sa = smem, *sb = smem + BM * 8;
@@ -2677,6 +2678,9 @@ __global__ void dense_wide(float *out, const unsigned char *w, const __half *x, 
         bx = first + r % size; by = r / size;
     }
     const unsigned m0 = bx * BM, t0 = by * BN;
+    /* MIX (hc up, hc = 4): tile row r is weight row (r % 4) * E + r / 4, so
+     * four consecutive rows are the four streams of one hidden element */
+    auto wrow = [&](unsigned r) { return MIX ? (r & 3) * E + (r >> 2) : r; };
     const uint64_t rb = WT == 1 ? (uint64_t)K * 2 : (uint64_t)(K / 32) * 34;
     float8 acc[4][4] = {};
     uint4 pa[8], pb[4];
@@ -2686,10 +2690,10 @@ __global__ void dense_wide(float *out, const unsigned char *w, const __half *x, 
             #pragma unroll
             for (unsigned j = 0; j < 8; j++) {
                 const unsigned i = tid + 256 * j, r = i >> 3, c = i & 7;
-                pa[j] = *(const uint4 *)(w + (uint64_t)(m0 + r) * rb + (uint64_t)(k0 + c * 8) * 2);
+                pa[j] = *(const uint4 *)(w + (uint64_t)wrow(m0 + r) * rb + (uint64_t)(k0 + c * 8) * 2);
             }
         } else {
-            const unsigned *src = (const unsigned *)(w + (uint64_t)(m0 + tid) * rb + (uint64_t)(k0 / 32) * 34);
+            const unsigned *src = (const unsigned *)(w + (uint64_t)wrow(m0 + tid) * rb + (uint64_t)(k0 / 32) * 34);
             #pragma unroll
             for (unsigned j = 0; j < 17; j++) pq[j] = src[j];
         }
@@ -2699,7 +2703,7 @@ __global__ void dense_wide(float *out, const unsigned char *w, const __half *x, 
             pb[j] = t0 + r < T ? *(const uint4 *)(x + (uint64_t)(t0 + r) * K + k0 + c * 8) : make_uint4(0, 0, 0, 0);
         }
     };
-    const float winv = WT == 1 ? 1.0f : 1.0f / ws[m0 + tid];
+    const float winv = WT == 1 ? 1.0f : 1.0f / ws[wrow(m0 + tid)];
     auto commit = [&]() {
         if (WT == 1) {
             #pragma unroll
@@ -2772,7 +2776,24 @@ __global__ void dense_wide(float *out, const unsigned char *w, const __half *x, 
             for (unsigned j = 0; j < 8; j++) stage[l16 * 68 + fi * 16 + 2 * j + (lane >> 4)] = acc[fi][fj][j];
         __syncthreads();
         const unsigned tl = lane >> 1, half = lane & 1, tok = t0 + wn * 64 + fj * 16 + tl;
-        if (tok < T) {
+        if (MIX && tok < T) {
+            /* out[tok][d] = sum_s sigmoid(up_s) xn_s / 4, as hc_rows */
+            const unsigned r0 = m0 + wm * 64 + half * 32, d0 = r0 >> 2;
+            const float sx = xs[tok];
+            float mixed[8];
+            #pragma unroll
+            for (unsigned q = 0; q < 8; q++) {
+                float v = 0;
+                #pragma unroll
+                for (unsigned st = 0; st < 4; st++) {
+                    const float up = stage[tl * 68 + half * 32 + q * 4 + st] * (sx * ws[st * E + d0 + q]);
+                    v += sigmoid(up) * xn[((uint64_t)tok * 4 + st) * E + d0 + q];
+                }
+                mixed[q] = v / 4;
+            }
+            *(float4 *)(out + (uint64_t)tok * E + d0) = make_float4(mixed[0], mixed[1], mixed[2], mixed[3]);
+            *(float4 *)(out + (uint64_t)tok * E + d0 + 4) = make_float4(mixed[4], mixed[5], mixed[6], mixed[7]);
+        } else if (!MIX && tok < T) {
             const unsigned row = m0 + wm * 64 + half * 32;
             const float sx = xs[tok];
             float *dst = out + (uint64_t)tok * M + row;
@@ -3488,6 +3509,65 @@ __global__ void conv(float *x, float *history, const float *w, unsigned T,
     for (unsigned i = 0; i < K - 1; i++) history[(uint64_t)i * C + c] = win[i];
 }
 
+/* conv for long chunks, split into TT-token tiles: conv_edges saves each
+ * tile's K-1 incoming raw rows (tile 0: the history) and the chunk's last
+ * K-1 raw rows, then conv_tiles runs conv's arithmetic per tile in place and
+ * the tile-0 blocks store the new history. */
+__global__ void conv_edges(float *edge, const float *x, const float *history, unsigned T, unsigned C,
+                           unsigned K, unsigned TT) {
+    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y, n = gridDim.y - 1;
+    if (c >= C) return;
+    for (unsigned i = 0; i < K - 1; i++) {
+        float v;
+        if (j == 0) v = history[(uint64_t)i * C + c];
+        else if (j == n) v = x[(uint64_t)(T - (K - 1) + i) * C + c];
+        else v = x[(uint64_t)(j * TT - (K - 1) + i) * C + c];
+        edge[((uint64_t)j * (K - 1) + i) * C + c] = v;
+    }
+}
+
+__global__ void conv_tiles(float *x, float *history, const float *edge, const float *w, unsigned T,
+                           unsigned C, unsigned K, unsigned TT, bool activate) {
+    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
+    if (c >= C) return;
+    float win[3], taps[4];
+    for (unsigned i = 0; i < K - 1; i++) win[i] = edge[((uint64_t)j * (K - 1) + i) * C + c];
+    for (unsigned i = 0; i < K; i++) taps[i] = w[c * K + i];
+    const unsigned t1 = min(T, (j + 1) * TT);
+    for (unsigned t = j * TT; t < t1; t++) {
+        const uint64_t pos = (uint64_t)t * C + c;
+        const float raw = x[pos];
+        float v = taps[K - 1] * raw;
+        for (unsigned i = 0; i < K - 1; i++) v += taps[i] * win[i];
+        for (unsigned i = 0; i + 2 < K; i++) win[i] = win[i + 1];
+        win[K - 2] = raw;
+        x[pos] = activate ? silu(v) : v;
+    }
+    if (j == 0) {
+        const unsigned last = (T + TT - 1) / TT;
+        for (unsigned i = 0; i < K - 1; i++) history[(uint64_t)i * C + c] = edge[((uint64_t)last * (K - 1) + i) * C + c];
+    }
+}
+
+/* gdn_prep with one block per token and a warp per key head; each warp's
+ * arithmetic is gdn_prep's. */
+__global__ void gdn_prep_rows(float *qkv, float *a, float *b, const float *A, const float *bias,
+                              unsigned Hk, unsigned Hv, unsigned D) {
+    const unsigned h = threadIdx.x >> 5, t = blockIdx.x, lane = threadIdx.x & 31;
+    const unsigned C = (2 * Hk + Hv) * D, npt = D / 32;
+    float *q = qkv + (uint64_t)t * C + h * D + lane * npt, *k = q + Hk * D;
+    float qs = 0, ks = 0;
+    for (unsigned i = 0; i < npt; i++) { qs += q[i] * q[i]; ks += k[i] * k[i]; }
+    qs = rsqrtf(sum(qs) + 1e-6f) * rsqrtf((float)D);
+    ks = rsqrtf(sum(ks) + 1e-6f);
+    for (unsigned i = 0; i < npt; i++) { q[i] *= qs; k[i] *= ks; }
+    if (!h) for (unsigned j = lane; j < Hv; j += 32) {
+        const uint64_t p = (uint64_t)t * Hv + j;
+        a[p] = expf(A[j] * softplus(a[p] + bias[j]));
+        b[p] = sigmoid(b[p]);
+    }
+}
+
 __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const float *bias,
                          unsigned Hk, unsigned Hv, unsigned D) {
     const unsigned h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
@@ -3734,9 +3814,85 @@ extern "C" int ds4_gpu_qwen4_conv_stream_tensor(ds4_gpu_tensor *x, ds4_gpu_tenso
     if (!T || !C || K < 2 || K > 4 || !tensor(x, (uint64_t)T * C * 4) || !tensor(history, (uint64_t)(K - 1) * C * 4)) return 0;
     const char *w = weight(map, size, offset, (uint64_t)C * K * 4);
     if (!w) return 0;
+    static int tiled = -1;
+    if (tiled < 0) tiled = getenv("DS4_QWEN4_CONV_OLD") == NULL;
+    constexpr unsigned TT = 64;
+    if (tiled && T >= 4 * TT) {
+        const unsigned tiles = (T + TT - 1) / TT;
+        float *edge = (float *)cuda_tmp_alloc((uint64_t)(tiles + 1) * (K - 1) * C * sizeof(float), "Qwen conv edges");
+        if (!edge) return 0;
+        conv_edges<<<dim3((C + 255) / 256, tiles + 1), 256, 0, 0>>>(edge, (const float *)x->ptr,
+            (const float *)history->ptr, T, C, K, TT);
+        conv_tiles<<<dim3((C + 255) / 256, tiles), 256, 0, 0>>>((float *)x->ptr, (float *)history->ptr,
+            edge, (const float *)w, T, C, K, TT, activate);
+        return launched();
+    }
     conv<<<(C + 255) / 256, 256, 0, 0>>>((float *)x->ptr, (float *)history->ptr,
         (const float *)w, T, C, K, activate, NULL, UINT_MAX, NULL, UINT_MAX);
     return launched();
+}
+
+/* GDN alpha and beta projections for prefill (F32 rows, M = 2 x 48):
+ * 32 tokens x 96 outputs per block; a thread accumulates 4 tokens x 3
+ * outputs over K in order, operands staged through LDS 64 columns at a time. */
+__global__ __launch_bounds__(256) void gdn_ab_rows(float *ga, float *gb, const float *x, const float *wa,
+        const float *wb, unsigned T, unsigned K, unsigned H) {
+    constexpr unsigned TT = 32, KC = 64;
+    __shared__ float xs[TT][KC + 1], ws[96][KC + 1];
+    const unsigned tid = threadIdx.x, tg = tid >> 5, og = tid & 31, t0 = blockIdx.x * TT;
+    float acc[4][3] = {};
+    for (unsigned k0 = 0; k0 < K; k0 += KC) {
+        for (unsigned i = tid; i < TT * KC; i += 256) {
+            const unsigned t = i / KC, k = i % KC;
+            xs[t][k] = t0 + t < T ? x[(uint64_t)(t0 + t) * K + k0 + k] : 0.0f;
+        }
+        for (unsigned i = tid; i < 2 * H * KC; i += 256) {
+            const unsigned r = i / KC, k = i % KC;
+            ws[r][k] = r < H ? wa[(uint64_t)r * K + k0 + k] : wb[(uint64_t)(r - H) * K + k0 + k];
+        }
+        __syncthreads();
+        #pragma unroll 4
+        for (unsigned k = 0; k < KC; k++) {
+            float xv[4], wv[3];
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) xv[i] = xs[tg * 4 + i][k];
+            #pragma unroll
+            for (unsigned j = 0; j < 3; j++) wv[j] = og * 3 + j < 2 * H ? ws[og * 3 + j][k] : 0.0f;
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++)
+                #pragma unroll
+                for (unsigned j = 0; j < 3; j++) acc[i][j] += wv[j] * xv[i];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++) {
+        const unsigned t = t0 + tg * 4 + i;
+        if (t >= T) continue;
+        #pragma unroll
+        for (unsigned j = 0; j < 3; j++) {
+            const unsigned r = og * 3 + j;
+            if (r < H) ga[(uint64_t)t * H + r] = acc[i][j];
+            else if (r < 2 * H) gb[(uint64_t)t * H + r - H] = acc[i][j];
+        }
+    }
+}
+
+/* 1 when launched, -1 when not taken (F32 weights, 2 x H <= 96, T >= 64,
+ * DS4_QWEN4_AB_OLD), 0 on error */
+extern "C" int ds4_gpu_qwen4_gdn_ab_tensor(ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t ao, uint64_t bo, uint32_t type, uint32_t T, uint32_t K, uint32_t H) {
+    using namespace qwen4_rocm;
+    static int off = -1, min_rows = -1;
+    if (off < 0) off = getenv("DS4_QWEN4_AB_OLD") != NULL;
+    if (min_rows < 0) min_rows = getenv("DS4_QWEN4_AB_MIN") ? atoi(getenv("DS4_QWEN4_AB_MIN")) : 64;
+    if (off || type != 0 || T < (uint32_t)min_rows || 2 * H > 96 || K % 64) return -1;
+    if (!tensor(ga, (uint64_t)T * H * 4) || !tensor(gb, (uint64_t)T * H * 4) || !tensor(x, (uint64_t)T * K * 4)) return 0;
+    const float *wa = (const float *)weight(map, size, ao, (uint64_t)H * K * 4);
+    const float *wb = (const float *)weight(map, size, bo, (uint64_t)H * K * 4);
+    if (!wa || !wb) return 0;
+    gdn_ab_rows<<<(T + 31) / 32, 256, 0, 0>>>((float *)ga->ptr, (float *)gb->ptr, (const float *)x->ptr, wa, wb, T, K, H);
+    return launched() ? 1 : 0;
 }
 
 extern "C" int ds4_gpu_qwen4_gdn_prep_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor *a, ds4_gpu_tensor *b,
@@ -3747,6 +3903,11 @@ extern "C" int ds4_gpu_qwen4_gdn_prep_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor
         !tensor(a, (uint64_t)T * Hv * 4) || !tensor(b, (uint64_t)T * Hv * 4)) return 0;
     const char *A = weight(map, size, ao, (uint64_t)Hv * 4), *bias = weight(map, size, bo, (uint64_t)Hv * 4);
     if (!A || !bias) return 0;
+    if (Hk * 32 <= 1024 && T >= 64) {
+        gdn_prep_rows<<<T, Hk * 32, 0, 0>>>((float *)qkv->ptr,
+            (float *)a->ptr, (float *)b->ptr, (const float *)A, (const float *)bias, Hk, Hv, D);
+        return launched();
+    }
     gdn_prep<<<dim3(Hk, T), 32, 0, 0>>>((float *)qkv->ptr,
         (float *)a->ptr, (float *)b->ptr, (const float *)A, (const float *)bias, Hk, Hv, D);
     return launched();
@@ -4164,6 +4325,23 @@ static int direct_plain(float *y, const float *x, const char *w, unsigned T, uns
     return 1;
 }
 
+/* F16 rows -> Q8_0 rows (34-byte blocks of 32: f16 absmax/127 scale, round
+ * to nearest), one thread per block */
+__global__ void f16_rows_to_q8(unsigned char *dst, const __half *src, uint64_t blocks) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= blocks) return;
+    const __half *x = src + b * 32;
+    float v[32], amax = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 32; i++) { v[i] = __half2float(x[i]); amax = fmaxf(amax, fabsf(v[i])); }
+    const float d = amax / 127.0f, id = d > 0 ? 1.0f / d : 0.0f;
+    unsigned char *o = dst + b * 34;
+    const __half dh = __float2half_rn(d);
+    __builtin_memcpy(o, &dh, 2);
+    #pragma unroll
+    for (unsigned i = 0; i < 32; i++) o[2 + i] = (unsigned char)(int8_t)__float2int_rn(v[i] * id);
+}
+
 /* bulk rows: unpack to f16 and run the f16 projection; 0 when not taken */
 static int ht4_bulk(float *y, const float *x, const unsigned *w, const __half *su, const __half *sv,
         const int *rp, const int *cp, unsigned T, unsigned K, unsigned N) {
@@ -4182,6 +4360,27 @@ static int ht4_bulk(float *y, const float *x, const unsigned *w, const __half *s
     ht4_unpack<<<dim3(N / 128, K / 128), 256, 0, 0>>>(buf, w, su, sv, rp, cp, K);
     if (!launched()) return 0;
     if (!ds4_rocm_is_gfx1151()) return dense_f16_blas(y, x, buf, T, K, N);
+    /* long rows (GDN out, K 6144): as F16 the matrix misses the MALL, as
+     * Q8_0 it fits; DS4_QWEN4_HT4_Q8_MIN sets the K threshold (0 = never) */
+    static int q8_min = -1, q8_rows = -1;
+    if (q8_min < 0) q8_min = getenv("DS4_QWEN4_HT4_Q8_MIN") ? atoi(getenv("DS4_QWEN4_HT4_Q8_MIN")) : 4096;
+    if (q8_rows < 0) q8_rows = getenv("DS4_QWEN4_HT4_Q8_ROWS") ? atoi(getenv("DS4_QWEN4_HT4_Q8_ROWS")) : 512;
+    if (q8_min && K >= (unsigned)q8_min && T >= (unsigned)q8_rows) {
+        static unsigned char *q8;
+        static uint64_t q8cap;
+        const uint64_t q8need = (uint64_t)N * (K / 32) * 34;
+        if (q8need > q8cap) {
+            if (q8) { (void)cudaFree(q8); q8 = NULL; q8cap = 0; }
+            if (cudaMalloc((void **)&q8, q8need) != cudaSuccess) { (void)cudaGetLastError(); q8 = NULL; }
+            else q8cap = q8need;
+        }
+        if (q8) {
+            const uint64_t blocks = (uint64_t)N * (K / 32);
+            f16_rows_to_q8<<<(blocks + 255) / 256, 256, 0, 0>>>(q8, buf, blocks);
+            if (!launched()) return 0;
+            return dense_q8_blas(y, x, (const char *)q8, T, K, N);
+        }
+    }
     return direct_plain<1>(y, x, (const char *)buf, T, K, N);
 }
 
@@ -4441,6 +4640,37 @@ extern "C" int ds4_gpu_qwen4_dense_mm_packed_tensor(ds4_gpu_tensor *out, const d
     const int wide = launch_dense_wide<8>((float *)out->ptr, (const unsigned char *)w, xhp, xs, ws, T, K, M);
     if (wide) return wide > 0;
     return launch_qwen_q8_direct((float *)out->ptr, (const unsigned char *)w, xhp, xs, ws, T, K, M, 0, K);
+}
+
+/* Prefill hc up projection with the stream mix in its epilogue: mixed =
+ * sum_s sigmoid(up_s) xn_s / hc over the dense_wide GEMM of the activated
+ * low-rank rows (hc 4, Q8_0 up rows).  1 when launched, -1 when not taken,
+ * 0 on error. */
+extern "C" int ds4_gpu_qwen4_hc_up_mix_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor *lo_act,
+        const ds4_gpu_tensor *xn, const void *map, uint64_t size, uint64_t off, uint32_t type,
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t rank) {
+    using namespace qwen4_rocm;
+    static int off_env = -1, min_rows = -1;
+    if (off_env < 0) off_env = getenv("DS4_QWEN4_HC_MIX_OLD") != NULL;
+    if (min_rows < 0) min_rows = getenv("DS4_QWEN4_WIDE_MIN") ? atoi(getenv("DS4_QWEN4_WIDE_MIN")) : 512;
+    const uint32_t M = E * hc;
+    if (off_env || !min_rows || T < (uint32_t)min_rows || type != 8 || hc != 4 || M % 256 || rank % 64 ||
+        E % 64 || !ds4_rocm_is_gfx1151()) return -1;
+    if (!tensor(mixed, (uint64_t)T * E * 4) || !tensor(lo_act, (uint64_t)T * rank * 4) ||
+        !tensor(xn, (uint64_t)T * M * 4)) return 0;
+    const char *w = weight(map, size, off, row_bytes(8, rank) * M);
+    if (!w || (((uintptr_t)w & 3) || (rank / 32 * 34) % 4)) return w ? -1 : 0;
+    const uint64_t xbytes = ((uint64_t)T * rank * 2 + 15) & ~UINT64_C(15);
+    __half *xh = (__half *)cuda_tmp_alloc(xbytes + ((uint64_t)T + M) * sizeof(float), "Qwen hc up mix scratch");
+    if (!xh) return 0;
+    float *xs = (float *)((char *)xh + xbytes), *ws = xs + T;
+    pack_half_rows<0><<<T, 256, 0, 0>>>(xs, xh, (const char *)lo_act->ptr, rank, (uint64_t)rank * 4);
+    qwen_dense_row_scales<8><<<M, 256, 0, 0>>>(ws, w, rank, row_bytes(8, rank));
+    static int group = -1;
+    if (group < 0) group = getenv("DS4_QWEN4_WIDE_GROUP") ? atoi(getenv("DS4_QWEN4_WIDE_GROUP")) : 4;
+    dense_wide<8, true><<<dim3(M / 256, (T + 127) / 128), 256, 0, 0>>>((float *)mixed->ptr,
+        (const unsigned char *)w, xh, xs, ws, T, rank, M, (unsigned)group, (const float *)xn->ptr, E);
+    return launched() ? 1 : 0;
 }
 
 extern "C" int ds4_gpu_qwen4_moe_build_lists_tensor(ds4_gpu_tensor *lists, ds4_gpu_tensor *counts,

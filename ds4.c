@@ -60993,9 +60993,16 @@ static bool qwen4_graph_hc_mix_ex(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 #endif
     if (T > 8u && up_gemm) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
-        return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
-               qwen4_mark("hc lo act", 0) &&
-               qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
+        ok = ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
+             qwen4_mark("hc lo act", 0);
+        int fused = -1;
+#ifdef DS4_ROCM_BUILD
+        if (ok) fused = ds4_gpu_qwen4_hc_up_mix_tensor(g->mixed, g->hc_lo_act, g->xn, m->map, m->size, up->abs_offset,
+                                                       up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+#endif
+        if (fused == 0) return false;
+        if (fused > 0) return ok && qwen4_mark("hc up gemm", up->bytes);
+        return ok && qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                qwen4_mark("hc up gemm", up->bytes) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
@@ -61063,15 +61070,23 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                             DS4_N_EMBD, g->snap_after_first ? g->snap_lin_hist[il] : NULL, 0u,
                                             g->snap_after_second ? g->snap2_lin_hist[il] : NULL, 1u) != 0;
     } else {
-        ok = qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) &&
-             qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T) &&
+        int ab = -1;
+#ifdef DS4_ROCM_BUILD
+        if (l->lin_alpha->type == l->lin_beta->type)
+            ab = ds4_gpu_qwen4_gdn_ab_tensor(g->ga, g->gb, g->mixed, m->map, m->size, l->lin_alpha->abs_offset,
+                                             l->lin_beta->abs_offset, l->lin_alpha->type, T, DS4_N_EMBD,
+                                             DS4_N_LIN_V_HEAD);
+#endif
+        ok = ab > 0 || (ab < 0 && qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) &&
+                        qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T));
+        ok = ok && qwen4_mark("gdn alpha+beta proj", l->lin_alpha->bytes + l->lin_beta->bytes) &&
              ds4_gpu_qwen4_conv_stream_tensor(g->qkv, g->layer_lin_hist[il], m->map, m->size, l->lin_conv->abs_offset,
                                               T, conv_dim, DS4_N_LIN_CONV, true) &&
              ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size, l->lin_a->abs_offset,
                                            l->lin_dt_bias->abs_offset, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
                                            DS4_N_LIN_HEAD_DIM);
     }
-    if (ok) ok = qwen4_mark("gdn conv+gates", l->lin_alpha->bytes + l->lin_beta->bytes);
+    if (ok) ok = qwen4_mark("gdn conv+gates", 0);
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb, T,
                                            DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
