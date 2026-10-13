@@ -907,6 +907,55 @@ Two small costs seen while wiring it: a multi-output HT4 projection
 and every Q8_0 direct call recomputes `qwen_dense_row_scales` (a full read
 of the weight matrix) instead of caching it per tensor.
 
+### Step 0 table and the first four steps (2026-10-13 morning)
+
+True per-call times from single-forward traces (`DS4_GPU_TRACE=1`;
+`qwen-prof/pf/m1`, `m2`, `m3`). ~2K is the 7,000-character prompt
+(one forward, ~2,080 rows); gufo's column is its 2,048-row figure
+(`executor.cpp:108-115`, `EXPERIMENTS.md`), per call or per layer.
+
+| op (~2K rows), ms per call | before (main 62ca107) | after 2d521d2..30cb58d | gufo |
+|---|---:|---:|---:|
+| GDN qkv+z, 16384 x 2560 (HT4 -> F16) | 12.37 | 9.42 | 4.6 (conv fused) |
+| GDN norm + out, 2560 x 6144 (HT4) | 7.33 | 7.19 | ~1.6 + epilogue |
+| attention q/k/v/indexer | 10.85 | 8.55 | 3.9 + indexer |
+| attention out, 2560 x 6144 Q8_0 | 5.98 | 6.03 | 1.8 (int8) |
+| hc down, 320 x 10240 Q8_0 | 1.94 | 1.92 (before the packed rows) | 0.40 (int8) |
+| hc up, 10240 x 320 Q8_0 | 1.19 | 0.69 | 0.79 (mix fused) |
+| hc mix (separate) | 0.98 | 0.98 | fused |
+| GDN scan, per layer | 5.10 | 1.72 | ~1.75 |
+| GDN conv + gates, per layer | 2.48 | 2.47 | in the GEMM epilogue |
+| routed experts gate/up + down, per layer | 9.56 + 8.84 | same | ~8.5 together |
+| hc norm + combine + MoE reduce | 1.71 + 1.43 + 2.80 | fused (8K below) | ~2.7 per layer |
+| attention dense core, per layer | 11.56 | 11.16 | ~5.5 (whole attention) |
+| whole forward | 3,049 ms | 2,719 ms (before the fused combine) | 1,195 ms |
+
+At 8K (8,030-row forward): 10.0 s -> 8.6 s (scan + wide GEMM) -> 7.97 s
+(fused combine). Per 8K forward now: routed experts 2.28 s (gate/up 26.7
++ down 20.7 ms per layer: ~20 and ~13 TFLOP/s), GDN qkv+z 1.02 s, GDN
+norm+out 0.72 s, MoE reduce (+ next norm) 0.54 s, sparse attention core
+0.51 s (42 ms per attention layer), hc down 0.44 s, GDN conv+gates 0.42 s
+(11.7 ms per layer: the conv runs one thread per channel over all tokens,
+40 blocks), attention projections 0.33 s, hc mix 0.33 s, hc combine+norm
+0.32 s, GDN scan 0.24 s, hc up 0.22 s, attention out 0.21 s.
+
+Model-level A/B (warm, alternating, `ds4` CLI, prefill tok/s):
+
+| build | 2K | 8K |
+|---|---:|---:|
+| 754bfd4 (night baseline) | 652 | 768-786 |
+| + grouped order (group 4) | 700 | 836-848 |
+| + long GDN scan | 687 (scan only) | 821-825 (scan only) |
+| scan + group 0 (wt-dev "off") | 681 | 815-820 |
+| + wide GEMM, group 4 | 745 | 924-929 |
+| + fused combine/norm (wide group 8) | 781 | 982-996 |
+| main 30cb58d, all defaults | 796-800 | 1,005-1,014 |
+
+Gates: perplexity with the new paths forced on in 32-row batches - scan
+avg NLL 1.5794, + wide 1.5794 (bit-identical), + fused combine 1.5813;
+KL to the reference 0.0478 -> 0.0468; decode output identical to the HT4
+commit, 29.1-29.3 ms per token, identity script passes in all three.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
