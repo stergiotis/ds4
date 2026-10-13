@@ -984,6 +984,21 @@ commit, 29.1-29.3 ms per token, identity script passes in all three.
 - Packing the HT4 multi-output input once (qkv and z each pack it) would
   save ~0.7 ms per GDN layer (~25 ms per 8K forward); not done.
 
+More results (2026-10-13, `qwen-prof/pf/m7`-`m8`, standalone `scratchpad/narrow`):
+
+- 7043200 committed the tiled conv, the hc up mix epilogue, HT4 long rows
+  as Q8_0 and the tiled alpha/beta kernel (8K 1,051-1,063, 2K 816-833).
+  Decode A/B against 754bfd4, alternating x3: 29.21-29.25 vs 29.21-29.23 ms,
+  identical output - the 29.3 ms readings in some gates were noise.
+- Rejected: F16 MoE partial rows (the down tile writing F16, the reduce
+  reading it): 8K +2% (1,048-1,055 -> 1,069-1,075), reduce 11.2 -> 9.3 ms,
+  but forced at 32 rows avg NLL 1.5813 -> 1.5859 (+0.0046) and KL to the
+  reference 0.0475 -> 0.0480. Expert outputs keep F32.
+- Not committed: a 64-row x 256-token Q8_0 GEMM for hc down (M = 320, which
+  the 256-row tiles cover with 37.5% waste): bit-identical, 3.54 -> 3.09 ms
+  at 8,192 rows (15 -> 17 TFLOP/s), 1.02 -> 0.86 ms at 2,048 - about 0.6%
+  of an 8K forward. gufo's int8 kernel does this shape at ~33 TFLOP/s.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
