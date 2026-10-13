@@ -956,6 +956,34 @@ avg NLL 1.5794, + wide 1.5794 (bit-identical), + fused combine 1.5813;
 KL to the reference 0.0478 -> 0.0468; decode output identical to the HT4
 commit, 29.1-29.3 ms per token, identity script passes in all three.
 
+### Steps after the morning commits (2026-10-13)
+
+8K prefill (warm, `qwen-prof/pf/m5`, `m6`; each new path alone, then all):
+
+| change | 8K tok/s | output |
+|---|---:|---|
+| main 30cb58d (all off) | 1,004-1,012 | |
+| conv tiled over tokens + gdn_prep one block per token | 1,017-1,022 | identical |
+| hc up GEMM with the stream mix in its epilogue | 1,018-1,021 | identical |
+| HT4 long rows (K >= 4096: GDN out, attention out) as Q8_0 | 1,033 | identical token |
+| all three | 1,051-1,054 (2K 793 -> 822) | identical token |
+| + F16 expert mid rows | 1,055-1,059 (down 20.6 -> 20.0 ms) | rejected: noise-level |
+
+- The conv ran one thread per channel over all tokens (40 blocks): conv +
+  prep 6.5 -> 4.9 ms at 8,192 rows, bit-identical.
+- hc up + mix 5.5 -> 4.7 ms per call standalone, bit-identical (the
+  epilogue reads xn, 335 MB, which now dominates).
+- HT4 -> Q8_0 for K >= 4096: GDN norm+out 19.9 -> 13.3 ms and attention
+  out 17.4 -> 10.2 ms per 8K layer. One more rounding of the weights: gate
+  with it forced at 32 rows avg NLL 1.5806 (1.5813 without), KL to the
+  reference 0.0467 (0.0468), to the HT4 dump 0.0112 (0.0095).
+- The F16 expert mid rows (gate/up writing F16, down reading it) did not
+  pay: the MXFP4 down tile is not bound by its activation conversion.
+- The trace now splits "gdn alpha+beta proj": the two F32 48 x 2560
+  projections took 5.0 ms per layer through hipBLAS SGEMM at 8K.
+- Packing the HT4 multi-output input once (qkv and z each pack it) would
+  save ~0.7 ms per GDN layer (~25 ms per 8K forward); not done.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
