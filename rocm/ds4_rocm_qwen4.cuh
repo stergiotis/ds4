@@ -2648,6 +2648,157 @@ __global__ void qwen_q8_direct(float *out,
     }
 }
 
+/* Wide projections (T >= a few hundred rows, M % 256 == 0, K % 64 == 0):
+ * 256 weight rows x 128 tokens per block, 8 waves of 64 x 64 (4 x 4 WMMA
+ * fragments), both operands in LDS (chunk XOR swizzle), the next K-stage of
+ * 64 loaded into registers while the current one runs, F16 weights (WT 1)
+ * or Q8_0 rows (WT 8) converted to F16 at the LDS commit with the row scale
+ * divided out as in qwen_q8_direct.  The epilogue transposes through LDS so
+ * each lane stores 32 consecutive rows of one token.  group > 0 runs bands
+ * of `group` row tiles over all token tiles. */
+template<unsigned WT>
+__launch_bounds__(256,1)
+__global__ void dense_wide(float *out, const unsigned char *w, const __half *x, const float *xs,
+        const float *ws, unsigned T, unsigned K, unsigned M, unsigned group) {
+    constexpr unsigned BM = 256, BN = 128, BK = 64;
+    __shared__ __align__(16) uint4 smem[(BM + BN) * 8];
+    uint4 *sa = smem, *sb = smem + BM * 8;
+    const unsigned tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
+    const unsigned wm = wave & 3, wn = wave >> 2;
+    unsigned bx = blockIdx.x, by = blockIdx.y;
+    if (group) {
+        const unsigned b = blockIdx.y * gridDim.x + blockIdx.x, per = group * gridDim.y;
+        const unsigned first = b / per * group, size = min(group, gridDim.x - first), r = b % per;
+        bx = first + r % size; by = r / size;
+    }
+    const unsigned m0 = bx * BM, t0 = by * BN;
+    const uint64_t rb = WT == 1 ? (uint64_t)K * 2 : (uint64_t)(K / 32) * 34;
+    float8 acc[4][4] = {};
+    uint4 pa[8], pb[4];
+    unsigned pq[17];
+    auto fetch = [&](unsigned k0) {
+        if (WT == 1) {
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const unsigned i = tid + 256 * j, r = i >> 3, c = i & 7;
+                pa[j] = *(const uint4 *)(w + (uint64_t)(m0 + r) * rb + (uint64_t)(k0 + c * 8) * 2);
+            }
+        } else {
+            const unsigned *src = (const unsigned *)(w + (uint64_t)(m0 + tid) * rb + (uint64_t)(k0 / 32) * 34);
+            #pragma unroll
+            for (unsigned j = 0; j < 17; j++) pq[j] = src[j];
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            const unsigned i = tid + 256 * j, r = i >> 3, c = i & 7;
+            pb[j] = t0 + r < T ? *(const uint4 *)(x + (uint64_t)(t0 + r) * K + k0 + c * 8) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    const float winv = WT == 1 ? 1.0f : 1.0f / ws[m0 + tid];
+    auto commit = [&]() {
+        if (WT == 1) {
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const unsigned i = tid + 256 * j, r = i >> 3, c = i & 7;
+                sa[r * 8 + (c ^ ((r >> 1) & 7))] = pa[j];
+            }
+        } else {
+            const unsigned char *bytes = (const unsigned char *)pq;
+            #pragma unroll
+            for (unsigned blk = 0; blk < 2; blk++) {
+                uint16_t sb16 = (uint16_t)bytes[blk * 34] | (uint16_t)bytes[blk * 34 + 1] << 8;
+                const float sc = qwen_f16_to_f32(sb16) * winv;
+                #pragma unroll
+                for (unsigned c = 0; c < 4; c++) {
+                    _Float16 h[8];
+                    #pragma unroll
+                    for (unsigned e = 0; e < 8; e++) h[e] = (_Float16)(sc * (float)(int8_t)bytes[blk * 34 + 2 + c * 8 + e]);
+                    uint4 v; __builtin_memcpy(&v, h, 16);
+                    const unsigned cc = blk * 4 + c;
+                    sa[tid * 8 + (cc ^ ((tid >> 1) & 7))] = v;
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            const unsigned i = tid + 256 * j, r = i >> 3, c = i & 7;
+            sb[r * 8 + (c ^ ((r >> 1) & 7))] = pb[j];
+        }
+    };
+    fetch(0);
+    commit();
+    __syncthreads();
+    for (unsigned k0 = 0; k0 < K; k0 += BK) {
+        const bool more = k0 + BK < K;
+        if (more) fetch(k0 + BK);
+        #pragma unroll
+        for (unsigned st = 0; st < 4; st++) {
+            half16 bf[4];
+            #pragma unroll
+            for (unsigned fj = 0; fj < 4; fj++) {
+                const unsigned r = wn * 64 + fj * 16 + l16;
+                const uint4 lo = sb[r * 8 + ((2 * st) ^ ((r >> 1) & 7))], hi = sb[r * 8 + ((2 * st + 1) ^ ((r >> 1) & 7))];
+                __builtin_memcpy(&bf[fj], &lo, 16); __builtin_memcpy((char *)&bf[fj] + 16, &hi, 16);
+            }
+            #pragma unroll
+            for (unsigned fi = 0; fi < 4; fi++) {
+                const unsigned r = wm * 64 + fi * 16 + l16;
+                const uint4 lo = sa[r * 8 + ((2 * st) ^ ((r >> 1) & 7))], hi = sa[r * 8 + ((2 * st + 1) ^ ((r >> 1) & 7))];
+                half16 af;
+                __builtin_memcpy(&af, &lo, 16); __builtin_memcpy((char *)&af + 16, &hi, 16);
+                #pragma unroll
+                for (unsigned fj = 0; fj < 4; fj++)
+                    acc[fi][fj] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf[fj], acc[fi][fj]);
+            }
+        }
+        __syncthreads();
+        if (more) {
+            commit();
+            __syncthreads();
+        }
+    }
+    /* epilogue: per 16-token column, each wave stages its 64 rows x 16 tokens */
+    float *stage = (float *)smem + wave * (16 * 68);
+    #pragma unroll
+    for (unsigned fj = 0; fj < 4; fj++) {
+        #pragma unroll
+        for (unsigned fi = 0; fi < 4; fi++)
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) stage[l16 * 68 + fi * 16 + 2 * j + (lane >> 4)] = acc[fi][fj][j];
+        __syncthreads();
+        const unsigned tl = lane >> 1, half = lane & 1, tok = t0 + wn * 64 + fj * 16 + tl;
+        if (tok < T) {
+            const unsigned row = m0 + wm * 64 + half * 32;
+            const float sx = xs[tok];
+            float *dst = out + (uint64_t)tok * M + row;
+            #pragma unroll
+            for (unsigned q = 0; q < 8; q++) {
+                float4 v = *(const float4 *)&stage[tl * 68 + half * 32 + q * 4];
+                if (WT == 1) { v.x *= sx; v.y *= sx; v.z *= sx; v.w *= sx; }
+                else {
+                    const float4 sw = *(const float4 *)(ws + row + q * 4);
+                    v.x *= sx * sw.x; v.y *= sx * sw.y; v.z *= sx * sw.z; v.w *= sx * sw.w;
+                }
+                *(float4 *)(dst + q * 4) = v;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+/* dense_wide when the shape fits and T >= DS4_QWEN4_WIDE_MIN (default 512, 0 = never); 0 when not taken */
+template<unsigned WT>
+static int launch_dense_wide(float *out, const unsigned char *w, const __half *x, const float *xs,
+        const float *ws, unsigned T, unsigned K, unsigned M) {
+    static int min_rows = -1, group = -1;
+    if (min_rows < 0) min_rows = getenv("DS4_QWEN4_WIDE_MIN") ? atoi(getenv("DS4_QWEN4_WIDE_MIN")) : 512;
+    if (group < 0) group = getenv("DS4_QWEN4_WIDE_GROUP") ? atoi(getenv("DS4_QWEN4_WIDE_GROUP")) : 4;
+    if (!min_rows || T < (unsigned)min_rows || M % 256 || K % 64 || !ds4_rocm_is_gfx1151()) return 0;
+    if (WT == 8 && (((uintptr_t)w & 3) || (K / 32 * 34) % 4)) return 0;
+    dense_wide<WT><<<dim3(M / 256, (T + 127) / 128), 256, 0, 0>>>(out, w, x, xs, ws, T, K, M, (unsigned)group);
+    return launched() ? 1 : -1;
+}
+
 template<unsigned WT = 8>
 static int launch_qwen_q8_direct(float *out, const unsigned char *w,
         const __half *x, const float *xs, const float *ws, unsigned T,
@@ -2762,6 +2913,8 @@ static int dense_q8_blas(float *out, const float *x, const char *w,
         pack_half_rows<0><<<T,256,0,0>>>(xs,xh,(const char *)x,K,(uint64_t)K*4);
         qwen_dense_row_scales<8><<<M,256,0,0>>>(ws,w,K,row_bytes(8,K));
         if (!launched()) return 0;
+        const int wide=launch_dense_wide<8>(out,(const unsigned char *)w,xh,xs,ws,T,K,M);
+        if (wide) return wide>0;
         static int whole = -1;
         if (whole < 0) whole = getenv("DS4_QWEN4_Q8_SEGMENT_K") == NULL;
         const unsigned segment=K>4096 && !whole ? 1024 : K;
@@ -3905,6 +4058,10 @@ static int direct_plain(float *y, const float *x, const char *w, unsigned T, uns
     if (!launched()) return 0;
     static int whole = -1;
     if (whole < 0) whole = getenv("DS4_QWEN4_Q8_SEGMENT_K") == NULL;
+    if (WT == 1) {
+        const int wide = launch_dense_wide<1>(y, (const unsigned char *)w, xh, xs, xs, T, K, N);
+        if (wide) return wide > 0;
+    }
     const unsigned segment = K > 4096 && !whole ? 1024 : K;
     for (unsigned begin = 0; begin < K; begin += segment)
         if (!launch_qwen_q8_direct<WT>(y, (const unsigned char *)w, xh, xs, xs, T, K, N, begin,
