@@ -999,6 +999,31 @@ More results (2026-10-13, `qwen-prof/pf/m7`-`m8`, standalone `scratchpad/narrow`
   at 8,192 rows (15 -> 17 TFLOP/s), 1.02 -> 0.86 ms at 2,048 - about 0.6%
   of an 8K forward. gufo's int8 kernel does this shape at ~33 TFLOP/s.
 
+**End-to-end after a0ebb5f (2026-10-13 10:37-10:46, `qwen-prof/pf/m9`-`m11`).**
+
+- Rejected: packed F16 Q4_K decode in the expert gate/up tile (byte permute
+  into 1024 + q, packed FMA): gate/up 22.5 -> 21.3 ms per 8K layer, 8K
+  +0.7%, avg NLL +0.0016; not worth a changed decode output on the gate's
+  prompt. Neither expert kernel is bound by its dequantization.
+- a0ebb5f: 32-token Q4_K gate/up tiles for chunks up to 4096 rows (2K
+  818-827 -> 832-837 tok/s, bit-identical).
+- The sparse attention core already runs gufo's design (WMMA, 4 queries,
+  union of selected tiles) and costs about what gufo's does per query.
+
+`ds4-bench`, promessi_sposi, 128 greedy tokens (prefill / decode tok/s):
+
+| context | stock cb70021 (Q4 GGUF) | 754bfd4 (HT4, last night) | a0ebb5f (now) |
+|---|---:|---:|---:|
+| 2K | 433 / 20.6 | 695 / 34.8 | 851-860 / 32.6-34.7 |
+| 8K | 437 / 20.5 | 760 / 34.6 | 1,050-1,054 / 32.1-34.6 |
+| 32K | 392 / 19.7 | 773 / 32.3 | 1,038 / 32.4 |
+
+ds4-server (serve-qwen-ds4.sh: --mtp --mtp-exact-sampling, thinking on),
+temperature 0 unless noted: 8,773-token prompt TTFT 8.67-8.81 s (yesterday
+11.7 s; ~1,000 tok/s), 2,110-token prompt 2.50 s; decode 512 tokens: code
+44.4 (t 1.0: 46.4), prose 42.7 (t 1.0: 41.2) tok/s. halogen for scale:
+1,694-1,844 tok/s prefill, 52-72 tok/s decode over its API.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
