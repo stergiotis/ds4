@@ -27,6 +27,8 @@ template<unsigned TYPE>
 __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n,
         const uint64_t *grid = NULL, const uint8_t *signs = NULL);
 __device__ __forceinline__ float dot_q8_vec(const char *row, const float *x, unsigned n);
+template<unsigned NR>
+__device__ __forceinline__ void dot_q8_vec_n(const char *const *rows, const float *x, unsigned n, float *out);
 __device__ float injection(const float *inj, unsigned hc, unsigned stream);
 
 struct rope_args { float freq[32], scale; unsigned nrot; };
@@ -889,6 +891,16 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4_q8(float *out, const float
     const uint64_t pair0 = (uint64_t)t0 * (NS + 1) + slot;
     if (slot == NS) {
         const float *xt = x + pair0 * K;
+        if (row0 + OR <= M) {
+            const char *rows[OR];
+            float v[OR];
+            #pragma unroll
+            for (unsigned r = 0; r < OR; r++) rows[r] = sh + (row0 + r) * srb;
+            dot_q8_vec_n<OR>(rows, xt, K, v);
+            #pragma unroll
+            for (unsigned r = 0; r < OR; r++) if (!lane) out[pair0 * M + row0 + r] = v[r];
+            return;
+        }
         #pragma unroll
         for (unsigned r = 0; r < OR; r++) {
             const unsigned row = row0 + r;
@@ -1814,6 +1826,27 @@ __device__ __forceinline__ float dot_q8_vec(const char *row, const float *x, uns
         acc += w.x * v.x; acc += w.y * v.y; acc += w.z * v.z; acc += w.w * v.w;
     }
     return sum(acc);
+}
+
+/* dot_q8_vec of NR rows with one x, each row's sum in dot_q8_vec's order,
+ * the loads of all rows issued together (NR serial dots leave a wave
+ * waiting on one row's loads at a time). */
+template<unsigned NR>
+__device__ __forceinline__ void dot_q8_vec_n(const char *const *rows, const float *x, unsigned n, float *out) {
+    float acc[NR];
+    #pragma unroll
+    for (unsigned r = 0; r < NR; r++) acc[r] = 0;
+    #pragma unroll 4
+    for (unsigned i = (threadIdx.x & 31) * 4; i < n; i += 128) {
+        const float4 v = *(const float4 *)(x + i);
+        #pragma unroll
+        for (unsigned r = 0; r < NR; r++) {
+            const float4 w = value4<8>(rows[r], i, NULL, NULL);
+            acc[r] += w.x * v.x; acc[r] += w.y * v.y; acc[r] += w.z * v.z; acc[r] += w.w * v.w;
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < NR; r++) out[r] = sum(acc[r]);
 }
 
 /* Dense Q4_K rows for 1-3 tokens: one row per wave, the KB blocks of a row

@@ -564,6 +564,16 @@ __global__ __launch_bounds__(128) void moe_q4k_rows(float *out, const float *x, 
     if (slot == NS) {
         const float *xt = x + (uint64_t)t0 * K;
         const uint64_t pair = (uint64_t)t0 * (NS + 1) + NS;
+        if (SHT == 8) {
+            const char *rows[2 * R];
+            float v[2 * R];
+            #pragma unroll
+            for (unsigned r = 0; r < R; r++) { rows[2 * r] = sh0 + (row0 + r) * srb; rows[2 * r + 1] = sh1 + (row0 + r) * srb; }
+            qwen4_rocm::dot_q8_vec_n<2 * R>(rows, xt, K, v);
+            #pragma unroll
+            for (unsigned r = 0; r < R; r++) if (!lane) out[pair * M + row0 + r] = qwen4_rocm::silu(v[2 * r]) * v[2 * r + 1];
+            return;
+        }
         #pragma unroll
         for (unsigned r = 0; r < R; r++) {
             const unsigned row = row0 + r;
