@@ -1066,6 +1066,47 @@ To test, ranked:
    kyojin's depth rule on the drafter's own probability (0.6/0.3, 0.95/0.85
    past depth 3) and n-gram drafts.
 
+### Multi-user throughput and the compiler (2026-10-14, `qwen-prof/pf/m12`, `m13`)
+
+gufo's protocol through each server's HTTP API (`qwen-prof/multi.py`): a
+different ~2K-token prose prompt per user, all users sent at once, 128
+tokens, thinking off, temperature 0. "Window" is the aggregate rate while
+every user is decoding; "sum" adds per-user rates (gufo's metric, which
+reads high when a server serves users one after the other).
+
+| users | ds4 --batched-session 8 (window) | ds4 --mtp, one session (queued) | halogen 0.17.5, 8 slots (window / sum) | gufo published AR / MTP (sum) |
+|---:|---:|---:|---:|---:|
+| 1 | 35.1 | 41.4-41.7 | 46.5 / 46.2 | 28.2 / 33.4 |
+| 2 | 35.0 | ~41 (serial) | 65.3-66.4 / 58.4-58.7 | 50.2 / 57.2 |
+| 4 | 34.0-35.9 | ~41 (serial) | 84.2-85.4 / 67.1-67.7 | 84.7 / 84.0 |
+| 8 | 26.3-34.4 | | 110.6-112.5 / 78.9-91.9 | 122.5 / 121.2 |
+
+kyojin publishes ~74 tok/s total at batch 5. Prefill with 8 users arriving
+together: halogen keeps ~1,535 tok/s (last first token after 10.9 s); ds4
+interleaves 128-token prefill slices with decode, ~220-890 tok/s, last
+first token after ~72-76 s.
+
+**ds4 has no batched Qwen decode on ROCm.** Native session batching for
+Qwen is Metal-only (`DS4_HAS_QWEN4_METAL` around
+`qwen4_graph_native_session_batch_supported`); on ROCm `--batched-session`
+time-slices the sessions, so the total stays at one stream's ~35 tok/s,
+and `--mtp` without it serves requests one at a time. The single-session
+verify kernels already take 2-3 rows (experts read once per verify); a
+ROCm cross-session batch needs the per-session state plumbing (KV caches,
+GDN state, n-gram convolution) of the Metal path.
+
+**Compiler (AMD clang 23 from the ROCm 10 image vs Ubuntu clang 21), same
+source:** prefill 2K 827 -> 903-904 (+9%), 8K 1,056-1,062 -> 1,091-1,097
+(+3.4%); perplexity bit-identical (avg NLL 1.5813, same total to every
+digit), decode output identical, identity script passes; decode 29.25 ->
+29.45 ms (+0.7%), all of it the single-token expert gate/up kernel
+(`moe_q4k_rows`, 5.94 -> 6.18 ms per token): clang 23 gives it 217 VGPRs
+(clang 21: 117), occupancy 12 -> 6, and launch-bound caps spill (12 waves:
+130 spilled, 10: 86, 8: 23). Not the default build; `strix/hipcc23.sh`
+(`make strix-halo HIPCC=strix/hipcc23.sh`) is the opt-in for
+prefill-heavy use. The fix to try: give `moe_q4k_rows` fewer live values
+(or split it) so that clang 23 fits it in ~128 VGPRs.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
