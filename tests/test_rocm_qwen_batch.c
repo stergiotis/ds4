@@ -10,6 +10,15 @@
  * argmax agreement per session, and fails on non-finite logits, a KL above
  * DS4_TEST_MAX_KL (default 0.02) or more than one argmax disagreement.
  *
+ * DS4_TEST_SPEC=1 runs speculative batches instead (MTP drafts,
+ * ds4_sessions_eval_batch_speculative_argmax) until every session has
+ * DS4_TEST_STEPS tokens, then decodes each prompt alone without drafts:
+ * greedy speculation commits only the target's argmax, so the sequences
+ * should agree; it reports the matching prefix, the acceptance and the
+ * rate, and fails when a session matches fewer than DS4_TEST_MIN_MATCH
+ * (default steps / 2) tokens unless the control's logits there are within
+ * 0.1 of each other (batched rounding can flip a near tie).
+ *
  *   DS4_TEST_MODEL=/path/to/qwen.gguf ./tests/test_rocm_qwen_batch
  */
 #include "ds4.h"
@@ -55,6 +64,7 @@ int main(void) {
     const int steps = getenv("DS4_TEST_STEPS") ? atoi(getenv("DS4_TEST_STEPS")) : 32;
     const double max_kl = getenv("DS4_TEST_MAX_KL") ? atof(getenv("DS4_TEST_MAX_KL")) : 0.02;
     const int ctx = 2048;
+    const bool spec = getenv("DS4_TEST_SPEC") && atoi(getenv("DS4_TEST_SPEC"));
     if (n < 2 || n > MAX_SESSIONS || steps < 1) { fprintf(stderr, "FAIL: bad session count or steps\n"); return 1; }
 
     ds4_engine_options opt = {
@@ -65,6 +75,8 @@ int main(void) {
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)ctx,
         .placement_session_count_hint = n,
+        .glm_mtp = spec,
+        .mtp_draft_tokens = spec ? 2 : 1,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) { fprintf(stderr, "FAIL: engine open\n"); return 1; }
@@ -79,6 +91,63 @@ int main(void) {
             ds4_session_sync(s[i], &prompt[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: prefill %d: %s\n", i, err); return 1;
         }
+    }
+    if (spec) {
+        int *seq = malloc((size_t)n * (steps + 2) * sizeof(int)), len[MAX_SESSIONS] = {0};
+        float *cur = malloc((size_t)vocab * sizeof(float));
+        int committed = 0, cycles = 0, two = 0;
+        double ms = 0;
+        while (1) {
+            ds4_decode_item items[MAX_SESSIONS];
+            int done = 1;
+            for (int i = 0; i < n; i++) {
+                items[i] = (ds4_decode_item){ .session = s[i], .token = ds4_session_argmax(s[i]) };
+                done &= len[i] >= steps;
+            }
+            if (done) break;
+            int acc[MAX_SESSIONS][2], nacc[MAX_SESSIONS];
+            const double t0 = now_ms();
+            if (ds4_sessions_eval_batch_speculative_argmax(items, n, acc, nacc, err, sizeof(err)) != 0) {
+                fprintf(stderr, "FAIL: speculative batch: %s\n", err); return 1;
+            }
+            if (cycles >= 2) ms += now_ms() - t0;
+            for (int i = 0; i < n; i++) {
+                for (int k = 0; k < nacc[i]; k++) if (len[i] < steps + 2) seq[(size_t)i * (steps + 2) + len[i]++] = acc[i][k];
+                if (cycles >= 2) { committed += nacc[i]; two += nacc[i] == 2; }
+            }
+            cycles++;
+        }
+        printf("speculative batch of %d: %d cycles, %.2f ms per cycle, %.1f tok/s total, %.0f%% of rows took 2\n",
+               n, cycles, ms / (cycles - 2), committed * 1000.0 / ms, 100.0 * two / ((cycles - 2) * (double)n));
+        for (int i = 0; i < n; i++) ds4_session_free(s[i]);
+        int failed = 0;
+        const int min_match = getenv("DS4_TEST_MIN_MATCH") ? atoi(getenv("DS4_TEST_MIN_MATCH")) : steps / 2;
+        for (int i = 0; i < n; i++) {
+            ds4_session *c = NULL;
+            if (ds4_session_create(&c, engine, (uint32_t)ctx) != 0 ||
+                ds4_session_sync(c, &prompt[i], err, sizeof(err)) != 0) { fprintf(stderr, "FAIL: control %d: %s\n", i, err); return 1; }
+            int match = 0;
+            float gap = -1;
+            for (int k = 0; k < steps; k++) {
+                const int t = ds4_session_argmax(c);
+                const int b = seq[(size_t)i * (steps + 2) + k];
+                if (t != b) {   /* the control's margin between its argmax and the batch's token */
+                    if (ds4_session_copy_logits(c, cur, vocab) == vocab) gap = cur[t] - cur[b];
+                    break;
+                }
+                match++;
+                if (ds4_session_eval(c, t, err, sizeof(err)) != 0) { fprintf(stderr, "FAIL: control eval: %s\n", err); return 1; }
+            }
+            const int bad = match < min_match && !(gap >= 0 && gap < 0.1f);
+            failed |= bad;
+            printf("session %d: %d of %d tokens match plain decode", i, match, steps);
+            if (gap >= 0) printf(" (then a tie within %.3g)", gap);
+            printf("%s\n", bad ? "  FAIL" : "");
+            ds4_session_free(c);
+        }
+        ds4_engine_close(engine);
+        printf("%s\n", failed ? "FAIL" : "PASS");
+        return failed;
     }
     float *arch = malloc((size_t)(steps + 1) * n * vocab * sizeof(float));
     int *tok = malloc((size_t)(steps + 1) * n * sizeof(int));

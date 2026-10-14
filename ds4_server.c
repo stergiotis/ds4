@@ -13486,9 +13486,9 @@ static void server_generation_enter(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
-/* Batched mode with MTP but no speculative batches (ROCm): a generation
- * that runs alone takes the model for one single-session speculative step,
- * as without --batched-session.  Returns true with model_busy set and
+/* Batched mode with MTP on ROCm: a generation that runs alone takes the
+ * model for one single-session speculative step, as without
+ * --batched-session (deeper drafts than a speculative batch's one).  Returns true with model_busy set and
  * inference_mu held; server_solo_end releases both. */
 static bool server_solo_begin(server *s) {
     pthread_mutex_lock(&s->model_mu);
@@ -14349,7 +14349,12 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        const bool solo = !forced && s->batched_mode && !s->qwen4_batch_mtp &&
+#ifdef DS4_ROCM_BUILD
+        const bool solo_mtp = true;   /* a lone generation drafts deeper than a speculative batch */
+#else
+        const bool solo_mtp = !s->qwen4_batch_mtp;
+#endif
+        const bool solo = !forced && s->batched_mode && solo_mtp &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL && getenv("DS4_SERVER_NO_SOLO_MTP") == NULL &&
             server_solo_begin(s);
@@ -16325,7 +16330,15 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
-    s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
+    /* speculative decode batches: Metal; on ROCm only with DS4_SERVER_BATCH_MTP=1 (a draft row
+     * costs about what a plain row does there, mostly expert weights, so at the drafts'
+     * acceptance plain batches decode faster) */
+#ifdef DS4_ROCM_BUILD
+    const bool batch_mtp_backend = getenv("DS4_SERVER_BATCH_MTP") && atoi(getenv("DS4_SERVER_BATCH_MTP"));
+#else
+    const bool batch_mtp_backend = cfg.engine.backend == DS4_BACKEND_METAL;
+#endif
+    s.qwen4_batch_mtp = batch_mtp_backend &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.mixed_prefill_quantum_explicit = cfg.mixed_prefill_quantum_explicit;

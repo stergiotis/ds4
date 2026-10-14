@@ -4234,6 +4234,125 @@ extern "C" int ds4_gpu_qwen4_gdn_conv_scan_rows_tensor(ds4_gpu_tensor *out, ds4_
     return launched();
 }
 
+namespace qwen4_rocm {
+/* One or two rows per session (a token and its draft) for speculative
+ * decode batches, each session reached through a staged entry (the layout
+ * of ds4_metal.m's qwen4_gdn_row_entry); after the first row the window or
+ * state goes to the entry's snapshot when it has one.  Per row the
+ * arithmetic is conv_rows' / gdn_scan_rows1's. */
+struct gdn_row_entry { uint64_t state, hist, snap_state, snap_hist; uint32_t row0, n_tok, pad0, pad1; };
+static_assert(sizeof(gdn_row_entry) == DS4_GPU_QWEN4_GDN_ROW_BYTES, "GDN row entry");
+
+__global__ void conv_rows2(float *x, const gdn_row_entry *rows, const float *w, unsigned C, unsigned K,
+                           unsigned stride, bool activate) {
+    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const gdn_row_entry e = rows[blockIdx.y];
+    float *history = (float *)e.hist, *snap = (float *)e.snap_hist;
+    float win[3], taps[4];
+    for (unsigned i = 0; i < K - 1; i++) win[i] = history[(uint64_t)i * C + c];
+    for (unsigned i = 0; i < K; i++) taps[i] = w[c * K + i];
+    for (unsigned t = 0; t < e.n_tok; t++) {
+        float *xr = x + (uint64_t)(e.row0 + t) * stride;
+        const float raw = xr[c];
+        float v = taps[K - 1] * raw;
+        for (unsigned i = 0; i < K - 1; i++) v += taps[i] * win[i];
+        for (unsigned i = 0; i + 2 < K; i++) win[i] = win[i + 1];
+        win[K - 2] = raw;
+        xr[c] = activate ? silu(v) : v;
+        if (t == 0 && snap) for (unsigned i = 0; i < K - 1; i++) snap[(uint64_t)i * C + c] = win[i];
+    }
+    for (unsigned i = 0; i < K - 1; i++) history[(uint64_t)i * C + c] = win[i];
+}
+
+template<unsigned D>
+__global__ void gdn_scan_rows2(float *out, const gdn_row_entry *rows, const float *qkv,
+                               const float *a, const float *b, unsigned Hk, unsigned Hv,
+                               unsigned qkv_stride, unsigned out_stride) {
+    const unsigned dv = blockIdx.x * 4 + threadIdx.x / 32, h = blockIdx.y;
+    if (dv >= D) return;
+    const gdn_row_entry e = rows[blockIdx.z];
+    const unsigned npt = D / 32, k0 = (threadIdx.x & 31) * npt, kh = h % Hk;
+    float *state = (float *)e.state, *snap = (float *)e.snap_state;
+    const uint64_t idx = ((uint64_t)h * D + dv) * D + k0;
+    float s[4];
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) s[i] = state[idx + i];
+    for (unsigned t = 0; t < e.n_tok; t++) {
+        const unsigned row = e.row0 + t;
+        const float *q = qkv + (uint64_t)row * qkv_stride + kh * D + k0, *k = q + Hk * D;
+        const float decay = a[(uint64_t)row * Hv + h], beta = b[(uint64_t)row * Hv + h];
+        const float v = qkv[(uint64_t)row * qkv_stride + 2 * Hk * D + h * D + dv];
+        float u = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < npt; i++) { s[i] *= decay; u += s[i] * k[i]; }
+        const float delta = (v - sum(u)) * beta;
+        float o = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < npt; i++) { s[i] += k[i] * delta; o += s[i] * q[i]; }
+        o = sum(o);
+        if (!(threadIdx.x & 31)) out[(uint64_t)row * out_stride + h * D + dv] = o;
+        if (t == 0 && snap) {
+            #pragma unroll
+            for (unsigned i = 0; i < npt; i++) snap[idx + i] = s[i];
+        }
+    }
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) state[idx + i] = s[i];
+}
+}  // namespace qwen4_rocm
+
+extern "C" int ds4_gpu_qwen4_gdn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+        const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows) {
+    using namespace qwen4_rocm;
+    if (!rows || !n_rows || n_rows > 64) return 0;
+    gdn_row_entry e[64];
+    for (uint32_t i = 0; i < n_rows; i++) {
+        if (!rows[i].state || !rows[i].hist || !rows[i].n_tok || rows[i].n_tok > 2) return 0;
+        e[i].state = (uint64_t)(uintptr_t)rows[i].state->ptr;
+        e[i].hist = (uint64_t)(uintptr_t)rows[i].hist->ptr;
+        e[i].snap_state = rows[i].snap_state ? (uint64_t)(uintptr_t)rows[i].snap_state->ptr : 0;
+        e[i].snap_hist = rows[i].snap_hist ? (uint64_t)(uintptr_t)rows[i].snap_hist->ptr : 0;
+        e[i].row0 = rows[i].row0;
+        e[i].n_tok = rows[i].n_tok;
+        e[i].pad0 = e[i].pad1 = 0;
+    }
+    const uint64_t off = entry0 * sizeof(e[0]), bytes = (uint64_t)n_rows * sizeof(e[0]);
+    if (!table || off + bytes > table->bytes) return 0;
+    return cudaMemcpyAsync((char *)table->ptr + off, e, bytes, cudaMemcpyHostToDevice, 0) == cudaSuccess;
+}
+
+extern "C" int ds4_gpu_qwen4_conv_stream_rows2_tensor(ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t off, const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows,
+        uint32_t n_rows, uint32_t n_batch_rows, uint32_t C, uint32_t K, uint32_t stride, int activate) {
+    using namespace qwen4_rocm;
+    (void)rows;
+    if (!n_rows || n_rows > 64 || K < 2 || K > 4 || stride < C || !tensor(x, (uint64_t)n_batch_rows * stride * 4) ||
+        !table || (entry0 + n_rows) * sizeof(gdn_row_entry) > table->bytes) return 0;
+    const float *w = (const float *)weight(map, size, off, (uint64_t)C * K * 4);
+    if (!w) return 0;
+    conv_rows2<<<dim3((C + 255) / 256, n_rows), 256, 0, 0>>>((float *)x->ptr,
+        (const gdn_row_entry *)table->ptr + entry0, w, C, K, stride, activate != 0);
+    return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_gdn_scan_rows2_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, const ds4_gpu_tensor *table, uint64_t entry0,
+        const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows, uint32_t n_batch_rows, uint32_t Hk,
+        uint32_t Hv, uint32_t D, uint32_t qkv_stride, uint32_t out_stride) {
+    using namespace qwen4_rocm;
+    (void)rows;
+    if (!n_rows || n_rows > 64 || D != 128 || !tensor(out, (uint64_t)n_batch_rows * out_stride * 4) ||
+        !tensor((ds4_gpu_tensor *)qkv, (uint64_t)n_batch_rows * qkv_stride * 4) ||
+        !tensor((ds4_gpu_tensor *)a, (uint64_t)n_batch_rows * Hv * 4) ||
+        !tensor((ds4_gpu_tensor *)b, (uint64_t)n_batch_rows * Hv * 4) ||
+        !table || (entry0 + n_rows) * sizeof(gdn_row_entry) > table->bytes) return 0;
+    gdn_scan_rows2<128><<<dim3(D / 4, Hv, n_rows), 128, 0, 0>>>((float *)out->ptr,
+        (const gdn_row_entry *)table->ptr + entry0, (const float *)qkv->ptr, (const float *)a->ptr,
+        (const float *)b->ptr, Hk, Hv, qkv_stride, out_stride);
+    return launched();
+}
+
 extern "C" int ds4_gpu_qwen4_gdn_out_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *z,
         const void *map, uint64_t size, uint64_t off, uint32_t T, uint32_t H, uint32_t D, float eps) {
     using namespace qwen4_rocm;

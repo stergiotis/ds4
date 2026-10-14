@@ -1141,6 +1141,24 @@ for contiguous rows. Weights round to f16 exactly as before.
   (17.5 vs 16.5 ms); 64-token gate/up tiles; one 16-row group per wave for
   down.
 
+**Speculative decode batches on ROCm (2026-10-14, `qwen-prof/pf/s1`, `k2`;
+opt-in).** The Metal path (each session's token plus its MTP draft as a
+second row, snapshot after the first, one batched draft pass) now runs on
+ROCm: `gdn_rows_stage`, `conv_rows2` / `gdn_scan_rows2` (one or two rows per
+session through a staged entry table), and without the rows attention
+kernels each session's consecutive entries run as one single-session
+attention over row views. Oracle (`DS4_TEST_SPEC=1`): 2 and 4 sessions
+match plain decode on all 64-96 tokens; at 8, three sessions diverge at
+near ties (control logits within 0.012-0.056). It does not pay: a draft row
+costs about what a plain row does (+~10 ms per row from 1 to 8 rows, mostly
+expert weights), so at ~50-68% acceptance a cycle commits fewer tokens per
+ms than a plain batch. Oracle, tok/s total: 2 sessions 52.0 plain vs
+51.6-57.4 speculative, 4: 67.5 vs 66.0-69.9. Server (gufo protocol, 256
+tokens, window tok/s): 2 / 4 / 8 users plain 47.0 / 64.1 / 77.8 vs
+speculative 46.6 / 60.9 / 72.3 (the policy mostly picks plain; its probes
+cost). So `ds4-server` keeps plain batches on ROCm unless
+`DS4_SERVER_BATCH_MTP=1`; a lone generation still takes solo MTP.
+
 ### Batched multi-session decode on ROCm (2026-10-14, 64ca285, 7037ab1, 4b2134b)
 
 The Metal session-batch path now runs on ROCm (shared transient arena,
