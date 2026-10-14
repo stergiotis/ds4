@@ -595,6 +595,7 @@ __global__ __launch_bounds__(256) void router_fused(int *selected, float *weight
         float acc[T];
         #pragma unroll
         for (unsigned t = 0; t < T; t++) acc[t] = 0;
+        #pragma unroll 5
         for (unsigned i = lane * 8; i < K; i += 256) {
             const uint4 q = *(const uint4 *)(r + (uint64_t)i * 2);
             const float w0 = __uint_as_float(q.x << 16), w1 = __uint_as_float(q.x & 0xffff0000u);
@@ -3787,9 +3788,10 @@ __global__ void hc_mix(float *out, const float *xn, const float *lo,
 /* hc_mix for 2-3 tokens in one block: each weight load serves every token.
  * Each token's arithmetic is hc_mix's, so rows match it and do not depend
  * on T.  rank <= 512. */
-template<unsigned TYPE, unsigned TM>
+template<unsigned TYPE, unsigned TM, unsigned RK = 0>
 __global__ void hc_mix_multi(float *out, const float *xn, const float *lo,
-                             const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
+                             const char *up, unsigned E, unsigned hc, unsigned rank_, uint64_t rb) {
+    const unsigned rank = RK ? RK : rank_;
     const unsigned d = blockIdx.x * 4 + threadIdx.x / 32;
     __shared__ __align__(16) float activated[TM][512];
     for (unsigned i = threadIdx.x; i < TM * rank; i += blockDim.x)
@@ -3803,6 +3805,7 @@ __global__ void hc_mix_multi(float *out, const float *xn, const float *lo,
     if (stream < hc) {
         const char *row = up+((uint64_t)stream*E+d)*rb;
         if (!(rank%4) && !(TYPE == 0 ? (uintptr_t)row&15 : TYPE == 1 ? (uintptr_t)row&7 : 0)) {
+            #pragma unroll
             for (unsigned r = l*4; r < rank; r += 32) {
                 const float4 w = value4<TYPE>(row,r,NULL,NULL);
                 #pragma unroll
@@ -4653,6 +4656,10 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
 #undef QWEN_HC1
             } else if (type == 0) { if (n == 2) QWEN_HCM(0,2); else QWEN_HCM(0,3); }
             else if (type == 1) { if (n == 2) QWEN_HCM(1,2); else QWEN_HCM(1,3); }
+            else if (rank == 320) {
+                if (n == 2) hc_mix_multi<8,2,320><<<(E + 3) / 4,128,0,0>>>(op, xp, lp, w,E,hc,rank,row_bytes(8,rank));
+                else hc_mix_multi<8,3,320><<<(E + 3) / 4,128,0,0>>>(op, xp, lp, w,E,hc,rank,row_bytes(8,rank));
+            }
             else { if (n == 2) QWEN_HCM(8,2); else QWEN_HCM(8,3); }
         }
 #undef QWEN_HCM
