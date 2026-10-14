@@ -1107,6 +1107,47 @@ digit), decode output identical, identity script passes; decode 29.25 ->
 prefill-heavy use. The fix to try: give `moe_q4k_rows` fewer live values
 (or split it) so that clang 23 fits it in ~128 VGPRs.
 
+### Batched multi-session decode on ROCm (2026-10-14, 64ca285, 7037ab1, 4b2134b)
+
+The Metal session-batch path now runs on ROCm (shared transient arena,
+ROCm batches routed to it), with ROCm kernels for the per-session steps
+and the few-row kernels widened from 3 to 16 rows:
+
+| batch step (`tests/test_rocm_qwen_batch`) | before | after |
+|---|---:|---:|
+| 2 sessions | serial, 2 x ~30 ms | 38.7 ms (51.7 tok/s) |
+| 4 sessions | serial | 59.7 ms (67.0 tok/s) |
+| 8 sessions | serial | 99.2 ms (80.6 tok/s) |
+
+Order of the fixes at 8 rows: native path enabled 174 ms; Q4_K gate/up
+rows kernel for <= 16 rows (the ds4.c call was limited to T <= 3) 138 ms;
+MXFP4 down rows kernel 121 ms; dense matvec and hc mix in chunks of three
+rows 101 ms; GDN conv/scan for every row in one launch 99 ms. Tokens that
+share an expert form groups of three, so up to three rows the kernels are
+unchanged (an attempt with groups of four cost single-user decode 0.75%
+through register pressure). The oracle test compares every batched
+frontier with the session replayed alone: KL mean <= 0.001, at most one
+near-tie argmax flip in 32 steps x 8 sessions; perplexity bit-identical;
+single-user decode 29.25-29.28 ms (main 29.23-29.25).
+
+At 8 rows the MoE reads ~260 MB per layer at 230-250 GB/s (at the
+bandwidth limit), GDN is near its per-row state traffic (3.1 MB per layer
+and session, read and written); hc (12.6 ms) and per-session attention
+(6.2 ms) are the remaining slack, ~10%.
+
+Server (`ds4-server --batched-session 8 --mtp --mtp-exact-sampling`, gufo
+protocol, greedy): 1 user 42.2 tok/s (single-session MTP while alone,
+4b2134b), 2 / 4 / 8 users 48.6 / 64.0 / 80.6 tok/s total; with 8 users
+arriving together the last first token comes after 21.5 s (was ~66 s with
+128-row prefill slices; 2048-row slices since 7037ab1). halogen: 46 / 66
+/ 85 / 112; gufo published: 28 / 50 / 85 / 122.
+
+Next levers: speculation inside batches (Metal's path needs ROCm rows
+kernels with per-row snapshots), batched prefill of several arriving
+prompts (each prompt is prefilled alone at ~800 tok/s; halogen keeps
+~1,535 tok/s under load), wider (4-8-row) templates for the hc and Q8
+matvec kernels instead of chunks of three.
+
 ### Decode and speculation ideas from gufo (Track B, after prefill)
 
 - Producer-written Q8_1 activation rows + integer-dot matvecs + DPP /
