@@ -300,3 +300,25 @@ direct GEMM, the wide 256x128 GEMM for Q8_0) and the Kolibri expert tile
 Greedy output identical on both files. Kolibri sessions do not use the
 new batched multi-session decode: `ds4_sessions_eval_batch_cuda` still
 evaluates Kolibri batches one session after the other.
+
+## Batched multi-session decode (2026-10-14, `qwen-prof/pf/k2`)
+
+`ds4_sessions_eval_batch` runs Kolibri batches of up to 16 sessions as one
+forward: every weight product (q/k/v, o, router, routed and shared experts,
+head) over one row per session in the first session's transients (they
+hold no state between forwards), and each session's rope, KV store and
+attention against its own caches at its own position (`DS4_KOLIBRI_NO_BATCH=1`
+for one session after the other). The F8 dense matvecs read their weights
+once per row on the old path, so `matvec_f8_rows` (2-16 rows, `dot_f8`'s
+order per row) and `matvec_bf16_rows` (4-16 rows, the head) now read each
+weight once for all rows. Oracle (`tests/test_rocm_qwen_batch`, Kolibri-1-Q4_K,
+32 greedy steps): PASS at 2/4/8, max |dlogit| 3-4e-6, no argmax change.
+
+| sessions | one after the other | batched (first version) | batched |
+|---:|---:|---:|---:|
+| 1 | 55.6 | | |
+| 2 | | 46.6 | 88.5 |
+| 4 | 55.9 | 61.4 | 112.8 |
+| 8 | 56.0 | 59.3 | 145.0 |
+
+(tok/s total; single-stream decode unchanged, output identical.)

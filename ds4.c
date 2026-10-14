@@ -44372,6 +44372,8 @@ struct ds4_engine {
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
+    ds4_gpu_tensor *kolibri_batch_logits;   /* Kolibri decode batches: one logit row per session */
+    uint32_t kolibri_batch_rows;
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
     float qwen4_batch_p, qwen4_batch_ms[2];
@@ -76697,6 +76699,8 @@ void ds4_engine_close(ds4_engine *e) {
         e->qwen4_shared_workspace = NULL;
     }
 #endif
+    ds4_gpu_tensor_free(e->kolibri_batch_logits);
+    e->kolibri_batch_logits = NULL;
     if (e->shared_prefill_workspace_ready) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
@@ -84599,6 +84603,105 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
     return 0;
 }
 
+#ifdef DS4_HAS_KOLIBRI_GPU
+/* Kolibri decode batch: one row per session through every weight product
+ * (projections, routed and shared experts, head) in the first session's
+ * transients, which hold no state between forwards; each session's rope,
+ * KV store and attention run against its own caches at its own position.
+ * Per row the arithmetic is that of a single-session decode, except the
+ * products over several rows. */
+static int kolibri_sessions_eval_batch(ds4_decode_item *items, int count, ds4_engine *e,
+                                       char *err, size_t errlen) {
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+    ds4_kolibri_gpu_graph *g = &items[0].session->kolibri_graph;
+    const uint32_t T = (uint32_t)count, E = DS4_N_EMBD, H = DS4_N_HEAD, Hkv = DS4_N_HEAD_KV, D = DS4_N_HEAD_DIM;
+    const uint64_t q_bytes = (uint64_t)H * D * sizeof(float), kv_bytes = (uint64_t)Hkv * D * sizeof(float);
+    if (T > g->cap_tokens) {
+        if (errlen) snprintf(err, errlen, "Kolibri batch of %d exceeds the chunk size", count);
+        return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s->kolibri_graph_ready || s->kolibri_graph.pos != (uint32_t)s->checkpoint.len ||
+            s->kolibri_graph.pos >= s->kolibri_graph.ctx_cap) {
+            if (errlen) snprintf(err, errlen, "Kolibri batch item %d is out of step with its session", i);
+            return 1;
+        }
+        qwen4_ref_row(m, w->token_embd, (uint64_t)items[i].token, g->host_x + (uint64_t)i * E);
+    }
+    if (e->kolibri_batch_rows < T) {
+        ds4_gpu_tensor_free(e->kolibri_batch_logits);
+        e->kolibri_batch_logits = qwen4_graph_alloc_f32((uint64_t)16u * DS4_N_VOCAB);
+        e->kolibri_batch_rows = e->kolibri_batch_logits ? 16u : 0u;
+        if (e->kolibri_batch_rows < T) {
+            if (errlen) snprintf(err, errlen, "Kolibri batch logits allocation failed");
+            return 1;
+        }
+    }
+    bool ok = ds4_gpu_tensor_write(g->x, 0, g->host_x, (uint64_t)T * E * sizeof(float)) != 0 &&
+              glm_graph_begin_commands_if_needed() &&
+              kolibri_mark(NULL, 0) &&
+              ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, NULL, NULL, NULL, NULL, 0, 0, 0,
+                                              m->map, m->size, 0, w->layer[0].attn_norm->abs_offset,
+                                              T, E, DS4_RMS_EPS) != 0 &&
+              kolibri_mark("input norm", 0);
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const bool sliding = ds4_kolibri_layer_is_sliding(il);
+        const uint64_t next = il + 1u < DS4_N_LAYER ? w->layer[il + 1u].attn_norm->abs_offset
+                                                    : w->output_norm->abs_offset;
+        ok = qwen4_gemv(g->q, m, l->attn_q, g->xn, T) && qwen4_gemv(g->k, m, l->attn_k, g->xn, T) &&
+             qwen4_gemv(g->v, m, l->attn_v, g->xn, T) &&
+             kolibri_mark("qkv matvec", l->attn_q->bytes + l->attn_k->bytes + l->attn_v->bytes);
+        for (uint32_t i = 0; ok && i < T; i++) {
+            ds4_kolibri_gpu_graph *sg = &items[i].session->kolibri_graph;
+            ds4_gpu_tensor *q = ds4_gpu_tensor_view(g->q, i * q_bytes, q_bytes);
+            ds4_gpu_tensor *k = ds4_gpu_tensor_view(g->k, i * kv_bytes, kv_bytes);
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(g->v, i * kv_bytes, kv_bytes);
+            ds4_gpu_tensor *a = ds4_gpu_tensor_view(g->attn, i * q_bytes, q_bytes);
+            ok = q && k && v && a &&
+                 ds4_gpu_kolibri_qk_prep_tensor(q, k, v, sg->kc[il], sg->vc[il], m->map, m->size,
+                                                l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                                                1, H, Hkv, D, sg->pos, sg->cache_rows[il], sliding,
+                                                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
+                 ds4_gpu_kolibri_attention_tensor(a, q, sg->kc[il], sg->vc[il], 1, H, Hkv, D, sg->pos,
+                                                  sg->cache_rows[il], sliding ? DS4_N_SLIDING_WINDOW : 0u);
+            ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(a);
+        }
+        ok = ok && kolibri_mark(sliding ? "attention sliding" : "attention full", 0);
+        ok = ok && qwen4_gemv(g->h, m, l->attn_output, g->attn, T) &&
+             kolibri_mark("o matvec", l->attn_output->bytes) &&
+             ds4_gpu_kolibri_norm_add_tensor(g->x, g->xn, g->h, NULL, NULL, NULL, 0, 0, 0,
+                                             m->map, m->size, l->attn_post_norm->abs_offset,
+                                             l->ffn_norm->abs_offset, T, E, DS4_RMS_EPS) &&
+             kolibri_mark("attn residual+norm", 0) &&
+             kolibri_graph_moe(g, m, l, T, next);
+    }
+    ok = ok && qwen4_gemv(e->kolibri_batch_logits, m, w->output, g->xn, T) &&
+         kolibri_mark("lm head", w->output->bytes);
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok) ds4_gpu_kolibri_trace_end(T);
+    for (int i = 0; ok && i < count; i++) {
+        ds4_session *s = items[i].session;
+        ok = ds4_gpu_tensor_read(e->kolibri_batch_logits, (uint64_t)i * DS4_N_VOCAB * sizeof(float), s->logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        if (ok) {
+            s->kolibri_graph.pos++;
+            token_vec_push(&s->checkpoint, items[i].token);
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+        }
+    }
+    if (!ok) {
+        for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+        if (errlen) snprintf(err, errlen, "Kolibri decode batch failed");
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -84649,6 +84752,14 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
         }
     }
 
+#ifdef DS4_HAS_KOLIBRI_GPU
+    /* DS4_KOLIBRI_NO_BATCH=1: one decode per session in turn */
+    if (ds4_session_is_kolibri(first) && count <= 16 && getenv("DS4_KOLIBRI_NO_BATCH") == NULL) {
+        bool all = true;
+        for (int i = 1; i < count; i++) all &= ds4_session_is_kolibri(items[i].session);
+        if (all) return kolibri_sessions_eval_batch(items, count, e, err, errlen);
+    }
+#endif
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA
 #ifdef DS4_ROCM_BUILD

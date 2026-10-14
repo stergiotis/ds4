@@ -1942,6 +1942,87 @@ __global__ void matvec_rows(float *out, const char *w, const float *x,
     }
 }
 
+/* F8_B128 rows for 2-16 tokens (K % 512 == 0, x 16-byte aligned): one row
+ * per wave, each lane's 16 weights of a block decoded once and dotted with
+ * every token in dot_f8's order, so each token's result is the one-token
+ * matvec's. */
+template<unsigned TM>
+__global__ __launch_bounds__(128) void matvec_f8_rows(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const char *r = w + (uint64_t)row * stride;
+    const unsigned off = lane * 16, group = lane / 8;
+    float acc[TM];
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) acc[t] = 0;
+    for (unsigned base = 0; base < K; base += 512) {
+        const char *b = r + (base / 512) * 528;
+        const float scale = ((const float *)b)[group] * 256.0f;
+        const uint4 q = *(const uint4 *)(b + 16 + off);
+        const unsigned wq[4] = {q.x, q.y, q.z, q.w};
+        float f[16];
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            f[4 * k] = f8_e4m3_x256(wq[k] & 255); f[4 * k + 1] = f8_e4m3_x256((wq[k] >> 8) & 255);
+            f[4 * k + 2] = f8_e4m3_x256((wq[k] >> 16) & 255); f[4 * k + 3] = f8_e4m3_x256(wq[k] >> 24);
+        }
+        #pragma unroll
+        for (unsigned t = 0; t < TM; t++) {
+            if (t < T) {
+                const float4 *xv = (const float4 *)(x + (uint64_t)t * K + base + off);
+                float part = 0;
+                #pragma unroll
+                for (unsigned k = 0; k < 4; k++) {
+                    const float4 v = xv[k];
+                    part += f[4 * k] * v.x + f[4 * k + 1] * v.y + f[4 * k + 2] * v.z + f[4 * k + 3] * v.w;
+                }
+                acc[t] += part * scale;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) {
+        if (t < T) {
+            const float v = sum(acc[t]);
+            if (!lane) out[(uint64_t)t * M + row] = v;
+        }
+    }
+}
+
+/* matvec_bf16 for 4-16 tokens (T <= TM), each token's sum in its order. */
+template<unsigned TM>
+__global__ __launch_bounds__(128) void matvec_bf16_rows(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const char *r = w + (uint64_t)row * stride;
+    float acc[TM];
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) acc[t] = 0;
+    for (unsigned i = lane * 8; i < K; i += 256) {
+        const uint4 q = *(const uint4 *)(r + (uint64_t)i * 2);
+        const float w0 = __uint_as_float(q.x << 16), w1 = __uint_as_float(q.x & 0xffff0000u);
+        const float w2 = __uint_as_float(q.y << 16), w3 = __uint_as_float(q.y & 0xffff0000u);
+        const float w4 = __uint_as_float(q.z << 16), w5 = __uint_as_float(q.z & 0xffff0000u);
+        const float w6 = __uint_as_float(q.w << 16), w7 = __uint_as_float(q.w & 0xffff0000u);
+        #pragma unroll
+        for (unsigned t = 0; t < TM; t++) {
+            if (t < T) {
+                const float4 a = *(const float4 *)(x + (uint64_t)t * K + i), b = *(const float4 *)(x + (uint64_t)t * K + i + 4);
+                acc[t] += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) {
+        if (t < T) {
+            const float v = sum(acc[t]);
+            if (!lane) out[(uint64_t)t * M + row] = v;
+        }
+    }
+}
+
 template<unsigned ROWS>
 __global__ void matvec_q8(float *out, const char *w, const float *x,
         unsigned T, unsigned K, unsigned M, uint64_t stride) {
@@ -2421,6 +2502,20 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
      * ones read it once per row, and every row keeps their sum order */
     static int chunk = -1;
     if (chunk < 0) chunk = getenv("DS4_QWEN4_MV_NO_CHUNK") == NULL;
+    /* F8 (2-16 rows) and BF16 (4-16 rows) read each weight once for all rows */
+    if (chunk && type == 200 && T >= 2 && T <= 16 && !(K % 512) && !((uintptr_t)x & 15) && !((uintptr_t)w & 15)) {
+        const uint64_t st = row_bytes(type, K);
+        if (T <= 4) matvec_f8_rows<4><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
+        else if (T <= 8) matvec_f8_rows<8><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
+        else matvec_f8_rows<16><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
+        return launched();
+    }
+    if (chunk && type == 30 && T > 3 && T <= 16 && !(K % 256) && !((uintptr_t)x & 15) && !((uintptr_t)w & 15)) {
+        const uint64_t st = row_bytes(type, K);
+        if (T <= 8) matvec_bf16_rows<8><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
+        else matvec_bf16_rows<16><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
+        return launched();
+    }
     if (chunk && T > 3 && T <= 16) {
         for (unsigned c = 0; c < T; c += 3) {
             const unsigned n = T - c < 3 ? T - c : 3;
