@@ -322,3 +322,11 @@ weight once for all rows. Oracle (`tests/test_rocm_qwen_batch`, Kolibri-1-Q4_K,
 | 8 | 56.0 | 59.3 | 145.0 |
 
 (tok/s total; single-stream decode unchanged, output identical.)
+
+Through `ds4-server --batched-session 8` (gufo protocol, 256 tokens,
+`qwen-prof/pf/k3`, `k3b`): 1 / 2 / 4 / 8 users decode 54 / 85-108 /
+111-112 / 143-146 tok/s in the all-decoding window, against ~54 with
+`DS4_KOLIBRI_NO_BATCH=1`; outputs equal. With the default 128-token mixed
+prefill slices 8 users arriving together waited 31 s for the last first
+token (prefill 675 tok/s); Kolibri on ROCm now takes 2048-token slices like
+Qwen3.8: 13.8 s, 1,522 tok/s.

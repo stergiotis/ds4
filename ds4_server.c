@@ -12731,11 +12731,12 @@ static int server_prefill_quantum_for(const server *s,
         quantum = 1024;
     }
 #ifdef DS4_ROCM_BUILD
-    /* Qwen3.8 on ROCm: 128-row prefill slices run far below the bulk GEMMs'
-     * rate (8 users arriving together: ~250 tok/s and 66 s to the last first
-     * token at 128, ~750 tok/s and 22 s at 2048, decode throughput equal) */
+    /* Qwen3.8 and Kolibri 1 on ROCm: 128-row prefill slices run far below the
+     * bulk GEMMs' rate (Qwen, 8 users arriving together: ~250 tok/s and 66 s
+     * to the last first token at 128, ~750 tok/s and 22 s at 2048, decode
+     * throughput equal) */
     if (generation_active && !s->mixed_prefill_quantum_explicit && s->engine &&
-        ds4_engine_is_qwen4(s->engine) && quantum < 2048) {
+        (ds4_engine_is_qwen4(s->engine) || ds4_engine_is_kolibri(s->engine)) && quantum < 2048) {
         quantum = 2048;
     }
 #endif
