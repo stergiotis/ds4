@@ -1141,6 +1141,17 @@ for contiguous rows. Weights round to f16 exactly as before.
   (17.5 vs 16.5 ms); 64-token gate/up tiles; one 16-row group per wave for
   down.
 
+**Plain decode batches, 8 sessions (2026-10-14).** `DS4_GPU_TRACE` now
+reports session batches as their own bucket. Per step (98 ms; groups from
+`DS4_QWEN4_BATCH_TIMING`, synchronized): MoE 56 ms (router 5, routed
+experts ~9.7 GB of weights at ~173 GB/s), GDN 18.6, attention 6.6, hc mixes
+11.1, embeddings and n-grams 3. Matvecs for 4-16 rows no longer split into
+3-row launches where a kernel keeps each row's order for any count: hc down
+(Q8_0, K 10240, up to 8 rows per launch) 4.2 -> 3.0 ms per step, the BF16
+router (one block per row, K over 8 waves) 6.2 -> 5.0 ms; batch of 4 59.6
+-> 58.0 ms, 8 99.9 -> 98.9 ms; oracle passes. What is left is mostly expert
+weight bandwidth (~10% headroom).
+
 **Speculative decode batches on ROCm (2026-10-14, `qwen-prof/pf/s1`, `k2`;
 opt-in).** The Metal path (each session's token plus its MTP draft as a
 second row, snapshot after the first, one batched draft pass) now runs on

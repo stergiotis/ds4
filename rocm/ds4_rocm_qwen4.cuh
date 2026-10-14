@@ -2023,6 +2023,45 @@ __global__ __launch_bounds__(128) void matvec_bf16_rows(float *out, const char *
     }
 }
 
+/* BF16 rows for 2-16 tokens when M is small (the router): one 256-thread
+ * block per row, K spread over all eight waves, a fixed-order block sum. */
+template<unsigned TM>
+__global__ __launch_bounds__(256) void matvec_bf16_split(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x, tid = threadIdx.x;
+    const char *r = w + (uint64_t)row * stride;
+    float acc[TM];
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) acc[t] = 0;
+    for (unsigned i = tid * 8; i < K; i += 2048) {
+        const uint4 q = *(const uint4 *)(r + (uint64_t)i * 2);
+        const float w0 = __uint_as_float(q.x << 16), w1 = __uint_as_float(q.x & 0xffff0000u);
+        const float w2 = __uint_as_float(q.y << 16), w3 = __uint_as_float(q.y & 0xffff0000u);
+        const float w4 = __uint_as_float(q.z << 16), w5 = __uint_as_float(q.z & 0xffff0000u);
+        const float w6 = __uint_as_float(q.w << 16), w7 = __uint_as_float(q.w & 0xffff0000u);
+        #pragma unroll
+        for (unsigned t = 0; t < TM; t++) {
+            if (t < T) {
+                const float4 a = *(const float4 *)(x + (uint64_t)t * K + i), b = *(const float4 *)(x + (uint64_t)t * K + i + 4);
+                acc[t] += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+            }
+        }
+    }
+    __shared__ float part[8][TM];
+    #pragma unroll
+    for (unsigned t = 0; t < TM; t++) {
+        const float v = sum(acc[t]);
+        if (!(tid & 31)) part[tid / 32][t] = v;
+    }
+    __syncthreads();
+    if (tid < TM && tid < T) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) v += part[k][tid];
+        out[(uint64_t)tid * M + row] = v;
+    }
+}
+
 template<unsigned ROWS>
 __global__ void matvec_q8(float *out, const char *w, const float *x,
         unsigned T, unsigned K, unsigned M, uint64_t stride) {
@@ -2510,10 +2549,48 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         else matvec_f8_rows<16><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
         return launched();
     }
+    if (chunk && type == 30 && T > 3 && T <= 16 && M <= 4096 && !(K % 8) && !((uintptr_t)x & 15) &&
+        !((uintptr_t)w & 15)) {
+        const uint64_t st = row_bytes(type, K);
+        if (T <= 8) matvec_bf16_split<8><<<M, 256, 0, 0>>>(out, w, x, T, K, M, st);
+        else matvec_bf16_split<16><<<M, 256, 0, 0>>>(out, w, x, T, K, M, st);
+        return launched();
+    }
     if (chunk && type == 30 && T > 3 && T <= 16 && !(K % 256) && !((uintptr_t)x & 15) && !((uintptr_t)w & 15)) {
         const uint64_t st = row_bytes(type, K);
         if (T <= 8) matvec_bf16_rows<8><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
         else matvec_bf16_rows<16><<<(M + 3) / 4, 128, 0, 0>>>(out, w, x, T, K, M, st);
+        return launched();
+    }
+    /* the router (F32) and hc down (Q8_0, K = 10240) kernels keep each row's
+     * sum order for any row count: one launch reads the weights once */
+    if (chunk && type == 0 && T > 3 && T <= 16 && K == 2560 && (M == 48 || M == 512) &&
+        ds4_rocm_is_gfx1151() && !((uintptr_t)x & 15) && !((uintptr_t)w & 3)) {
+        const uint64_t st = row_bytes(type, K);
+#define QWEN_F32_ROWS(ROWS) \
+        if (M == 48) matvec_f32_prefetch<ROWS,4><<<(M+3)/4,128,0,0>>>(out,w,x,T,K,M,st); \
+        else matvec_f32_prefetch<ROWS,2><<<(M+1)/2,64,0,0>>>(out,w,x,T,K,M,st)
+        if (T <= 8) { QWEN_F32_ROWS(8); } else { QWEN_F32_ROWS(16); }
+#undef QWEN_F32_ROWS
+        return launched();
+    }
+    if (chunk && type == 8 && T > 3 && T <= 16 && K == 10240 && !(M % 2) && !((uintptr_t)x & 15)) {
+        const uint64_t st = row_bytes(type, K);
+        for (unsigned c = 0; c < T; c += 8) {
+            const unsigned n = T - c < 8 ? T - c : 8;
+            float *o = out + (uint64_t)c * M;
+            const float *xc = x + (uint64_t)c * K;
+            switch (n) {
+            case 1: matvec_q8_long<2,1><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            case 2: matvec_q8_long<2,2><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            case 3: matvec_q8_long<2,3><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            case 4: matvec_q8_long<2,4><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            case 5: matvec_q8_long<2,5><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            case 6: matvec_q8_long<2,6><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            case 7: matvec_q8_long<2,7><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            default: matvec_q8_long<2,8><<<M / 2,256,0,0>>>(o,w,xc,K,M,st); break;
+            }
+        }
         return launched();
     }
     if (chunk && T > 3 && T <= 16) {

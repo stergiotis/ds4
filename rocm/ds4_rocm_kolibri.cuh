@@ -1547,7 +1547,7 @@ static uint64_t bytes[MAX_MARKS];
 static double host[MAX_MARKS];
 static unsigned n_ev, n_marks;
 static bool overflow;
-static bucket bk[4];   /* 0 decode, 1 verify (T = 2-3), 2 prefill, 3 MTP draft steps */
+static bucket bk[5];   /* 0 decode, 1 verify (T = 2-3), 2 prefill, 3 MTP draft steps, 4 session batches */
 
 static double now_ms(void) {
     struct timespec ts;
@@ -1571,8 +1571,8 @@ static int by_gpu(const void *a, const void *b) {
 }
 
 static void report(void) {
-    static const char *name[4] = {"decode", "verify", "prefill", "draft"};
-    for (int k = 0; k < 4; k++) {
+    static const char *name[5] = {"decode", "verify", "prefill", "draft", "session batch"};
+    for (int k = 0; k < 5; k++) {
         bucket *b = &bk[k];
         if (!b->forwards) continue;
         const double f = (double)b->forwards;
@@ -1632,8 +1632,8 @@ extern "C" int ds4_gpu_kolibri_trace_mark(const char *name, uint64_t nbytes) {
 extern "C" int ds4_gpu_kolibri_trace_end(uint32_t T) {
     using namespace kolibri_trace;
     if (!on() || n_marks < 2 || label[0]) return 1;
-    /* T | 0x100: an MTP draft step of T rows */
-    bucket *b = &bk[T & 0x100u ? 3 : T == 1 ? 0 : T <= 3 ? 1 : 2];
+    /* T | 0x100: an MTP draft step of T rows; T | 0x200: a decode batch of T sessions */
+    bucket *b = &bk[T & 0x200u ? 4 : T & 0x100u ? 3 : T == 1 ? 0 : T <= 3 ? 1 : 2];
     T &= 0xffu;
     if (overflow) {
         b->overflow++;

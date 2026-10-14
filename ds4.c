@@ -83991,6 +83991,7 @@ static int ds4_sessions_eval_batch_native(
 #endif
 #ifdef DS4_HAS_QWEN4_BATCH
     } else if (native_qwen4) {
+        (void)qwen4_mark(NULL, 0);
         ok = qwen4_graph_encode_native_session_batch(
                 items, count, e->qwen4_shared_workspace, &e->model, &e->weights);
 #endif
@@ -84027,6 +84028,9 @@ static int ds4_sessions_eval_batch_native(
     }
     /* Finish partial command buffers before invalidating failed sessions. */
     if (!ds4_gpu_end_commands()) ok = false;
+#if defined(DS4_HAS_QWEN4_BATCH) && defined(DS4_ROCM_BUILD)
+    if (ok && native_qwen4) ds4_gpu_kolibri_trace_end(0x200u | (uint32_t)count);
+#endif
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
 #endif
