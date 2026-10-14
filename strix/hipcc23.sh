@@ -1,6 +1,7 @@
 #!/bin/bash
 # hipcc stand-in: AMD clang 23 (from the ROCm 10 toolbox image) with the host's
-# ROCm 7.1 HIP headers and runtime.  Build:  make strix-halo HIPCC=strix/hipcc23.sh
+# ROCm 7.1 HIP headers and runtime.  The Makefile uses it when $DS4_LLVM23 holds the toolchain
+# (make strix-halo HIPCC=hipcc for the system compiler).
 # Toolchain (once, ~1 GB), into $DS4_LLVM23 (default ~/.local/share/ds4/rocm10-llvm):
 #   cid=$(podman create docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-strix-llama true)
 #   podman cp $cid:/opt/rocm/core-10.0/lib/llvm $DS4_LLVM23/

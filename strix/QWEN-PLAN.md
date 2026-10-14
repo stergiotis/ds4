@@ -1107,6 +1107,16 @@ digit), decode output identical, identity script passes; decode 29.25 ->
 prefill-heavy use. The fix to try: give `moe_q4k_rows` fewer live values
 (or split it) so that clang 23 fits it in ~128 VGPRs.
 
+**clang 23 is the default build (2026-10-14, d749d4a + Makefile, `qwen-prof/pf/c1`).**
+`moe_q4k_rows` no longer unrolls its block loop (clang 23: 217 -> 152 VGPRs;
+gate/up per 256-token decode 5.98 -> 5.83 ms; clang 21 also gains, 5.86).
+The Makefile picks `strix/hipcc23.sh` when `$DS4_LLVM23/llvm/bin/clang++`
+exists (`HIPCC=hipcc` for the system compiler). clang 21 -> 23 at d749d4a:
+prefill 8K 1,052-1,060 -> 1,097-1,101 (+4%), 2K 820-826 -> 906-907
+(+10%); decode 29.12 -> 29.08-29.11 ms; perplexity bit-identical (1.5813),
+decode output identical, identity passes, batch oracle passes (8 sessions
+100.0 ms per step).
+
 ### Batched multi-session decode on ROCm (2026-10-14, 64ca285, 7037ab1, 4b2134b)
 
 The Metal session-batch path now runs on ROCm (shared transient arena,
