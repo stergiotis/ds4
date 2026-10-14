@@ -1141,6 +1141,30 @@ for contiguous rows. Weights round to f16 exactly as before.
   (17.5 vs 16.5 ms); 64-token gate/up tiles; one 16-row group per wave for
   down.
 
+**One user, then 8 sessions (2026-10-14 evening, 45dd2cc..f0a85c8).**
+Single-user plain decode reads 4.05 GB of weights per token (floor ~18.8
+ms at 215 GB/s); the weight kernels take 24.4 ms (166 GB/s average) and
+the weight-free ones 4.2 ms, over ~803 dependent launches (2-4 us each
+even when empty). Kept: the shared-expert slot's rows read together
+(gate/up 5.84 -> 5.40 ms per token), hc gate/mix and the router with
+compile-time loop counts. Plain decode 29.07 -> 28.5 ms traced, 37.2 tok/s
+untraced; MTP greedy code 55.9 -> 60.0, prose 44.7 -> 48.1 tok/s. Batches:
+grouped projections (HT4 sets, fused alpha/beta) as in single decode, the
+hc gate/mix over 8 rows per launch, and `ht4_rotate` (x rotated once
+instead of in every workgroup) for 2+ rows: 8 sessions 98.2 -> 89.4 ms per
+step. Server (gufo protocol, 256 tokens, window): 1/2/4/8 users 40.7 /
+48.7 / 63.8 / 79.4 -> 42.0 / 51.1 / 69.2 / 86.5 tok/s.
+Tried and dropped: the norm kernel's reductions merged (bit-identical, -2
+us of 17 per call in the chain), MoE reduce + next norm fused (with a
+spin barrier between chunk and norm phases: -0.07 ms per token), hc down
+with 1 or 4 rows per block, a 16-byte-load gate/up rows kernel (+4% in
+isolation, the shared slot was the straggler), weight prefetch on a side
+stream (decode 37.2 -> 27.4 tok/s: cross-stream events cost more than the
+warmed cache saves), HT4 pre-rotation for single rows (slower). What is
+left for one user is spread over the launch chain; for 8 sessions the
+GDN projections at 8 rows (~276 us per layer vs 116 at one row) and the
+per-session attention are the next targets.
+
 **Small prefill items, measured and dropped (2026-10-14, `qwen-prof/pf/i4`,
 8K prefill ~1,155 tok/s each time):** HT4 -> Q8_0 also for K 2560 (GDN
 qkv+z) 1,152-1,155 -> 1,155-1,159 at 8K but 949 -> 929 at 2K, plus a
