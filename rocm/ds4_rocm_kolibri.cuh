@@ -601,7 +601,8 @@ __global__ __launch_bounds__(128) void moe_q4k_rows(float *out, const float *x, 
         for (unsigned r = 0; r < R; r++) a[p][r] = b[p][r] = 0;
     }
     const uint64_t base = ((uint64_t)e * M + row0) * rb;
-    #pragma unroll 2
+    /* unrolled, clang 23 keeps both blocks' decoded weights live (217 VGPRs) */
+    #pragma unroll 1
     for (unsigned bk = 0; bk < KB; bk++) {
         uint4 h0[R], h1[R];
         unsigned q0[R], q1[R];
