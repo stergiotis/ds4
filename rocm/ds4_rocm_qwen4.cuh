@@ -4640,6 +4640,28 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
     if (!w || (type != 0 && type != 1 && type != 8)) return 0;
+    if (T >= 2 && T <= 16 && type == 8 && rank == 320) {
+        /* Q8_0, rank 320: up to 8 rows per launch, each weight load serving
+         * every row (rows keep hc_mix's sums) */
+        for (unsigned c = 0; c < T; c += 8) {
+            const unsigned n = T - c < 8 ? T - c : 8;
+            float *op = (float *)out->ptr + (uint64_t)c * E;
+            const float *xp = (const float *)xn->ptr + (uint64_t)c * E * hc, *lp = (const float *)lo->ptr + (uint64_t)c * rank;
+#define QWEN_HC8(TM) hc_mix_multi<8,TM,320><<<(E + 3) / 4,128,0,0>>>(op, xp, lp, w,E,hc,rank,row_bytes(8,rank))
+            switch (n) {
+            case 1: hc_mix<8,320><<<dim3((E + 3) / 4, 1),128,0,0>>>(op, xp, lp, w,E,hc,rank,row_bytes(8,rank)); break;
+            case 2: QWEN_HC8(2); break;
+            case 3: QWEN_HC8(3); break;
+            case 4: QWEN_HC8(4); break;
+            case 5: QWEN_HC8(5); break;
+            case 6: QWEN_HC8(6); break;
+            case 7: QWEN_HC8(7); break;
+            default: QWEN_HC8(8); break;
+            }
+#undef QWEN_HC8
+        }
+        return launched();
+    }
     if (T >= 2 && T <= 16 && rank <= 512) {
         /* 2-3 rows per launch (more in chunks of three): each weight load
          * serves every row of the chunk */

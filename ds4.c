@@ -82805,12 +82805,23 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
                                const ds4_qwen4_gpu_graph *rowg,
                                ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l, uint32_t il, uint32_t T) {
-    if (!qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) ||
-        !qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T) ||
-        !qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) ||
-        !qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T)) {
+    /* qkv and z as one HT4 set (x rotated once), alpha and beta in one launch,
+     * as the single-session decode does */
+    const ds4_tensor *gdn_in[2] = { l->lin_qkv, l->lin_gate };
+    ds4_gpu_tensor *gdn_out[2] = { g->qkv, g->z };
+    if (!qwen4_ht4_group(m, gdn_in, gdn_out, 2u, g->mixed, T) &&
+        !(qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) && qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T)))
         return false;
-    }
+    int ab = -1;
+#ifdef DS4_ROCM_BUILD
+    if (l->lin_alpha->type == l->lin_beta->type)
+        ab = ds4_gpu_qwen4_gdn_ab_tensor(g->ga, g->gb, g->mixed, m->map, m->size, l->lin_alpha->abs_offset,
+                                         l->lin_beta->abs_offset, l->lin_alpha->type, T, DS4_N_EMBD,
+                                         DS4_N_LIN_V_HEAD);
+#endif
+    if (ab == 0 || (ab < 0 && !(qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) &&
+                                qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T))))
+        return false;
     /* The causal convolution and the delta-net scan are the only steps that
      * read and write a session's own recurrent state.  Overlapping these rows
      * through a concurrent encoder was measured and changed nothing: the cost
@@ -83025,11 +83036,14 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                   ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t T) {
     const uint32_t ratio = 4u;
-    bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
-              qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
-              qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
-              qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
-              qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+    const ds4_tensor *att_in[5] = { l->attn_q, l->attn_k, l->attn_v, l->indexer_q_proj, l->indexer_k_proj };
+    ds4_gpu_tensor *att_out[5] = { g->qg, g->kp, g->vp, g->iq, g->ik };
+    bool ok = qwen4_ht4_group(m, att_in, att_out, 5u, g->mixed, T) ||
+              (qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
+               qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
+               qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
+               qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
+               qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T));
     const bool rows_path = qwen4_batch_rows_kernels && getenv("DS4_QWEN4_NO_BATCH_ATTN") == NULL &&
                            getenv("DS4_QWEN4_NO_IDX_SELECT") == NULL &&
                            (DS4_N_HEAD_DIM == 128u || DS4_N_HEAD_DIM == 256u);
