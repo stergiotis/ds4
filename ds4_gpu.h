@@ -3561,6 +3561,10 @@ int ds4_gpu_qwen4_hc_up_mix_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor *
         uint32_t T, uint32_t E, uint32_t hc, uint32_t rank);
 int ds4_gpu_qwen4_gdn_ab_tensor(ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t ao, uint64_t bo, uint32_t type, uint32_t T, uint32_t K, uint32_t H);
+int ds4_gpu_qwen4_gdn_conv_scan_rows_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, ds4_gpu_tensor *const *states,
+        ds4_gpu_tensor *const *hists, uint32_t n, const void *map, uint64_t size, uint64_t conv_off,
+        uint32_t C, uint32_t K, uint32_t Hk, uint32_t Hv, uint32_t D, int stage);
 int ds4_gpu_qwen4_moe_reduce_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,

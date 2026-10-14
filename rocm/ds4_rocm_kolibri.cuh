@@ -547,11 +547,12 @@ __global__ __launch_bounds__(128) void moe_q4k(float *out, const float *x, const
     if (!lane) out[pair * M + row] = DOWN ? a : qwen4_rocm::silu(a) * b;
 }
 
-/* moe_q4k gate/up for 1-3 tokens with R rows per wave (each x load serves
- * R rows) and each routed expert read once: the block of the first token
- * that selects an expert also computes every later token that selects it,
- * and the later tokens' blocks exit.  Each token's sums run in moe_q4k's
- * order, so results match it and do not depend on T.  M % (4 * R) == 0. */
+/* moe_q4k gate/up for 1-16 tokens with R rows per wave (each x load serves
+ * R rows) and each routed expert read once per group of up to 3 tokens that
+ * select it: a token whose earlier sharers number a multiple of 3 leads a
+ * group and also computes the next two sharers, whose blocks exit.  Each
+ * token's sums run in moe_q4k's order, so results match it and do not
+ * depend on T.  M % (4 * R) == 0. */
 template<unsigned KB, unsigned R, unsigned SHT>
 __global__ __launch_bounds__(128) void moe_q4k_rows(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
@@ -582,17 +583,20 @@ __global__ __launch_bounds__(128) void moe_q4k_rows(float *out, const float *x, 
         if (!lane) for (unsigned r = 0; r < R; r++) out[((uint64_t)t0 * (NS + 1) + slot) * M + row0 + r] = 0;
         return;
     }
+    constexpr unsigned NP = 3;
+    unsigned earlier = 0;
     for (unsigned t = 0; t < t0; t++)
         for (unsigned s = 0; s < NS; s++)
-            if (selected[(uint64_t)t * NS + s] == e) return;
-    uint64_t pairs[3] = {(uint64_t)t0 * (NS + 1) + slot, 0, 0};
-    unsigned toks[3] = {t0, 0, 0}, n = 1;
-    for (unsigned t = t0 + 1; t < T && n < 3; t++)
+            if (selected[(uint64_t)t * NS + s] == e) { earlier++; break; }
+    if (earlier % NP) return;
+    uint64_t pairs[NP] = {(uint64_t)t0 * (NS + 1) + slot};
+    unsigned toks[NP] = {t0}, n = 1;
+    for (unsigned t = t0 + 1; t < T && n < NP; t++)
         for (unsigned s = 0; s < NS; s++)
             if (selected[(uint64_t)t * NS + s] == e) { pairs[n] = (uint64_t)t * (NS + 1) + s; toks[n++] = t; break; }
-    float a[3][R], b[3][R];
+    float a[NP][R], b[NP][R];
     #pragma unroll
-    for (unsigned p = 0; p < 3; p++) {
+    for (unsigned p = 0; p < NP; p++) {
         #pragma unroll
         for (unsigned r = 0; r < R; r++) a[p][r] = b[p][r] = 0;
     }
@@ -610,7 +614,7 @@ __global__ __launch_bounds__(128) void moe_q4k_rows(float *out, const float *x, 
             q1[r] = *(const unsigned *)(w1 + off + 16 + c * 32 + o);
         }
         #pragma unroll
-        for (unsigned p = 0; p < 3; p++) {
+        for (unsigned p = 0; p < NP; p++) {
             if (p < n) {
                 const float *xt = x + (uint64_t)toks[p] * K + bk * 256 + c * 64 + o;
                 const float4 xa = *(const float4 *)xt, xb = *(const float4 *)(xt + 32);
@@ -623,7 +627,7 @@ __global__ __launch_bounds__(128) void moe_q4k_rows(float *out, const float *x, 
         }
     }
     #pragma unroll
-    for (unsigned p = 0; p < 3; p++) {
+    for (unsigned p = 0; p < NP; p++) {
         if (p < n) {
             #pragma unroll
             for (unsigned r = 0; r < R; r++) {
@@ -1244,7 +1248,9 @@ extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *s1 = down ? NULL : weight(map, size, so1, srb * M);
     if (!w0 || !s0 || (!down && (!w1 || !s1))) return 0;
     if (((uintptr_t)w0 | (uintptr_t)(w1 ? w1 : w0) | (uintptr_t)x->ptr) & 15) return -1;
-    if (!down && K == 2560 && T <= 3 && !(M % 8u)) {
+    static int rows_max = -1;
+    if (rows_max < 0) rows_max = getenv("DS4_KOLIBRI_Q4K_ROWS_MAX") ? atoi(getenv("DS4_KOLIBRI_Q4K_ROWS_MAX")) : 16;
+    if (!down && K == 2560 && T <= (uint32_t)rows_max && !(M % 8u)) {
         const dim3 g(M / 8u, NO, T);
         if (shared_type == 8) moe_q4k_rows<10, 2, 8><<<g, 128, 0, 0>>>((float *)out->ptr,
             (const float *)x->ptr, (const int *)sel->ptr, w0, w1, s0, s1, NE, NS, M, rb, srb, T);

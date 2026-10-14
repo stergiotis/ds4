@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-rocm-qwen-batch test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
@@ -1047,6 +1047,18 @@ tests/test_cuda_session_batch.o: tests/test_cuda_session_batch.c ds4.h ds4_gpu_a
 
 tests/test_cuda_session_batch: tests/test_cuda_session_batch.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# ROCm oracle for Qwen3.8 multi-session decode batches (model-backed, not part of `make test`):
+#   DS4_TEST_MODEL=/path/to/qwen.gguf make test-rocm-qwen-batch
+ROCM_QWEN_BATCH_TEST_OBJS := ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o ds4.o ds4_image.o \
+	ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o \
+	ds4_engram.o $(ROCM_MMQ_OBJS)
+tests/test_rocm_qwen_batch: tests/test_rocm_qwen_batch.c ds4.h $(ROCM_QWEN_BATCH_TEST_OBJS)
+	$(CC) -O2 -I. -c -o tests/test_rocm_qwen_batch.o tests/test_rocm_qwen_batch.c
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ tests/test_rocm_qwen_batch.o $(ROCM_QWEN_BATCH_TEST_OBJS) $(ROCM_LDLIBS)
+
+test-rocm-qwen-batch: tests/test_rocm_qwen_batch
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_rocm_qwen_batch
 
 test-cuda-session-batch: tests/test_cuda_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_session_batch

@@ -907,9 +907,13 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4_q8(float *out, const float
     pairs[0] = pair0;
     unsigned n = 1;
     if (NT > 1) {
+        /* groups of NT tokens selecting e: a token whose earlier sharers
+         * number a multiple of NT leads one and computes the next NT - 1 */
+        unsigned earlier = 0;
         for (unsigned t = 0; t < t0; t++)
             for (unsigned s = 0; s < NS; s++)
-                if (selected[(uint64_t)t * NS + s] == e) return;
+                if (selected[(uint64_t)t * NS + s] == e) { earlier++; break; }
+        if (earlier % NT) return;
         for (unsigned t = t0 + 1; t < T && n < NT; t++)
             for (unsigned s = 0; s < NS; s++)
                 if (selected[(uint64_t)t * NS + s] == e) { pairs[n++] = (uint64_t)t * (NS + 1) + s; break; }
@@ -996,12 +1000,12 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
-    /* MXFP4 expert down for 1-3 tokens: integer dots on int8 x by default,
+    /* MXFP4 expert down for 1-16 tokens: integer dots on int8 x by default,
      * DS4_QWEN4_MXFP4_Q8=0 the float kernel.  One instance serves every T,
      * so verify rows match plain decode. */
     static int mxfp4_q8 = -1;
     if (mxfp4_q8 < 0) mxfp4_q8 = !getenv("DS4_QWEN4_MXFP4_Q8") || atoi(getenv("DS4_QWEN4_MXFP4_Q8")) != 0;
-    if (down && T >= 1 && T <= 3 && type == 39 && st == 8 && K == 640 &&
+    if (down && T >= 1 && T <= (mxfp4_q8 ? 16u : 3u) && type == 39 && st == 8 && K == 640 &&
         M % 16 == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
         const dim3 grid(M / 16, NS + 1, T);
         if (mxfp4_q8) moe_down_mxfp4_q8<3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
@@ -2236,6 +2240,18 @@ static int ht4_dispatch(ht4_set set, const float *x, const __half *su, const int
 
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
+    /* 4-16 rows (decode batches of several sessions) in chunks of three:
+     * the 1-3-row kernels read each weight once per chunk where the generic
+     * ones read it once per row, and every row keeps their sum order */
+    static int chunk = -1;
+    if (chunk < 0) chunk = getenv("DS4_QWEN4_MV_NO_CHUNK") == NULL;
+    if (chunk && T > 3 && T <= 16) {
+        for (unsigned c = 0; c < T; c += 3) {
+            const unsigned n = T - c < 3 ? T - c : 3;
+            if (!matvec_dispatch(out + (uint64_t)c * M, w, x + (uint64_t)c * K, type, n, K, M)) return 0;
+        }
+        return 1;
+    }
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
@@ -3950,6 +3966,98 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
     return launched();
 }
 
+namespace qwen4_rocm {
+/* Decode batches of several sessions (one row each): the causal conv and
+ * the delta-net scan of every row in one launch each, each row's history
+ * and state reached through a table of per-session pointers.  Per row the
+ * arithmetic is that of conv / gdn_scan<1, D> at T = 1. */
+__global__ void conv_rows(float *x, float *const *hist, const float *w, unsigned C, unsigned K, bool activate) {
+    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (c >= C) return;
+    float *history = hist[r];
+    const uint64_t pos = (uint64_t)r * C + c;
+    float win[3], taps[4];
+    for (unsigned i = 0; i < K - 1; i++) win[i] = history[(uint64_t)i * C + c];
+    for (unsigned i = 0; i < K; i++) taps[i] = w[c * K + i];
+    const float raw = x[pos];
+    float v = taps[K - 1] * raw;
+    for (unsigned i = 0; i < K - 1; i++) v += taps[i] * win[i];
+    for (unsigned i = 0; i + 2 < K; i++) win[i] = win[i + 1];
+    win[K - 2] = raw;
+    x[pos] = activate ? silu(v) : v;
+    for (unsigned i = 0; i < K - 1; i++) history[(uint64_t)i * C + c] = win[i];
+}
+
+template<unsigned D>
+__global__ void gdn_scan_rows1(float *out, float *const *states, const float *qkv,
+                               const float *a, const float *b, unsigned Hk, unsigned Hv) {
+    const unsigned dv = blockIdx.x * 4 + threadIdx.x / 32, h = blockIdx.y, row = blockIdx.z;
+    if (dv >= D) return;
+    const unsigned npt = D / 32, k0 = (threadIdx.x & 31) * npt, kh = h % Hk;
+    const unsigned C = (2 * Hk + Hv) * D;
+    float *state = states[row];
+    const uint64_t idx = ((uint64_t)h * D + dv) * D + k0;
+    float s[4];
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) s[i] = state[idx + i];
+    const float *q = qkv + (uint64_t)row * C + kh * D + k0, *k = q + Hk * D;
+    const float decay = a[(uint64_t)row * Hv + h], beta = b[(uint64_t)row * Hv + h];
+    const float v = qkv[(uint64_t)row * C + 2 * Hk * D + h * D + dv];
+    float u = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) { s[i] *= decay; u += s[i] * k[i]; }
+    const float delta = (v - sum(u)) * beta;
+    float o = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) { s[i] += k[i] * delta; o += s[i] * q[i]; }
+    o = sum(o);
+    if (!(threadIdx.x & 31)) out[((uint64_t)row * Hv + h) * D + dv] = o;
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) state[idx + i] = s[i];
+}
+
+/* stage n device pointers into a small reusable table (ordered on the stream) */
+static float *const *qwen4_ptr_table(ds4_gpu_tensor *const *t, uint32_t n, unsigned which) {
+    static float **tab[2];
+    static uint32_t cap[2];
+    if (n > cap[which]) {
+        if (tab[which]) (void)cudaFree(tab[which]);
+        tab[which] = NULL; cap[which] = 0;
+        if (cudaMalloc((void **)&tab[which], 64 * sizeof(float *)) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+        cap[which] = 64;
+    }
+    float *host[64];
+    for (uint32_t i = 0; i < n; i++) host[i] = (float *)t[i]->ptr;
+    if (cudaMemcpyAsync(tab[which], host, n * sizeof(float *), cudaMemcpyHostToDevice, 0) != cudaSuccess) return NULL;
+    return tab[which];
+}
+
+}  // namespace qwen4_rocm
+
+extern "C" int ds4_gpu_qwen4_gdn_conv_scan_rows_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, ds4_gpu_tensor *const *states,
+        ds4_gpu_tensor *const *hists, uint32_t n, const void *map, uint64_t size, uint64_t conv_off,
+        uint32_t C, uint32_t K, uint32_t Hk, uint32_t Hv, uint32_t D, int stage) {
+    using namespace qwen4_rocm;
+    if (!n || n > 64 || D != 128 || K < 2 || K > 4) return 0;
+    if (stage == 0) {
+        if (!tensor(qkv, (uint64_t)n * C * 4)) return 0;
+        for (uint32_t i = 0; i < n; i++) if (!tensor(hists[i], (uint64_t)(K - 1) * C * 4)) return 0;
+        const float *w = (const float *)weight(map, size, conv_off, (uint64_t)C * K * 4);
+        float *const *ht = qwen4_ptr_table(hists, n, 0);
+        if (!w || !ht) return 0;
+        conv_rows<<<dim3((C + 255) / 256, n), 256, 0, 0>>>((float *)qkv->ptr, ht, w, C, K, true);
+        return launched();
+    }
+    if (!tensor(out, (uint64_t)n * Hv * D * 4) || !tensor(a, (uint64_t)n * Hv * 4) || !tensor(b, (uint64_t)n * Hv * 4)) return 0;
+    for (uint32_t i = 0; i < n; i++) if (!tensor(states[i], (uint64_t)Hv * D * D * 4)) return 0;
+    float *const *st = qwen4_ptr_table(states, n, 1);
+    if (!st) return 0;
+    gdn_scan_rows1<128><<<dim3(D / 4, Hv, n), 128, 0, 0>>>((float *)out->ptr, st, (const float *)qkv->ptr,
+        (const float *)a->ptr, (const float *)b->ptr, Hk, Hv);
+    return launched();
+}
+
 extern "C" int ds4_gpu_qwen4_gdn_out_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *z,
         const void *map, uint64_t size, uint64_t off, uint32_t T, uint32_t H, uint32_t D, float eps) {
     using namespace qwen4_rocm;
@@ -4025,12 +4133,23 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
     if (!w || (type != 0 && type != 1 && type != 8)) return 0;
-    if (T >= 2 && T <= 3 && rank <= 512) {
-#define QWEN_HCM(TYPE, TM) hc_mix_multi<TYPE,TM><<<(E + 3) / 4,128,0,0>>>((float *)out->ptr, \
-        (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
-        if (type == 0) { if (T == 2) QWEN_HCM(0,2); else QWEN_HCM(0,3); }
-        else if (type == 1) { if (T == 2) QWEN_HCM(1,2); else QWEN_HCM(1,3); }
-        else { if (T == 2) QWEN_HCM(8,2); else QWEN_HCM(8,3); }
+    if (T >= 2 && T <= 16 && rank <= 512) {
+        /* 2-3 rows per launch (more in chunks of three): each weight load
+         * serves every row of the chunk */
+#define QWEN_HCM(TYPE, TM) hc_mix_multi<TYPE,TM><<<(E + 3) / 4,128,0,0>>>(op, xp, lp, \
+        w,E,hc,rank,row_bytes(TYPE,rank))
+        for (unsigned c = 0; c < T; c += 3) {
+            const unsigned n = T - c < 3 ? T - c : 3;
+            float *op = (float *)out->ptr + (uint64_t)c * E;
+            const float *xp = (const float *)xn->ptr + (uint64_t)c * E * hc, *lp = (const float *)lo->ptr + (uint64_t)c * rank;
+            if (n == 1) {
+#define QWEN_HC1(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, 1),128,0,0>>>(op, xp, lp, w,E,hc,rank,row_bytes(TYPE,rank))
+                if (type == 0) { QWEN_HC1(0); } else if (type == 1) { QWEN_HC1(1); } else { QWEN_HC1(8); }
+#undef QWEN_HC1
+            } else if (type == 0) { if (n == 2) QWEN_HCM(0,2); else QWEN_HCM(0,3); }
+            else if (type == 1) { if (n == 2) QWEN_HCM(1,2); else QWEN_HCM(1,3); }
+            else { if (n == 2) QWEN_HCM(8,2); else QWEN_HCM(8,3); }
+        }
 #undef QWEN_HCM
         return launched();
     }
