@@ -1117,6 +1117,30 @@ prefill 8K 1,052-1,060 -> 1,097-1,101 (+4%), 2K 820-826 -> 906-907
 decode output identical, identity passes, batch oracle passes (8 sessions
 100.0 ms per step).
 
+**Routed experts, wave-decoded tiles (2026-10-14, `qwen-prof/pf/e1`, harness
+`scratchpad/moe/{moe,down}.hip`).** Ablations of the old tiles showed the
+WMMAs were not the limit: each wave re-read weights and activations, waited
+on unprefetched loads, and stored outputs scattered (the down output is
+840 MB of F32 per layer at 8K). New kernels: each wave decodes its own rows
+straight into A fragments, half a fragment per lane (the other half from
+lane ^ 16 by `v_permlanex16`; the upper half-wave then runs k 8-15, 0-7 and
+reads B in that order), K in 64-value chunks prefetched into registers a
+chunk ahead, empty 16-token sub-tiles skipped, outputs staged through LDS
+for contiguous rows. Weights round to f16 exactly as before.
+- `matrix_down_wave<64,2>` (MXFP4 down, 32 rows per wave): harness 8K
+  13.6 -> 10.6 ms, 2K 4.8 -> 3.9 (`DS4_QWEN4_DOWN_OLD=1` for the old tile).
+- `moe_q4k_wave<128>` (Q4_K gate/up, Qwen and Kolibri): harness 8K 19.1 ->
+  15.1 ms, 4K 11.4 -> 8.9, 2K 7.2 (32-token tile) -> 6.8
+  (`DS4_KOLIBRI_Q4K_WAVE=0` for the old tiles).
+- Prefill (clang 23): 8K 1,097-1,101 -> 1,153-1,158 (+5.1%), 2K 901-904 ->
+  950-953 (+5.4%); each kernel alone about half of it. 8K token identical,
+  decode 29.05-29.07 ms, decode output identical, identity passes.
+  Perplexity avg NLL 1.5813 -> 1.5826, KL vs the reference 0.0475 -> 0.0464,
+  top-1 89.92 -> 90.00% (summation order only).
+- Not better: an f16 magic-number decode with one 16-byte load per lane
+  (17.5 vs 16.5 ms); 64-token gate/up tiles; one 16-row group per wave for
+  down.
+
 ### Batched multi-session decode on ROCm (2026-10-14, 64ca285, 7037ab1, 4b2134b)
 
 The Metal session-batch path now runs on ROCm (shared transient arena,

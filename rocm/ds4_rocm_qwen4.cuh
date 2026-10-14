@@ -1230,6 +1230,176 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
     }
 }
 
+/* Half-wave split of a 16-value WMMA A fragment: lanes 0-15 hold values
+ * 0-7 of their row, lanes 16-31 values 8-15; each takes the other half from
+ * lane ^ 16.  The upper half-wave's fragment then runs k 8-15, 0-7, so its B
+ * fragment must be read in that order (the k permutation of the products
+ * the upper half computes is the same on both operands). */
+__device__ __forceinline__ unsigned xchg16(unsigned v) {
+    return (unsigned)__builtin_amdgcn_permlanex16((int)v, (int)v, 0x76543210, 0xfedcba98, false, false);
+}
+
+/* Eight MXFP4 codes (one nibble of each of 8 bytes) times scale as four
+ * half2 words, levels and rounding as matrix_down_tile's. */
+template<unsigned HI>
+__device__ __forceinline__ void mxfp4_dec8(uint2 w, float scale, unsigned o[4]) {
+    #pragma unroll
+    for (unsigned i = 0; i < 2; i++) {
+        const unsigned src = i ? w.y : w.x;
+        const unsigned codes = (HI ? src >> 4 : src) & 0x0F0F0F0Fu, mags = codes & 0x07070707u;
+        const unsigned top = __builtin_amdgcn_perm(0x40404040u, 0x3F3F3F00u, mags);
+        const unsigned nxt = __builtin_amdgcn_perm(0xC0804000u, 0xC0800000u, mags);
+        #pragma unroll
+        for (unsigned p = 0; p < 2; p++) {
+            _Float16 v[2];
+            #pragma unroll
+            for (unsigned q = 0; q < 2; q++) {
+                const unsigned j = 2 * p + q;
+                const unsigned bits = ((top >> (8 * j)) & 0xFFu) << 24 | ((nxt >> (8 * j)) & 0xFFu) << 16 |
+                    ((codes >> (8 * j + 3)) & 1u) << 31;
+                v[q] = (_Float16)(__uint_as_float(bits) * scale);
+            }
+            o[2 * i + p] = (unsigned)__builtin_bit_cast(unsigned short, v[0]) |
+                ((unsigned)__builtin_bit_cast(unsigned short, v[1]) << 16);
+        }
+    }
+}
+
+/* MXFP4 expert down over one expert's token tile (NT items, 8 waves of RW
+ * 16-row groups, K % 64 == 0, 4-byte aligned rows).  Each wave decodes its
+ * own rows straight into A fragments (xchg16 split; block b's code bytes
+ * 8h..8h+7 are read as three aligned words, up to 3 bytes past the block);
+ * the next 64-value chunk's codes and activations are prefetched into
+ * registers; 16-item sub-tiles past the expert's count are skipped; outputs
+ * go through LDS so each item's rows are stored contiguously. */
+template<unsigned NT, unsigned RW>
+__launch_bounds__(256)
+__global__ void matrix_down_wave(float *out, const float *x, const char *w0,
+        const int *lists, const int *counts, const unsigned *tiles, unsigned NE,
+        unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    constexpr unsigned WAVES = 8, NF = NT / 16, MT = WAVES * 16 * RW, KC = 64, LD = KC + 8, NTH = WAVES * 32;
+    constexpr unsigned XV = NT * KC / 4 / NTH, LO = MT + 4, PT = 32 / RW;
+    static_assert(XV >= 1 && NT * KC / 4 % NTH == 0 && PT % 16 == 0 && NT % PT == 0, "tile shape");
+    const unsigned tid = threadIdx.x, wave = tid / 32, lane = tid % 32, lane16 = lane % 16, h = lane / 16;
+    const unsigned nr = (M + MT - 1) / MT, job = blockIdx.x / nr;
+    if (job >= tiles[NE]) return;
+    unsigned e = 0, end = NE;
+    while (e < end) { const unsigned mid = (e + end) / 2; if (tiles[mid + 1] <= job) e = mid + 1; else end = mid; }
+    const unsigned count = counts[e], t0 = (job - tiles[e]) * NT, r0 = (blockIdx.x % nr) * MT;
+    const unsigned live = min(NF, (count - t0 + 15) / 16);
+    const char *wrows[RW];
+    #pragma unroll
+    for (unsigned rw = 0; rw < RW; rw++) {
+        const unsigned row = r0 + (wave * RW + rw) * 16 + lane16;
+        wrows[rw] = w0 + ((uint64_t)e * M + (row < M ? row : M - 1)) * rb;
+    }
+    constexpr unsigned SXB = NT * LD * 2 > PT * LO * 4 ? NT * LD * 2 : PT * LO * 4;
+    __shared__ __align__(16) unsigned char smem[SXB];
+    _Float16 (*sx)[LD] = (_Float16 (*)[LD])smem;
+    float (*o)[LO] = (float (*)[LO])smem;
+    __shared__ unsigned xrow[NT];
+    for (unsigned i = tid; i < NT; i += NTH) {
+        const unsigned item = t0 + i;
+        const unsigned pair = item < count ? (unsigned)lists[(uint64_t)e * cap + item] : 0u;
+        xrow[i] = item < count ? (pair / NS) * NO + pair % NS : UINT_MAX;
+    }
+    __syncthreads();
+    unsigned xr[XV];
+    #pragma unroll
+    for (unsigned u = 0; u < XV; u++) xr[u] = xrow[(tid + u * NTH) / (KC / 4)];
+    float4 xv[XV];
+    auto load_x = [&](unsigned k0) {
+        #pragma unroll
+        for (unsigned u = 0; u < XV; u++) {
+            const unsigned kk = ((tid + u * NTH) % (KC / 4)) * 4;
+            xv[u] = xr[u] != UINT_MAX ? *(const float4 *)(x + (uint64_t)xr[u] * K + k0 + kk) : make_float4(0, 0, 0, 0);
+        }
+    };
+    unsigned wsc[RW][2]; uint2 wq[RW][2];
+    auto load_w = [&](unsigned ch) {
+        #pragma unroll
+        for (unsigned rw = 0; rw < RW; rw++)
+        #pragma unroll
+        for (unsigned j = 0; j < 2; j++) {
+            const unsigned b = ch * 2 + j, off = b * 17 + 1 + 8 * h, a = off & ~3u, sh = (off & 3) * 8;
+            const unsigned *p = (const unsigned *)(wrows[rw] + a);
+            const unsigned d0 = p[0], d1 = p[1], d2 = p[2];
+            wq[rw][j] = make_uint2(sh ? __builtin_amdgcn_alignbit(d1, d0, sh) : d0,
+                                   sh ? __builtin_amdgcn_alignbit(d2, d1, sh) : d1);
+            wsc[rw][j] = (unsigned char)wrows[rw][b * 17];
+        }
+    };
+    load_x(0);
+    load_w(0);
+    float8 acc[RW][NF] = {};
+    const unsigned nchunks = K / KC;
+    for (unsigned ch = 0; ch < nchunks; ch++) {
+        __syncthreads();
+        #pragma unroll
+        for (unsigned u = 0; u < XV; u++) {
+            const unsigned i = tid + u * NTH;
+            typedef _Float16 half4 __attribute__((ext_vector_type(4)));
+            *(half4 *)&sx[i / (KC / 4)][(i % (KC / 4)) * 4] =
+                (half4){(_Float16)xv[u].x, (_Float16)xv[u].y, (_Float16)xv[u].z, (_Float16)xv[u].w};
+        }
+        unsigned scc[RW][2]; uint2 qc[RW][2];
+        #pragma unroll
+        for (unsigned rw = 0; rw < RW; rw++)
+            for (unsigned j = 0; j < 2; j++) { scc[rw][j] = wsc[rw][j]; qc[rw][j] = wq[rw][j]; }
+        __syncthreads();
+        if (ch + 1 < nchunks) { load_x((ch + 1) * KC); load_w(ch + 1); }
+        #pragma unroll
+        for (unsigned j = 0; j < 2; j++) {
+            #pragma unroll
+            for (unsigned hi = 0; hi < 2; hi++) {
+                half16 av[RW];
+                #pragma unroll
+                for (unsigned rw = 0; rw < RW; rw++) {
+                    const float scale = scc[rw][j] == 0 ? 0x1p-127f : __uint_as_float(scc[rw][j] << 23);
+                    unsigned ow[4], fa[8];
+                    if (hi) mxfp4_dec8<1>(qc[rw][j], scale, ow); else mxfp4_dec8<0>(qc[rw][j], scale, ow);
+                    #pragma unroll
+                    for (unsigned i = 0; i < 4; i++) { fa[i] = ow[i]; fa[4 + i] = xchg16(ow[i]); }
+                    av[rw] = __builtin_bit_cast(half16, fa);
+                }
+                const unsigned k = j * 32 + hi * 16;
+                #pragma unroll
+                for (unsigned f = 0; f < NF; f++) {
+                    if (f < live) {
+                        const _Float16 *row = &sx[f * 16 + lane16][k];
+                        uint4 bb[2];
+                        bb[0] = *(const uint4 *)(row + 8 * h);
+                        bb[1] = *(const uint4 *)(row + 8 * (1 - h));
+                        const half16 bx = __builtin_bit_cast(half16, bb);
+                        #pragma unroll
+                        for (unsigned rw = 0; rw < RW; rw++)
+                            acc[rw][f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av[rw], bx, acc[rw][f]);
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned p = 0; p < NT / PT; p++) {
+        if (p * PT >= live * 16) break;
+        __syncthreads();
+        #pragma unroll
+        for (unsigned q = 0; q < PT / 16; q++) {
+            #pragma unroll
+            for (unsigned rw = 0; rw < RW; rw++)
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++)
+                o[q * 16 + lane16][(wave * RW + rw) * 16 + 2 * j + h] = acc[rw][p * PT / 16 + q][j];
+        }
+        __syncthreads();
+        for (unsigned i = tid; i < PT * MT / 4; i += NTH) {
+            const unsigned t = i / (MT / 4), c = (i % (MT / 4)) * 4;
+            const unsigned r = xrow[p * PT + t];
+            if (r != UINT_MAX && r0 + c < M) *(float4 *)(out + (uint64_t)r * M + r0 + c) = *(const float4 *)&o[t][c];
+        }
+    }
+}
+
 /* Expert down projection over one expert's token tile: matrix_half_tile's
  * product (NR rows x NT items, 8 waves, f16 WMMA, k steps of KS), with each
  * item's activation row and output row computed once per tile,
@@ -1483,9 +1653,15 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
                 if (!tiles) return 0;
                 expert_tiles<<<1,1,0,0>>>(tiles,counts,NE,64);
                 if (!launched()) return 0;
-                const uint64_t blocks = (((uint64_t)T*NS+63)/64+NE)*((M+127)/128);
+                /* DS4_QWEN4_DOWN_OLD=1: the LDS-decoded 128-row tile */
+                static int down_old = -1;
+                if (down_old < 0) down_old = getenv("DS4_QWEN4_DOWN_OLD") && atoi(getenv("DS4_QWEN4_DOWN_OLD"));
+                const bool wave_ok = !down_old && K % 64 == 0 && rb % 4 == 0 && M % 4 == 0;
+                const unsigned mt = wave_ok ? 256 : 128;
+                const uint64_t blocks = (((uint64_t)T*NS+63)/64+NE)*((M+mt-1)/mt);
                 if (blocks > INT_MAX) return 0;
-                matrix_down_tile<39,64,128,64><<<blocks,256,0,0>>>(out,x,w0,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+                if (wave_ok) matrix_down_wave<64,2><<<blocks,256,0,0>>>(out,x,w0,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+                else matrix_down_tile<39,64,128,64><<<blocks,256,0,0>>>(out,x,w0,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
                 return launched();
             }
             for (unsigned pass = 0; pass < passes; pass++) {
