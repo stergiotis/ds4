@@ -10475,6 +10475,7 @@ struct server {
     int decode_pending;
     int active_generations;
     int mixed_prefill_quantum;
+    bool mixed_prefill_quantum_explicit;
     int last_prefill_slot;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -12729,6 +12730,15 @@ static int server_prefill_quantum_for(const server *s,
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
     }
+#ifdef DS4_ROCM_BUILD
+    /* Qwen3.8 on ROCm: 128-row prefill slices run far below the bulk GEMMs'
+     * rate (8 users arriving together: ~250 tok/s and 66 s to the last first
+     * token at 128, ~750 tok/s and 22 s at 2048, decode throughput equal) */
+    if (generation_active && !s->mixed_prefill_quantum_explicit && s->engine &&
+        ds4_engine_is_qwen4(s->engine) && quantum < 2048) {
+        quantum = 2048;
+    }
+#endif
     return quantum;
 }
 
@@ -15774,6 +15784,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    bool mixed_prefill_quantum_explicit;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -16018,6 +16029,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.mixed_prefill_quantum_explicit = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -16285,6 +16297,7 @@ int main(int argc, char **argv) {
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+    s.mixed_prefill_quantum_explicit = cfg.mixed_prefill_quantum_explicit;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
