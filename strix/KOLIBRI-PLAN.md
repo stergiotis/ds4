@@ -284,3 +284,19 @@ reference's order before rejecting the idea.
   the forward at exit, separately for decode and prefill, with GB/s where
   the bytes are known. `DS4_KOLIBRI_TIMING=1` still gives synchronized stage
   times. `rocprofv3` is not packaged with Ubuntu's ROCm 7.1.
+
+## Side effect of the Qwen3.8 prefill work (2026-10-14)
+
+Kolibri shares the Qwen projection kernels (grouped launch order of the
+direct GEMM, the wide 256x128 GEMM for Q8_0) and the Kolibri expert tile
+(32-token Q4_K gate/up tiles for chunks up to 4096 rows, a0ebb5f).
+`ds4-bench`, 754bfd4 vs 5890c8c, 128 greedy tokens (prefill / decode tok/s):
+
+| file | 2K | 8K |
+|---|---|---|
+| Kolibri-1-Q4_K | 1,521 -> 1,583 / 54.7 -> 54.5 | 1,454 -> 1,525 / 51.6 -> 51.5 |
+| Kolibri-1-F8 | 1,391 -> 1,436 / 49.0 -> 49.0 | 1,345 -> 1,379 / 46.5 -> 46.5 |
+
+Greedy output identical on both files. Kolibri sessions do not use the
+new batched multi-session decode: `ds4_sessions_eval_batch_cuda` still
+evaluates Kolibri batches one session after the other.
