@@ -13486,6 +13486,32 @@ static void server_generation_enter(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* Batched mode with MTP but no speculative batches (ROCm): a generation
+ * that runs alone takes the model for one single-session speculative step,
+ * as without --batched-session.  Returns true with model_busy set and
+ * inference_mu held; server_solo_end releases both. */
+static bool server_solo_begin(server *s) {
+    pthread_mutex_lock(&s->model_mu);
+    while (s->model_busy && !s->model_stopping) pthread_cond_wait(&s->model_cv, &s->model_mu);
+    bool prefill_waiting = false;
+    for (int i = 0; i < s->slot_count && !prefill_waiting; i++) prefill_waiting = s->slots[i].prefill_waiting;
+    /* a waiting prefill gets the model first: the regular path queues behind it */
+    const bool solo = !s->model_stopping && !prefill_waiting && s->active_generations == 1 &&
+                      s->decode_pending == 0;
+    if (solo) s->model_busy = true;
+    pthread_mutex_unlock(&s->model_mu);
+    if (solo) pthread_mutex_lock(&s->inference_mu);
+    return solo;
+}
+
+static void server_solo_end(server *s) {
+    pthread_mutex_unlock(&s->inference_mu);
+    pthread_mutex_lock(&s->model_mu);
+    s->model_busy = false;
+    pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
+}
+
 static void server_generation_leave(server *s) {
     if (!s || !s->batched_mode) return;
     pthread_mutex_lock(&s->model_mu);
@@ -14323,9 +14349,13 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!forced && !s->batched_mode &&
+        const bool solo = !forced && s->batched_mode && !s->qwen4_batch_mtp &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL && getenv("DS4_SERVER_NO_SOLO_MTP") == NULL &&
+            server_solo_begin(s);
+        if ((!forced && !s->batched_mode &&
+             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+             getenv("DS4_MTP_SPEC_DISABLE") == NULL) || solo)
         {
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
@@ -14340,6 +14370,7 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             }
+            if (solo) server_solo_end(s);
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -16354,7 +16385,8 @@ int main(int argc, char **argv) {
                    server_decode_coalesce_us());
         if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: MTP speculative decoding is disabled while native session batching is active");
+                       "ds4-server: MTP speculative decoding runs only while one generation is active; "
+                       "concurrent generations decode as a plain batch");
         }
     }
     if (cfg.trace_path) {
