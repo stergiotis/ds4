@@ -1141,6 +1141,16 @@ for contiguous rows. Weights round to f16 exactly as before.
   (17.5 vs 16.5 ms); 64-token gate/up tiles; one 16-row group per wave for
   down.
 
+**Small prefill items, measured and dropped (2026-10-14, `qwen-prof/pf/i4`,
+8K prefill ~1,155 tok/s each time):** HT4 -> Q8_0 also for K 2560 (GDN
+qkv+z) 1,152-1,155 -> 1,155-1,159 at 8K but 949 -> 929 at 2K, plus a
+rounding: kept at K >= 4096. `dense_wide<1>` without its 144-byte spill (K
+stages of 32 for F16 weights, 212 VGPRs) 1,154-1,158, identical token: no
+gain. Sparse attention WMMA kernel at launch bounds (256, 1) (no spill)
+attention 510 -> 508 ms per forward: no gain. hc down (M 320) in an exact
+320-row or 2 x 160-row tile 454 -> 396 ms per forward, end to end
+unchanged. The spills are not on the critical path.
+
 **Plain decode batches, 8 sessions (2026-10-14).** `DS4_GPU_TRACE` now
 reports session batches as their own bucket. Per step (98 ms; groups from
 `DS4_QWEN4_BATCH_TIMING`, synchronized): MoE 56 ms (router 5, routed
