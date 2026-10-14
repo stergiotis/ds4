@@ -82822,6 +82822,8 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
     if (ab == 0 || (ab < 0 && !(qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) &&
                                 qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T))))
         return false;
+    if (!qwen4_mark("gdn qkv+z+ab proj", l->lin_qkv->bytes + l->lin_gate->bytes + l->lin_alpha->bytes +
+                    l->lin_beta->bytes)) return false;
     /* The causal convolution and the delta-net scan are the only steps that
      * read and write a session's own recurrent state.  Overlapping these rows
      * through a concurrent encoder was measured and changed nothing: the cost
@@ -82856,10 +82858,12 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
             }
         }
     }
-    if (!ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size,
+    if (!qwen4_mark("gdn conv rows", 0) ||
+        !ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size,
                                        l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
                                        T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
-                                       DS4_N_LIN_HEAD_DIM)) {
+                                       DS4_N_LIN_HEAD_DIM) ||
+        !qwen4_mark("gdn prep", 0)) {
         return false;
     }
     /* With every row's state in the pool, one dispatch advances them all; the
@@ -82893,10 +82897,13 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
             }
         }
     }
-    return ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size,
+    return qwen4_mark("gdn scan rows", 0) &&
+           ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size,
                                         l->lin_norm->abs_offset, T, DS4_N_LIN_V_HEAD,
                                         DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
-           qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
+           qwen4_mark("gdn norm", 0) &&
+           qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T) &&
+           qwen4_mark("gdn out proj", l->lin_out->bytes);
 }
 
 /* Every row's attention in one dispatch per stage: the projections above

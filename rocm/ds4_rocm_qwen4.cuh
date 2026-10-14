@@ -2526,6 +2526,26 @@ __global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsig
     }
 }
 
+/* x rotated once for every ht4_mv workgroup: xr[t][kb * 128 + i] =
+ * f16(FWHT_128(x[t][cperm(kb) * 128 + .] * su[kb * 128 + .])[i] / sqrt(128)),
+ * the values ht4_mv's own prelude computes (same stages and rounding). */
+__global__ __launch_bounds__(128) void ht4_rotate(_Float16 *xr, const float *x, const __half *su, const int *cperm,
+        unsigned K) {
+    constexpr float RS = 0.08838834764831845f;
+    const unsigned kb = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
+    __shared__ float v[128];
+    const unsigned xb = cperm ? (unsigned)cperm[kb] : kb;
+    v[i] = x[(uint64_t)t * K + xb * 128 + i] * __half2float(su[kb * 128 + i]);
+    __syncthreads();
+    for (unsigned h = 1; h < 128; h <<= 1) {
+        const float a = v[i], c = v[i ^ h];
+        __syncthreads();
+        v[i] = (i & h) ? c - a : a + c;
+        __syncthreads();
+    }
+    xr[(uint64_t)t * K + kb * 128 + i] = (_Float16)(v[i] * RS);
+}
+
 static unsigned *g_ht4_counter;
 
 /* HT4 matvecs of a set (shared x and su) for any T, in chunks of 16 rows */
@@ -2546,10 +2566,24 @@ static int ht4_dispatch(ht4_set set, const float *x, const __half *su, const int
     CT = (CT + 7) / 8 * 8;
     if (CT > 32) CT = 32;
     chunks = (ctiles + CT - 1) / CT;
+    /* DS4_QWEN4_HT4_PREROT: 0 = every workgroup rotates its slice of x, 1 = x
+     * rotated once by ht4_rotate, default for 2+ rows only */
+    static int prerot = -2;
+    if (prerot == -2) prerot = getenv("DS4_QWEN4_HT4_PREROT") ? atoi(getenv("DS4_QWEN4_HT4_PREROT")) : -1;
+    const bool rot = prerot == 1 || (prerot == -1 && T >= 2);
+    const uint64_t pbytes = chunks > 1 ? (uint64_t)bands * chunks * 16 * 128 * 4 : 0;
+    const uint64_t xbytes = rot ? (((uint64_t)T * K * 2 + 255) & ~UINT64_C(255)) : 0;
     float *partial = NULL;
-    if (chunks > 1) {
-        partial = (float *)cuda_tmp_alloc((uint64_t)bands * chunks * 16 * 128 * 4, "Qwen HT4 partial sums");
-        if (!partial) return 0;
+    _Float16 *xr = NULL;
+    if (pbytes || xbytes) {
+        char *tmp = (char *)cuda_tmp_alloc(xbytes + pbytes, "Qwen HT4 partial sums");
+        if (!tmp) return 0;
+        xr = rot ? (_Float16 *)tmp : NULL;
+        partial = pbytes ? (float *)(tmp + xbytes) : NULL;
+    }
+    if (xr) {
+        ht4_rotate<<<dim3(K / 128, T), 128, 0, 0>>>(xr, x, su, cperm, K);
+        if (!launched()) return 0;
     }
     const dim3 g(bands, chunks);
     for (unsigned t0 = 0; t0 < T; t0 += 16) {
@@ -2557,7 +2591,8 @@ static int ht4_dispatch(ht4_set set, const float *x, const __half *su, const int
         ht4_set s2 = set;
         for (unsigned i = 0; i < set.n; i++) s2.y[i] = set.y[i] + (uint64_t)t0 * (set.band0[i + 1] - set.band0[i]) * 128;
         const float *xt = x + (uint64_t)t0 * K;
-#define QWEN_HT4(TMV) ht4_mv<TMV><<<g, 256, 0, 0>>>(s2, partial, g_ht4_counter, su, cperm, xt, NULL, n, K, CT, chunks)
+        const _Float16 *xrt = xr ? xr + (uint64_t)t0 * K : NULL;
+#define QWEN_HT4(TMV) ht4_mv<TMV><<<g, 256, 0, 0>>>(s2, partial, g_ht4_counter, su, cperm, xt, xrt, n, K, CT, chunks)
         if (n == 1) { QWEN_HT4(1); }
         else if (n <= 3) { QWEN_HT4(3); }
         else if (n <= 8) { QWEN_HT4(8); }
