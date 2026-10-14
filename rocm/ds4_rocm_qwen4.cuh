@@ -3746,9 +3746,12 @@ __global__ __launch_bounds__(256) void hc_comb_norm_wide(float *R, float *xn, __
             xh[((uint64_t)tok * HC + s) * E + c * 320 + lane + 32 * i] = __float2half_rn(r[s][i] * sc);
 }
 
-template<unsigned TYPE>
+/* RK > 0: rank known at compile time, so a lane's weight loads go out
+ * together (same sums) */
+template<unsigned TYPE, unsigned RK = 0>
 __global__ void hc_mix(float *out, const float *xn, const float *lo,
-                       const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
+                       const char *up, unsigned E, unsigned hc, unsigned rank_, uint64_t rb) {
+    const unsigned rank = RK ? RK : rank_;
     const unsigned d = blockIdx.x * 4 + threadIdx.x / 32, tok = blockIdx.y;
     __shared__ __align__(16) float activated[512];
     if (rank <= 512) {
@@ -3763,6 +3766,7 @@ __global__ void hc_mix(float *out, const float *xn, const float *lo,
         const char *row = up+((uint64_t)stream*E+d)*rb;
         if (!(rank%4) && rank <= 512 &&
             !(TYPE == 0 ? (uintptr_t)row&15 : TYPE == 1 ? (uintptr_t)row&7 : 0)) {
+            #pragma unroll
             for (unsigned r = l*4; r < rank; r += 32) {
                 const float4 w = value4<TYPE>(row,r,NULL,NULL), v = *(const float4 *)(activated+r);
                 a += w.x*v.x; a += w.y*v.y; a += w.z*v.z; a += w.w*v.w;
@@ -4644,7 +4648,8 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
             const float *xp = (const float *)xn->ptr + (uint64_t)c * E * hc, *lp = (const float *)lo->ptr + (uint64_t)c * rank;
             if (n == 1) {
 #define QWEN_HC1(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, 1),128,0,0>>>(op, xp, lp, w,E,hc,rank,row_bytes(TYPE,rank))
-                if (type == 0) { QWEN_HC1(0); } else if (type == 1) { QWEN_HC1(1); } else { QWEN_HC1(8); }
+                if (type == 8 && rank == 320) hc_mix<8,320><<<dim3((E + 3) / 4, 1),128,0,0>>>(op, xp, lp, w,E,hc,rank,row_bytes(8,rank));
+                else if (type == 0) { QWEN_HC1(0); } else if (type == 1) { QWEN_HC1(1); } else { QWEN_HC1(8); }
 #undef QWEN_HC1
             } else if (type == 0) { if (n == 2) QWEN_HCM(0,2); else QWEN_HCM(0,3); }
             else if (type == 1) { if (n == 2) QWEN_HCM(1,2); else QWEN_HCM(1,3); }
@@ -4655,7 +4660,9 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
     }
 #define QWEN_HC(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, T),128,0,0>>>((float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
-    if (type == 0) { QWEN_HC(0); }
+    if (type == 8 && rank == 320) hc_mix<8,320><<<dim3((E + 3) / 4, T),128,0,0>>>((float *)out->ptr,
+        (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(8,rank));
+    else if (type == 0) { QWEN_HC(0); }
     else if (type == 1) { QWEN_HC(1); }
     else { QWEN_HC(8); }
 #undef QWEN_HC
