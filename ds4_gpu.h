@@ -3407,6 +3407,13 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */
+/* ROCm decode/verify GDN front (gates + conv) and scan with prep folded in: 1 launched,
+ * -1 not applicable, 0 error */
+int ds4_gpu_qwen4_gdn_front_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *lin_state,
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *hist, const ds4_gpu_tensor *mixed, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *map, uint64_t size, uint64_t co, uint64_t ao, uint64_t bo, uint64_t so, uint64_t dto,
+        uint32_t type, uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t CK, uint32_t K,
+        ds4_gpu_tensor *hsnap, ds4_gpu_tensor *hsnap2, ds4_gpu_tensor *ssnap, ds4_gpu_tensor *ssnap2);
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,

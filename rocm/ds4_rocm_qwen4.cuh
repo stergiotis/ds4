@@ -5468,6 +5468,138 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
     return launched() && ds4_gpu_qwen4_gdn_prep_tensor(qkv,ga,gb,map,size,so,dto,T,Hk,Hv,D);
 }
 
+namespace qwen4_rocm {
+/* gdn_gates_f32 and conv in one launch (decode and verify rows): blocks
+ * below nconv run conv's channels, the others two gate rows each (half a
+ * block per row, gdn_gates_f32's 128-thread arithmetic). */
+__global__ __launch_bounds__(256) void gdn_front2(float *x, float *history, const float *cw, unsigned T,
+        unsigned C, unsigned CK, float *snap, unsigned snap_t, float *snap2, unsigned snap2_t, unsigned nconv,
+        float *ga, float *gb, const float *wa, const float *wb, const float *xm, unsigned K, unsigned M) {
+    const unsigned tid = threadIdx.x;
+    if (blockIdx.x < nconv) {
+        const unsigned c = blockIdx.x * 256 + tid;
+        if (c >= C) return;
+        float win[3], taps[4];
+        for (unsigned i = 0; i < CK - 1; i++) win[i] = history[(uint64_t)i * C + c];
+        for (unsigned i = 0; i < CK; i++) taps[i] = cw[c * CK + i];
+        for (unsigned t = 0; t < T; t++) {
+            const uint64_t pos = (uint64_t)t * C + c;
+            const float raw = x[pos];
+            float v = taps[CK - 1] * raw;
+            for (unsigned i = 0; i < CK - 1; i++) v += taps[i] * win[i];
+            for (unsigned i = 0; i + 2 < CK; i++) win[i] = win[i + 1];
+            win[CK - 2] = raw;
+            x[pos] = silu(v);
+            if (snap && t == snap_t) for (unsigned i = 0; i < CK - 1; i++) snap[(uint64_t)i * C + c] = win[i];
+            if (snap2 && t == snap2_t) for (unsigned i = 0; i < CK - 1; i++) snap2[(uint64_t)i * C + c] = win[i];
+        }
+        for (unsigned i = 0; i < CK - 1; i++) history[(uint64_t)i * C + c] = win[i];
+        return;
+    }
+    const unsigned half = tid / 128, ht = tid % 128;
+    const unsigned task = (blockIdx.x - nconv) * 2 + half, ntask = 2 * M * T;
+    const unsigned bx = task % (2 * M), t = task / (2 * M), r = bx % M;
+    float acc = 0;
+    if (task < ntask) {
+        const float *w = (bx < M ? wa : wb) + (uint64_t)r * K;
+        const float *xt = xm + (uint64_t)t * K;
+        for (unsigned i = ht * 4; i < K; i += 512) {
+            const float4 a = *(const float4 *)(w + i), v = *(const float4 *)(xt + i);
+            acc += a.x * v.x + a.y * v.y + a.z * v.z + a.w * v.w;
+        }
+    }
+    __shared__ float red[2][4];
+    acc = sum(acc);
+    if (!(ht & 31)) red[half][ht / 32] = acc;
+    __syncthreads();
+    if (!ht && task < ntask) (bx < M ? ga : gb)[(uint64_t)t * M + r] = red[half][0] + red[half][1] + red[half][2] + red[half][3];
+}
+
+/* gdn_prep folded into gdn_scan<1, 128>: each wave normalizes its head's q
+ * and k (gdn_prep's lane layout and sums) and turns the raw gates into decay
+ * and beta, so the values are gdn_prep's and the sums gdn_scan's. */
+__global__ void gdn_scan_prep(float *out, float *state, const float *qkv, const float *a, const float *b,
+                              const float *A, const float *bias, unsigned T, unsigned Hk, unsigned Hv,
+                              float *snap, unsigned st, float *snap2, unsigned st2) {
+    constexpr unsigned D = 128, npt = D / 32;
+    const unsigned dv = blockIdx.x * 4 + threadIdx.x / 32, h = blockIdx.y;
+    if (dv >= D) return;
+    const unsigned k0 = (threadIdx.x & 31) * npt, kh = h % Hk;
+    const unsigned C = (2 * Hk + Hv) * D;
+    const uint64_t idx = ((uint64_t)h * D + dv) * D + k0;
+    float s[4];
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) s[i] = state[idx + i];
+    const float Ah = A[h], bh = bias[h];
+    for (unsigned t = 0; t < T; t++) {
+        const float *qr = qkv + (uint64_t)t * C + kh * D + k0, *kr = qr + Hk * D;
+        float q[4], k[4];
+        float qs = 0, ks = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < npt; i++) { q[i] = qr[i]; k[i] = kr[i]; }
+        for (unsigned i = 0; i < npt; i++) { qs += q[i] * q[i]; ks += k[i] * k[i]; }
+        qs = rsqrtf(sum(qs) + 1e-6f) * rsqrtf((float)D);
+        ks = rsqrtf(sum(ks) + 1e-6f);
+        #pragma unroll
+        for (unsigned i = 0; i < npt; i++) { q[i] *= qs; k[i] *= ks; }
+        const uint64_t p = (uint64_t)t * Hv + h;
+        const float decay = expf(Ah * softplus(a[p] + bh)), beta = sigmoid(b[p]);
+        const float v = qkv[(uint64_t)t * C + 2 * Hk * D + h * D + dv];
+        float u = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < npt; i++) { s[i] *= decay; u += s[i] * k[i]; }
+        const float delta = (v - sum(u)) * beta;
+        float o = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < npt; i++) { s[i] += k[i] * delta; o += s[i] * q[i]; }
+        o = sum(o);
+        if (!(threadIdx.x & 31)) out[((uint64_t)t * Hv + h) * D + dv] = o;
+        if (snap && t == st) for (unsigned i = 0; i < npt; i++) snap[idx + i] = s[i];
+        if (snap2 && t == st2) for (unsigned i = 0; i < npt; i++) snap2[idx + i] = s[i];
+    }
+    #pragma unroll
+    for (unsigned i = 0; i < npt; i++) state[idx + i] = s[i];
+}
+}  // namespace qwen4_rocm
+
+/* Decode and verify rows (T <= 3, D 128, F32 gate rows): ds4_gpu_qwen4_gdn_front_tensor
+ * plus ds4_gpu_qwen4_gdn_scan_tensor in two launches (gdn_front2, gdn_scan_prep),
+ * same values.  -1 when the shape does not apply or DS4_QWEN4_GDN_FUSE_OLD is set. */
+extern "C" int ds4_gpu_qwen4_gdn_front_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *lin_state,
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *hist, const ds4_gpu_tensor *mixed, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *map, uint64_t size, uint64_t co, uint64_t ao, uint64_t bo, uint64_t so, uint64_t dto,
+        uint32_t type, uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t CK, uint32_t K,
+        ds4_gpu_tensor *hsnap, ds4_gpu_tensor *hsnap2, ds4_gpu_tensor *ssnap, ds4_gpu_tensor *ssnap2) {
+    using namespace qwen4_rocm;
+    static int off = -1, scan_min = -1;
+    if (off < 0) off = getenv("DS4_QWEN4_GDN_FUSE_OLD") != NULL;
+    /* ds4_gpu_qwen4_gdn_scan_tensor's choice: where it would take gdn_scan_long, so does this path */
+    if (scan_min < 0) scan_min = getenv("DS4_QWEN4_SCAN_OLD") ? 0 :
+        getenv("DS4_QWEN4_SCAN_MIN") ? atoi(getenv("DS4_QWEN4_SCAN_MIN")) : 64;
+    if (scan_min && T >= (uint32_t)scan_min) return -1;
+    const uint64_t C = ((uint64_t)2 * Hk + Hv) * D, hb = (CK - 1) * C * 4, sb = (uint64_t)Hv * D * D * 4;
+    if (off || !T || T > 3 || D != 128 || type != 0 || K % 512 || CK < 2 || CK > 4 || !Hk || Hv % Hk ||
+        C > UINT_MAX || T < 2 && hsnap2) return -1;
+    if (!tensor(qkv, (uint64_t)T * C * 4) || !tensor(hist, hb) || !tensor(out, (uint64_t)T * Hv * D * 4) ||
+        !tensor(lin_state, sb) || !tensor(ga, (uint64_t)T * Hv * 4) || !tensor(gb, (uint64_t)T * Hv * 4) ||
+        !tensor(mixed, (uint64_t)T * K * 4) || (hsnap && !tensor(hsnap, hb)) || (hsnap2 && !tensor(hsnap2, hb)) ||
+        (ssnap && !tensor(ssnap, sb)) || (ssnap2 && !tensor(ssnap2, sb))) return 0;
+    const char *cw = weight(map, size, co, C * CK * 4);
+    const char *wa = weight(map, size, ao, (uint64_t)K * Hv * 4), *wb = weight(map, size, bo, (uint64_t)K * Hv * 4);
+    const float *A = (const float *)weight(map, size, so, (uint64_t)Hv * 4);
+    const float *bias = (const float *)weight(map, size, dto, (uint64_t)Hv * 4);
+    if (!cw || !wa || !wb || !A || !bias || (((uintptr_t)wa | (uintptr_t)wb | (uintptr_t)mixed->ptr) & 15)) return -1;
+    const unsigned nconv = (unsigned)((C + 255) / 256), ngate = (2 * Hv * T + 1) / 2;
+    gdn_front2<<<nconv + ngate, 256, 0, 0>>>((float *)qkv->ptr, (float *)hist->ptr, (const float *)cw, T, (unsigned)C,
+        CK, hsnap ? (float *)hsnap->ptr : NULL, 0u, hsnap2 ? (float *)hsnap2->ptr : NULL, 1u, nconv,
+        (float *)ga->ptr, (float *)gb->ptr, (const float *)wa, (const float *)wb, (const float *)mixed->ptr, K, Hv);
+    if (!launched()) return 0;
+    gdn_scan_prep<<<dim3(D / 4, Hv), 128, 0, 0>>>((float *)out->ptr, (float *)lin_state->ptr, (const float *)qkv->ptr,
+        (const float *)ga->ptr, (const float *)gb->ptr, A, bias, T, Hk, Hv,
+        ssnap ? (float *)ssnap->ptr : NULL, 0u, ssnap2 ? (float *)ssnap2->ptr : NULL, 1u);
+    return launched();
+}
+
 extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
 
 extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,

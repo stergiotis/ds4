@@ -61069,7 +61069,22 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     }
     if (!qwen4_mark("gdn qkv+z proj", l->lin_qkv->bytes + l->lin_gate->bytes)) return false;
     bool ok;
-    if (qwen4_graph_fused(g, T)) {
+    int front_scan = -1;
+#ifdef DS4_ROCM_BUILD
+    if (qwen4_graph_fused(g, T))
+        front_scan = ds4_gpu_qwen4_gdn_front_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv,
+            g->layer_lin_hist[il], g->mixed, g->ga, g->gb, m->map, m->size, l->lin_conv->abs_offset,
+            l->lin_alpha->abs_offset, l->lin_beta->abs_offset, l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+            l->lin_alpha->type, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV,
+            DS4_N_EMBD, g->snap_after_first ? g->snap_lin_hist[il] : NULL,
+            g->snap_after_second ? g->snap2_lin_hist[il] : NULL,
+            g->snap_after_first ? g->snap_lin_state[il] : NULL,
+            g->snap_after_second ? g->snap2_lin_state[il] : NULL);
+#endif
+    if (front_scan >= 0) {
+        /* conv, gates, prep and scan in two launches */
+        ok = front_scan > 0 && qwen4_mark("gdn conv+gates+scan", 0);
+    } else if (qwen4_graph_fused(g, T)) {
         ok = ds4_gpu_qwen4_gdn_front_tensor(g->qkv, g->layer_lin_hist[il], g->mixed, g->ga, g->gb, m->map, m->size,
                                             l->lin_conv->abs_offset, l->lin_alpha->abs_offset, l->lin_beta->abs_offset,
                                             l->lin_a->abs_offset, l->lin_dt_bias->abs_offset, l->lin_alpha->type, T,
@@ -61093,14 +61108,14 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            l->lin_dt_bias->abs_offset, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
                                            DS4_N_LIN_HEAD_DIM);
     }
-    if (ok) ok = qwen4_mark("gdn conv+gates", 0);
-    if (ok) {
+    if (ok && front_scan < 0) ok = qwen4_mark("gdn conv+gates", 0);
+    if (ok && front_scan < 0) {
         ok = ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb, T,
                                            DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
                                            g->snap_after_first ? g->snap_lin_state[il] : NULL, 0u,
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
-    if (ok) ok = qwen4_mark("gdn scan", 0);
+    if (ok && front_scan < 0) ok = qwen4_mark("gdn scan", 0);
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
                                           DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
