@@ -63504,17 +63504,6 @@ struct ds4_session {
     uint64_t qwen4_spec_accepted;
 #endif
     uint32_t glm_dense_cache_len;
-    /* Next token drawn ahead by an exact-sampling speculative cycle.  The
-     * caller's next ds4_session_sample returns it when position, sampling
-     * parameters and rng match; anything else discards it. */
-    bool pending_valid;
-    int pending_token;
-    int pending_pos;
-    int pending_top_k;
-    float pending_temperature;
-    float pending_top_p;
-    float pending_min_p;
-    uint64_t *pending_rng;
     /* GLM MTP speculative state.  parent is the token that conditioned the
      * pending point-mass draft; sampled decoding discards a draft when its
      * boundary token differs from that parent. */
@@ -63539,6 +63528,17 @@ struct ds4_session {
     float *glm_mtp_logits0;
     ds4_spec_frontier greedy_splitkv_anchor;
 #endif
+    /* Next token drawn ahead by an exact-sampling speculative cycle.  The
+     * caller's next ds4_session_sample returns it when position, sampling
+     * parameters and rng match; anything else discards it. */
+    bool pending_valid;
+    int pending_token;
+    int pending_pos;
+    int pending_top_k;
+    float pending_temperature;
+    float pending_top_p;
+    float pending_min_p;
+    uint64_t *pending_rng;
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
