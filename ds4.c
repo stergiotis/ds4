@@ -60998,7 +60998,15 @@ static bool qwen4_graph_hc_mix_ex(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 #else
     const bool up_gemm = up->type != DS4_TENSOR_Q8_0;
 #endif
-    if (T > 8u && up_gemm) {
+#ifdef DS4_ROCM_BUILD
+    /* up to 16 rows take the gate/mix kernel (8 rows per launch, weights read once per launch) */
+    static int hc_gemm_min = -1;
+    if (hc_gemm_min < 0) hc_gemm_min = getenv("DS4_QWEN4_HC_GEMM_MIN") ? atoi(getenv("DS4_QWEN4_HC_GEMM_MIN")) : 16;
+    const uint32_t up_gemm_min = up->type == DS4_TENSOR_Q8_0 ? (uint32_t)hc_gemm_min : 8u;
+#else
+    const uint32_t up_gemm_min = 8u;
+#endif
+    if (T > up_gemm_min && up_gemm) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         ok = ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
              qwen4_mark("hc lo act", 0);
