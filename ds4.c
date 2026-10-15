@@ -61366,11 +61366,15 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * about 160 of them.  A decode batch does not - sixteen rows spread ten
      * choices each over 512 experts, so an expert averages a third of a token
      * and the tiles run nearly empty.  Above this row count the GEMM wins;
-     * below it the per-token expert path does, by 4% at sixteen rows. */
+     * below it the per-token expert path does (ROCm, 12 decode rows: 127 vs
+     * 149 ms per step; 16 rows: 159 vs 163). */
 #ifdef DS4_HAS_QWEN4_METAL
     const uint32_t mm_min = 64u;
 #else
-    const uint32_t mm_min = 8u;
+    /* DS4_QWEN4_MM_MIN: rows above which the experts take the tiled kernels */
+    static int mm_env = -1;
+    if (mm_env < 0) mm_env = getenv("DS4_QWEN4_MM_MIN") ? atoi(getenv("DS4_QWEN4_MM_MIN")) : 16;
+    const uint32_t mm_min = (uint32_t)mm_env;
 #endif
     const bool mm = T > mm_min &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
