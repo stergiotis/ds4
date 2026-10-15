@@ -1141,6 +1141,23 @@ for contiguous rows. Weights round to f16 exactly as before.
   (17.5 vs 16.5 ms); 64-token gate/up tiles; one 16-row group per wave for
   down.
 
+**Beyond 8 sessions (2026-10-15, 3a8ae04, 58149dc, a9f8317).** At 16
+sessions every stage roughly doubled: experts (twice the distinct experts),
+the GDN scan (at its floor: 2 MB of F32 state per layer and session, read
+and written each step), and the HT4 projections (513 us per layer at 16
+rows vs 116 at one, the per-row fdot2 loops). Kept: the hc gate/mix kernel
+up to 16 rows (16 sessions 174.1 -> 170.4 ms per step); HT4 dots on WMMA
+from 9 rows (half an A fragment per lane, xchg16; 12 sessions 153.4 ->
+149.9, 16: 170.7 -> 163.4; slower at 4-8 rows, so not used there); the
+per-token expert kernels up to 16 rows instead of the tiles from 9 (12
+sessions 149.1 -> 127.1, 16: 162.8 -> 159.4 ms). Oracle tok/s total now: 8
+sessions 92.2, 12: 94.9, 16: 100.1. Server window (256 tokens, gufo
+protocol): 1/2/4/8 users 42.5 / 52.7 / 72.2 / 89.0, 12 users 84.8, 16
+users 90.0 (halogen 46 / 66 / 85 / 112 at 1-8). Next: GDN state traffic
+(F32 now; a BF16 state halves it but is a precision question for a
+recurrence), the server's ~10% per-step overhead at 16 rows, expert
+kernel efficiency (~190 GB/s at 8 rows).
+
 **Night code, morning tests (2026-10-15, `qwen-prof/pf/n1`, `n1-NOTES.md`).**
 Three bit-identical changes, written in a worktree overnight and tested
 from 08:00: (A) ht4_mv's and ht4_rotate's 128-point FWHTs by wave shuffles
