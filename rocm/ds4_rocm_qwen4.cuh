@@ -2390,6 +2390,10 @@ __device__ __forceinline__ ht4_h2 ht4_pair(unsigned s0, unsigned s1) {
     return v * (ht4_h2){m, m} + (ht4_h2){c, c};
 }
 
+__device__ __forceinline__ void ht4_fwht_wave(float v[4]);
+/* DS4_QWEN4_HT4_LDS_FWHT=1: ht4_mv's transforms by the block in LDS, as before */
+__device__ __constant__ int g_ht4_lds_fwht;
+
 /* Sylvester fast Walsh-Hadamard transform of 128-value blocks in LDS by 256
  * threads (n values, n % 128 == 0, n <= 512) */
 __device__ __forceinline__ void ht4_fwht(float *v, unsigned n) {
@@ -2445,6 +2449,24 @@ __global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsig
         for (unsigned t = 0; t < T; t++)
             for (unsigned i = tid * 8; i < nk; i += 256 * 8)
                 *(uint4 *)&xs[t][i] = *(const uint4 *)&xr[(uint64_t)t * K + ct0 * 16 + i];
+        __syncthreads();
+    } else if (!g_ht4_lds_fwht) {
+        /* one 128-value block of one row per wave and step, transformed in
+         * registers (ht4_fwht_wave: the same stages and sums as ht4_fwht) */
+        const unsigned nb = nk / 128;
+        for (unsigned task = wave; task < T * nb; task += 8) {
+            const unsigned t = task / nb, b = task % nb, kb = ct0 / 8 + b;
+            const unsigned xb = cperm ? (unsigned)cperm[kb] : kb;
+            float v[4];
+            #pragma unroll
+            for (unsigned q = 0; q < 4; q++) {
+                const unsigned i = lane * 4 + q;
+                v[q] = x[(uint64_t)t * K + xb * 128 + i] * __half2float(su[kb * 128 + i]);
+            }
+            ht4_fwht_wave(v);
+            #pragma unroll
+            for (unsigned q = 0; q < 4; q++) xs[t][b * 128 + lane * 4 + q] = (_Float16)(v[q] * RS);
+        }
         __syncthreads();
     } else
     for (unsigned t = 0; t < T; t++) {
@@ -2517,6 +2539,20 @@ __global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsig
         __syncthreads();
     }
     const unsigned ob = rperm ? (unsigned)rperm[band] : band;
+    if (!g_ht4_lds_fwht) {
+        for (unsigned t = wave; t < T; t += 8) {
+            float v[4];
+            #pragma unroll
+            for (unsigned q = 0; q < 4; q++) v[q] = z[t][lane * 4 + q];
+            ht4_fwht_wave(v);
+            #pragma unroll
+            for (unsigned q = 0; q < 4; q++) {
+                const unsigned i = lane * 4 + q;
+                y[(uint64_t)t * N + ob * 128 + i] = v[q] * RS * __half2float(sv[band * 128 + i]);
+            }
+        }
+        return;
+    }
     for (unsigned t = 0; t < T; t++) {
         if (tid < 128) fb[tid] = z[t][tid];
         __syncthreads();
@@ -2529,21 +2565,21 @@ __global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsig
 /* x rotated once for every ht4_mv workgroup: xr[t][kb * 128 + i] =
  * f16(FWHT_128(x[t][cperm(kb) * 128 + .] * su[kb * 128 + .])[i] / sqrt(128)),
  * the values ht4_mv's own prelude computes (same stages and rounding). */
-__global__ __launch_bounds__(128) void ht4_rotate(_Float16 *xr, const float *x, const __half *su, const int *cperm,
+__global__ __launch_bounds__(256) void ht4_rotate(_Float16 *xr, const float *x, const __half *su, const int *cperm,
         unsigned K) {
     constexpr float RS = 0.08838834764831845f;
-    const unsigned kb = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
-    __shared__ float v[128];
+    const unsigned kb = blockIdx.x * 8 + threadIdx.x / 32, t = blockIdx.y, lane = threadIdx.x & 31;
+    if (kb >= K / 128) return;
     const unsigned xb = cperm ? (unsigned)cperm[kb] : kb;
-    v[i] = x[(uint64_t)t * K + xb * 128 + i] * __half2float(su[kb * 128 + i]);
-    __syncthreads();
-    for (unsigned h = 1; h < 128; h <<= 1) {
-        const float a = v[i], c = v[i ^ h];
-        __syncthreads();
-        v[i] = (i & h) ? c - a : a + c;
-        __syncthreads();
+    float v[4];
+    #pragma unroll
+    for (unsigned q = 0; q < 4; q++) {
+        const unsigned i = lane * 4 + q;
+        v[q] = x[(uint64_t)t * K + xb * 128 + i] * __half2float(su[kb * 128 + i]);
     }
-    xr[(uint64_t)t * K + kb * 128 + i] = (_Float16)(v[i] * RS);
+    ht4_fwht_wave(v);
+    #pragma unroll
+    for (unsigned q = 0; q < 4; q++) xr[(uint64_t)t * K + kb * 128 + lane * 4 + q] = (_Float16)(v[q] * RS);
 }
 
 static unsigned *g_ht4_counter;
@@ -2568,6 +2604,11 @@ static int ht4_dispatch(ht4_set set, const float *x, const __half *su, const int
     chunks = (ctiles + CT - 1) / CT;
     /* DS4_QWEN4_HT4_PREROT: 0 = every workgroup rotates its slice of x, 1 = x
      * rotated once by ht4_rotate, default for 2+ rows only */
+    static int lds_fwht = -1;
+    if (lds_fwht < 0) {
+        lds_fwht = getenv("DS4_QWEN4_HT4_LDS_FWHT") && atoi(getenv("DS4_QWEN4_HT4_LDS_FWHT")) ? 1 : 0;
+        if (hipMemcpyToSymbol(HIP_SYMBOL(g_ht4_lds_fwht), &lds_fwht, sizeof(int)) != hipSuccess) return 0;
+    }
     static int prerot = -2;
     if (prerot == -2) prerot = getenv("DS4_QWEN4_HT4_PREROT") ? atoi(getenv("DS4_QWEN4_HT4_PREROT")) : -1;
     const bool rot = prerot == 1 || (prerot == -1 && T >= 2);
@@ -2582,7 +2623,7 @@ static int ht4_dispatch(ht4_set set, const float *x, const __half *su, const int
         partial = pbytes ? (float *)(tmp + xbytes) : NULL;
     }
     if (xr) {
-        ht4_rotate<<<dim3(K / 128, T), 128, 0, 0>>>(xr, x, su, cperm, K);
+        ht4_rotate<<<dim3((K / 128 + 7) / 8, T), 256, 0, 0>>>(xr, x, su, cperm, K);
         if (!launched()) return 0;
     }
     const dim3 g(bands, chunks);
