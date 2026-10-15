@@ -2424,7 +2424,13 @@ struct ht4_set {
     unsigned n;
 };
 
-template<unsigned TM>
+/* WM (TM == 16, 4-16 rows): the per-row dots on WMMA.  A lane's 8 decoded
+ * values are half of a 16-value A fragment row (lanes 16-31 columns 8-15),
+ * the other half comes from lane ^ 16 (xchg16), so the upper half-wave runs
+ * k 8-15, 0-7 and reads x in that order; one 16 x 16 x 16 product per column
+ * tile serves every row.  Sums differ from the dot path (used up to 3 rows,
+ * where verify rows must match decode). */
+template<unsigned TM, bool WM = false>
 __global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsigned *counter,
         const __half *su, const int *cperm,
         const float *x, const _Float16 *xr, unsigned T, unsigned K, unsigned CT, unsigned chunks) {
@@ -2482,6 +2488,38 @@ __global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsig
     }
     const unsigned *wb = w + ((uint64_t)band * ctiles * 8) * 32 + wave * 32 + lane;
     const unsigned col_half = 8 * (lane / 16);
+    if constexpr (WM) {
+        static_assert(TM == 16, "WMMA rows");
+        const unsigned h = lane / 16, n16 = lane % 16;
+        float8 acc8 = {};
+        for (unsigned c = 0; c < nct; c += 8) {
+            unsigned cur[8];
+            #pragma unroll
+            for (unsigned u = 0; u < 8; u++) cur[u] = wb[(uint64_t)(ct0 + c + u) * 256];
+            #pragma unroll
+            for (unsigned u = 0; u < 8; u++) {
+                const unsigned prev = __shfl(cur[u], (lane + 31) & 31, 32);
+                unsigned fa[8];
+                #pragma unroll
+                for (unsigned j = 0; j < 8; j += 2) {
+                    const ht4_h2 mv = ht4_pair(__builtin_amdgcn_alignbit(prev, cur[u], 28 - 4 * j) & 0xFFFFu,
+                                               __builtin_amdgcn_alignbit(prev, cur[u], 24 - 4 * j) & 0xFFFFu);
+                    __builtin_memcpy(&fa[j / 2], &mv, 4);
+                }
+                #pragma unroll
+                for (unsigned i = 0; i < 4; i++) fa[4 + i] = xchg16(fa[i]);
+                const _Float16 *xr16 = &xs[n16][(c + u) * 16];
+                uint4 bb[2];
+                bb[0] = *(const uint4 *)(xr16 + 8 * h);
+                bb[1] = *(const uint4 *)(xr16 + 8 * (1 - h));
+                acc8 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(half16, fa),
+                                                                  __builtin_bit_cast(half16, bb), acc8);
+            }
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++)
+            if (n16 < T) z[n16][wave * 16 + 2 * j + h] = acc8[j];
+    } else {
     float acc[TM];
     #pragma unroll
     for (unsigned t = 0; t < TM; t++) acc[t] = 0.f;
@@ -2518,6 +2556,7 @@ __global__ __launch_bounds__(256) void ht4_mv(ht4_set set, float *partial, unsig
             const float v = acc[t] + __shfl_xor(acc[t], 16, 32);
             if (lane < 16) z[t][wave * 16 + lane] = v;
         }
+    }
     }
     __syncthreads();
     if (chunks > 1) {
@@ -2634,8 +2673,15 @@ static int ht4_dispatch(ht4_set set, const float *x, const __half *su, const int
         const float *xt = x + (uint64_t)t0 * K;
         const _Float16 *xrt = xr ? xr + (uint64_t)t0 * K : NULL;
 #define QWEN_HT4(TMV) ht4_mv<TMV><<<g, 256, 0, 0>>>(s2, partial, g_ht4_counter, su, cperm, xt, xrt, n, K, CT, chunks)
+        /* DS4_QWEN4_HT4_WMMA_MIN (default 9, 0 = never, at least 4): rows from which the WMMA dots run */
+        static int wmma_min = -1;
+        if (wmma_min < 0) {
+            wmma_min = getenv("DS4_QWEN4_HT4_WMMA_MIN") ? atoi(getenv("DS4_QWEN4_HT4_WMMA_MIN")) : 9;
+            if (wmma_min > 0 && wmma_min < 4) wmma_min = 4;
+        }
         if (n == 1) { QWEN_HT4(1); }
         else if (n <= 3) { QWEN_HT4(3); }
+        else if (wmma_min && n >= (unsigned)wmma_min) ht4_mv<16, true><<<g, 256, 0, 0>>>(s2, partial, g_ht4_counter, su, cperm, xt, xrt, n, K, CT, chunks);
         else if (n <= 8) { QWEN_HT4(8); }
         else { QWEN_HT4(16); }
 #undef QWEN_HT4
