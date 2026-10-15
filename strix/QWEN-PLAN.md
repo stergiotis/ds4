@@ -1141,6 +1141,26 @@ for contiguous rows. Weights round to f16 exactly as before.
   (17.5 vs 16.5 ms); 64-token gate/up tiles; one 16-row group per wave for
   down.
 
+**Night code, morning tests (2026-10-15, `qwen-prof/pf/n1`, `n1-NOTES.md`).**
+Three bit-identical changes, written in a worktree overnight and tested
+from 08:00: (A) ht4_mv's and ht4_rotate's 128-point FWHTs by wave shuffles
+instead of LDS with block barriers (8 sessions 89.2 -> 88.7 ms per step;
+single row unchanged); (B) decode/verify GDN in two launches instead of
+four, gates sharing the conv's launch and gdn_prep folded into the scan
+(decode 28.48 -> 28.11 ms GPU, 37.2 -> 37.6 tok/s); (C) decode batches run
+attention prep, core and merge for every session in three launches while
+all sessions are below the sparse window (attention 5.6 -> 3.0 ms per
+8-session step). The first perplexity run differed (1.5829 vs 1.5826):
+the gate forces `DS4_QWEN4_SCAN_MIN=1`, under which the old path took
+gdn_scan_long for 1-3 rows while (B) always ran the short scan's sums; (B)
+now steps aside wherever gdn_scan_long would run, and perplexity is
+bit-identical (NLL 13912.849756764). Results (main b0b0a09 -> now):
+plain decode 37.2 -> 37.6 tok/s, MTP greedy code 60.1 -> 60.9, prose 48.1
+-> 48.7; oracle 8 sessions 89.1 -> 86.7 ms, 16 sessions 178.9 -> 173.3 ms
+(92 tok/s, no more than 8: above 8 rows the experts take the prefill
+tiles); server window 1/2/4/8 users 42.0/50.4/70.8/88.0 -> 42.6/53.4/
+72.1/89.1, 16 users ~80 tok/s both. halogen: 46/66/85/112.
+
 **One user, then 8 sessions (2026-10-14 evening, 45dd2cc..f0a85c8).**
 Single-user plain decode reads 4.05 GB of weights per token (floor ~18.8
 ms at 215 GB/s); the weight kernels take 24.4 ms (166 GB/s average) and

@@ -3414,6 +3414,15 @@ int ds4_gpu_qwen4_gdn_front_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *lin
         const void *map, uint64_t size, uint64_t co, uint64_t ao, uint64_t bo, uint64_t so, uint64_t dto,
         uint32_t type, uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t CK, uint32_t K,
         ds4_gpu_tensor *hsnap, ds4_gpu_tensor *hsnap2, ds4_gpu_tensor *ssnap, ds4_gpu_tensor *ssnap2);
+/* ROCm decode batch, all sessions dense: attention prep/core/merge in three launches.
+ * 1 launched, -1 not applicable, 0 error. */
+int ds4_gpu_qwen4_attn_rows_dense_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *iqout, const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
+        const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, ds4_gpu_tensor *const *kc, ds4_gpu_tensor *const *vc,
+        ds4_gpu_tensor *const *ikc, const ds4_gpu_tensor *const *pos3, const uint32_t *pos, const uint32_t *cap,
+        uint32_t n, const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
+        uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot, uint32_t Hi, uint32_t Di, float base, float eps,
+        float scale);
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,

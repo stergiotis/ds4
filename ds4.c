@@ -83071,6 +83071,43 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                            (DS4_N_HEAD_DIM == 128u || DS4_N_HEAD_DIM == 256u);
     if (ok && rows_path) return qwen4_batch_attention_rows(count, rowg, g, m, l, il) &&
                                 qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+#ifdef DS4_ROCM_BUILD
+    /* every session still at a dense position: prep, attention and merge
+     * for all of them in three launches, then each session's block keys */
+    if (ok) {
+        const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
+        bool dense = count >= 2 && count <= QWEN4_BATCH_MAX_ROWS;
+        ds4_gpu_tensor *kcs[QWEN4_BATCH_MAX_ROWS], *vcs[QWEN4_BATCH_MAX_ROWS], *ikcs[QWEN4_BATCH_MAX_ROWS];
+        const ds4_gpu_tensor *p3s[QWEN4_BATCH_MAX_ROWS];
+        uint32_t poss[QWEN4_BATCH_MAX_ROWS], caps[QWEN4_BATCH_MAX_ROWS];
+        for (int i = 0; dense && i < count; i++) {
+            const ds4_qwen4_gpu_graph *r = &rowg[i];
+            dense = r->pos < sparse_pos;
+            kcs[i] = r->layer_k_cache[il]; vcs[i] = r->layer_v_cache[il]; ikcs[i] = r->layer_ik_cache[il];
+            p3s[i] = r->pos3; poss[i] = r->pos; caps[i] = r->ctx_cap;
+        }
+        int rows = dense ? ds4_gpu_qwen4_attn_rows_dense_tensor(g->attn_o, g->q, g->gate, g->iqn, g->qg, g->kp, g->vp,
+            g->iq, g->ik, kcs, vcs, ikcs, p3s, poss, caps, (uint32_t)count, m->map, m->size,
+            l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset, l->indexer_q_norm->abs_offset,
+            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+            DS4_ROPE_FREQ_BASE, DS4_RMS_EPS, 1.0f / sqrtf((float)DS4_N_HEAD_DIM)) : -1;
+        if (rows == 0) return false;
+        if (rows > 0) {
+            for (int i = 0; ok && i < count; i++) {
+                ds4_qwen4_gpu_graph *r = &rowg[i];
+                const uint32_t first_block = r->pos / ratio, n_blocks_after = (r->pos + 1u) / ratio;
+                if (n_blocks_after > first_block)
+                    ok = ds4_gpu_qwen4_idx_block_key_tensor(r->layer_block_key[il], r->layer_ik_cache[il],
+                                                            r->pos3, m->map, m->size,
+                                                            l->indexer_k_norm->abs_offset, first_block,
+                                                            n_blocks_after - first_block, ratio,
+                                                            DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                                                            DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
+            }
+            return ok && qwen4_mark("attn rows (dense)", 0) && qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+        }
+    }
+#endif
     /* Each row appends to its own KV and indexer caches at its own position,
      * then reads them back through its own block selection. */
     for (int i = 0; ok && i < count; i++) {

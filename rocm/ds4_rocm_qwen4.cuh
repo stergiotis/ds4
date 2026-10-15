@@ -4836,6 +4836,165 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
     return launched();
 }
 
+namespace qwen4_rocm {
+/* Decode batches, dense attention (one token per session): attn_prep,
+ * attention and attn_merge with the session as a grid axis, each session's
+ * caches, position and split count from a staged entry (the split count is
+ * the one ds4_gpu_qwen4_attn_decode_tensor picks for its keys), so every
+ * row's values are those of its own single-session launches. */
+struct attn_row_entry { __half *kc, *vc; float *ikc; const uint32_t *pos3; uint32_t pos, splits, per, pad; };
+
+__global__ void attn_prep_rows(float *qout, float *gate, float *iqout, const float *qg, const float *kp,
+        const float *vp, const float *iq, const float *ik, const attn_row_entry *rows,
+        const float *gq, const float *gk, const float *giq,
+        unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di, float eps, rope_args rp) {
+    const unsigned slot = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const attn_row_entry e = rows[t];
+    const unsigned pos = e.pos;
+    __shared__ float row[256];
+    if (slot == H + Hkv + Hi) {
+        for (unsigned i = lane; i < Di; i += 32) e.ikc[(uint64_t)pos * Di + i] = ik[(uint64_t)t * Di + i];
+        return;
+    }
+    const bool isq = slot < H, isk = !isq && slot < H + Hkv;
+    const unsigned h = isq ? slot : isk ? slot - H : slot - H - Hkv;
+    const unsigned dim = isq || isk ? D : Di;
+    const float *src = isq ? qg + ((uint64_t)t * H + h) * 2 * D :
+                      isk ? kp + ((uint64_t)t * Hkv + h) * D : iq + ((uint64_t)t * Hi + h) * Di;
+    const float *gamma = isq ? gq : isk ? gk : giq;
+    const unsigned npt = dim / 32;
+    float ss = 0;
+    for (unsigned i = 0; i < npt; i++) { const float v = src[lane * npt + i]; ss += v * v; }
+    const float inv = rsqrtf(sum(ss) / dim + eps);
+    for (unsigned i = lane; i < dim; i += 32) row[i] = src[i] * inv * gamma[i];
+    __syncwarp();
+    apply_rope(row, e.pos3 + (uint64_t)pos * 4, rp);
+    for (unsigned i = lane; i < dim; i += 32) {
+        if (isq) {
+            qout[((uint64_t)t * H + h) * D + i] = row[i];
+            gate[((uint64_t)t * H + h) * D + i] = src[D + i];
+        } else if (isk) {
+            e.kc[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(row[i]);
+            e.vc[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(vp[((uint64_t)t * Hkv + h) * D + i]);
+        } else iqout[((uint64_t)t * Hi + h) * Di + i] = row[i];
+    }
+}
+
+template<unsigned D>
+__global__ void attention_rows(float *out, float *partial, const float *q, const float *gate,
+        const attn_row_entry *rows, unsigned H, unsigned Hkv, unsigned maxsplits, float scale) {
+    const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, split = blockIdx.z;
+    const attn_row_entry e = rows[t];
+    if (h >= H || split >= e.splits) return;
+    const unsigned splits = e.splits, per = e.per, pos = e.pos;
+    const __half *kc = e.kc, *vc = e.vc;
+    const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = pos + 1;
+    float qv[D / 32], acc[D / 32] = {}, m = -3e38f, denom = 0;
+    for (unsigned i = 0; i < D / 32; i++) qv[i] = q[((uint64_t)t * H + h) * D + lane + 32 * i] * scale;
+    for (unsigned j = split * per; j < min(n, (split + 1) * per); j++) {
+        const unsigned p = j;
+        if (p > pos) continue;
+        float score = 0;
+        for (unsigned i = 0; i < D / 32; i++) score += qv[i] * __half2float(kc[((uint64_t)p * Hkv + kh) * D + lane + 32 * i]);
+        score = sum(score);
+        const float nm = fmaxf(m, score), correction = expf(m - nm), w = expf(score - nm);
+        denom = denom * correction + w;
+        for (unsigned i = 0; i < D / 32; i++) acc[i] = acc[i] * correction + w * __half2float(vc[((uint64_t)p * Hkv + kh) * D + lane + 32 * i]);
+        m = nm;
+    }
+    if (splits == 1) {
+        for (unsigned i = 0; i < D / 32; i++) {
+            const uint64_t p = ((uint64_t)t * H + h) * D + lane + 32 * i;
+            out[p] = (denom > 0 ? acc[i] / denom : 0) * sigmoid(gate[p]);
+        }
+    } else {
+        float *dst = partial + (uint64_t)t * H * maxsplits * (D + 2) + ((uint64_t)h * splits + split) * (D + 2);
+        if (!lane) { dst[0] = m; dst[1] = denom; }
+        for (unsigned i = 0; i < D / 32; i++) dst[2 + lane + 32 * i] = acc[i];
+    }
+}
+
+__global__ void attn_merge_rows(float *out, const float *partial, const float *gate, const attn_row_entry *rows,
+        unsigned H, unsigned D, unsigned maxsplits) {
+    const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    const unsigned splits = rows[t].splits;
+    if (d >= D || splits == 1) return;
+    const float *p = partial + (uint64_t)t * H * maxsplits * (D + 2) + (uint64_t)h * splits * (D + 2);
+    float m = -3e38f, denom = 0, acc = 0;
+    for (unsigned s = 0; s < splits; s++) m = fmaxf(m, p[s * (D + 2)]);
+    for (unsigned s = 0; s < splits; s++) {
+        const float *row = p + s * (D + 2);
+        const float w = row[1] > 0 ? expf(row[0] - m) : 0;
+        denom += row[1] * w; acc += row[2 + d] * w;
+    }
+    const uint64_t i = ((uint64_t)t * H + h) * D + d;
+    out[i] = (denom > 0 ? acc / denom : 0) * sigmoid(gate[i]);
+}
+}  // namespace qwen4_rocm
+
+/* Decode batch, every session at a dense position (pos < the sparse window):
+ * attn_prep, attention and the merge for all n sessions in three launches.
+ * Session i's caches are kc[i] / vc[i] / ikc[i] (cap[i] positions), its rope
+ * table pos3[i], its position pos[i]; its rows are row i of q / gate / iqout /
+ * qg / kp / vp / iq / ik / out.  1 when launched, -1 not applicable
+ * (DS4_QWEN4_NO_ATTN_ROWS, shape), 0 on error. */
+extern "C" int ds4_gpu_qwen4_attn_rows_dense_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *iqout, const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
+        const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, ds4_gpu_tensor *const *kc, ds4_gpu_tensor *const *vc,
+        ds4_gpu_tensor *const *ikc, const ds4_gpu_tensor *const *pos3, const uint32_t *pos, const uint32_t *cap,
+        uint32_t n, const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
+        uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot, uint32_t Hi, uint32_t Di, float base, float eps,
+        float scale) {
+    using namespace qwen4_rocm;
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_QWEN4_NO_ATTN_ROWS") != NULL;
+    if (off || n < 2 || n > 64 || D != 256 || !Hkv || H % Hkv || Di < 32 || Di > 128 || Di % 32 ||
+        nrot > 64 || nrot > Di || nrot % 2 || g_quality_mode) return -1;
+    const uint64_t qb = (uint64_t)n * H * D * 4, kb = (uint64_t)n * Hkv * D * 4, ib = (uint64_t)n * Hi * Di * 4;
+    if (!tensor(out, qb) || !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) || !tensor(kp, kb) ||
+        !tensor(vp, kb) || !tensor(iq, ib) || !tensor(iqout, ib) || !tensor(ik, (uint64_t)n * Di * 4)) return 0;
+    attn_row_entry e[64];
+    unsigned maxsplits = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (pos[i] >= cap[i] || !tensor(kc[i], (uint64_t)cap[i] * Hkv * D * 2) ||
+            !tensor(vc[i], (uint64_t)cap[i] * Hkv * D * 2) || !tensor(ikc[i], (uint64_t)cap[i] * Di * 4) ||
+            !tensor(pos3[i], (uint64_t)cap[i] * 16)) return 0;
+        const unsigned keys = pos[i] + 1;
+        const unsigned per = keys <= 64u * 32u ? 32u : (keys + 63u) / 64u;
+        e[i] = attn_row_entry{(__half *)kc[i]->ptr, (__half *)vc[i]->ptr, (float *)ikc[i]->ptr,
+                              (const uint32_t *)pos3[i]->ptr, pos[i], (keys + per - 1u) / per, per, 0u};
+        if (e[i].splits > maxsplits) maxsplits = e[i].splits;
+    }
+    static attn_row_entry *table;
+    static float *partial;
+    static uint64_t partial_bytes;
+    const uint64_t pbytes = (uint64_t)n * H * maxsplits * (D + 2) * 4;
+    if (!table && cudaMalloc((void **)&table, 64 * sizeof(attn_row_entry)) != cudaSuccess) { table = NULL; return 0; }
+    if (pbytes > partial_bytes) {
+        if (partial) (void)cudaFree(partial);
+        partial = NULL; partial_bytes = 0;
+        if (cudaMalloc((void **)&partial, pbytes) != cudaSuccess) { partial = NULL; return 0; }
+        partial_bytes = pbytes;
+    }
+    if (cudaMemcpyAsync(table, e, n * sizeof(attn_row_entry), cudaMemcpyHostToDevice, 0) != cudaSuccess) return 0;
+    const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4), *giq = weight(map, size, io, Di * 4);
+    if (!gq || !gk || !giq) return 0;
+    attn_prep_rows<<<dim3(H + Hkv + Hi + 1, n), 32, 0, 0>>>((float *)q->ptr, (float *)gate->ptr, (float *)iqout->ptr,
+        (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr,
+        (const float *)ik->ptr, table, (const float *)gq, (const float *)gk, (const float *)giq,
+        H, Hkv, D, Hi, Di, eps, rope(nrot, base));
+    if (!launched()) return 0;
+    attention_rows<256><<<dim3((H + 3) / 4, n, maxsplits), 128, 0, 0>>>((float *)out->ptr, partial,
+        (const float *)q->ptr, (const float *)gate->ptr, table, H, Hkv, maxsplits, scale);
+    if (!launched()) return 0;
+    if (maxsplits > 1) {
+        attn_merge_rows<<<dim3(H, n), D, 0, 0>>>((float *)out->ptr, partial, (const float *)gate->ptr, table,
+                                                 H, D, maxsplits);
+        if (!launched()) return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3, const void *map, uint64_t size,
         uint64_t off, uint32_t b0, uint32_t N, uint32_t ratio, uint32_t D, uint32_t nrot,
