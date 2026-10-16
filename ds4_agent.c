@@ -5600,6 +5600,7 @@ static char *agent_session_title_from_span(const char *p, const char *end,
     bool truncated = false;
     for (const char *s = p; s < end; s++) {
         unsigned char c = (unsigned char)*s;
+        if (c == (unsigned char)DS4_CHAT_LITERAL) continue;
         if (isspace(c)) {
             space = b.len != 0;
             continue;
@@ -6138,6 +6139,7 @@ static bool agent_worker_show_history(agent_worker *w, int user_turns,
         snprintf(err, err_len, "failed to render session text");
         return false;
     }
+    text_len = ds4_chat_literal_strip(text, text_len);
     agent_history_render_text(w, text, text_len, user_turns);
     free(text);
     return true;

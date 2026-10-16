@@ -373,7 +373,20 @@ void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
+/* Rendered chat text spells the model's control tokens inline ("<|user|>",
+ * "</think>", ...).  Text the template did not write (user, system and tool
+ * text, tool schemas) must not be able to spell them: ds4_chat_literal()
+ * puts DS4_CHAT_LITERAL before each special spelling, which the tokenizer
+ * then reads as plain text, and doubles the byte itself (0xFF is never part
+ * of UTF-8).  The spellings that count are those of the model loaded last. */
+#define DS4_CHAT_LITERAL '\xff'
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
+char *ds4_chat_literal(const char *text, size_t len, size_t *out_len);
+/* Removes the escapes, for showing rendered text to people. */
+size_t ds4_chat_literal_strip(char *text, size_t len);
+/* The rendered chat text that tokenizes back to these tokens' meaning, with
+ * plain-text spellings of control tokens escaped. */
+char *ds4_chat_tokens_text(ds4_engine *e, const ds4_tokens *tokens, size_t *out_len);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
 void ds4_encode_chat_prompt(
         ds4_engine *e,

@@ -45420,7 +45420,7 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
 
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 
-static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
+static void vocab_read(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
 
     ds4_array_ref tokens;
@@ -45719,48 +45719,109 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
-static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
-    struct special {
-        const char *text;
-        int token;
-    } specials[] = {
-        {"<｜begin▁of▁sentence｜>", vocab->bos_id},
-        {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"[gMASK]",                vocab->bos_id},
-        {"<sop>",                  vocab->sop_id},
-        {"<|system|>",             vocab->system_id},
-        {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1},
-        {"<｜User｜>",              vocab->user_id},
-        {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<|user|>",               vocab->user_id},
-        {"<|assistant|>",          vocab->assistant_id},
-        {"<|observation|>",        vocab->observation_id},
-        {"<think>",                vocab->think_start_id},
-        {"</think>",               vocab->think_end_id},
-        {"<tool_call>",            vocab->tool_call_start_id},
-        {"</tool_call>",           vocab->tool_call_end_id},
-        {"<tool_response>",        vocab->tool_response_start_id},
-        {"</tool_response>",       vocab->tool_response_end_id},
-        {"<arg_key>",              vocab->arg_key_start_id},
-        {"</arg_key>",             vocab->arg_key_end_id},
-        {"<arg_value>",            vocab->arg_value_start_id},
-        {"</arg_value>",           vocab->arg_value_end_id},
-        {"｜DSML｜",                vocab->dsml_id},
-        {"<|im_start|>",           vocab->im_start_id},
-        {"<|im_end|>",             vocab->im_end_id},
-        {"<|endoftext|>",          vocab->endoftext_id},
-    };
+/* Only V4.1 has a system token spelled with full-width bars. */
+static const char chat_ds41_system[] = "<｜System｜>";
 
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
-        if (specials[i].token < 0) continue;
-        size_t n = strlen(specials[i].text);
-        if (!strncmp(p, specials[i].text, n)) {
-            *token = specials[i].token;
-            *len = n;
-            return true;
-        }
+/* Control tokens that rendered chat text spells inline.  The first spelling
+ * that matches wins, and a spelling counts only when the vocabulary has its
+ * token; id is the offset of that token's id in ds4_vocab. */
+static const struct {
+    const char *text;
+    size_t id;
+} chat_specials[] = {
+    {"<｜begin▁of▁sentence｜>", offsetof(ds4_vocab, bos_id)},
+    {"<｜end▁of▁sentence｜>",   offsetof(ds4_vocab, eos_id)},
+    {"[gMASK]",                offsetof(ds4_vocab, bos_id)},
+    {"<sop>",                  offsetof(ds4_vocab, sop_id)},
+    {"<|system|>",             offsetof(ds4_vocab, system_id)},
+    {chat_ds41_system,         offsetof(ds4_vocab, system_id)},
+    {"<｜User｜>",              offsetof(ds4_vocab, user_id)},
+    {"<｜Assistant｜>",         offsetof(ds4_vocab, assistant_id)},
+    {"<|user|>",               offsetof(ds4_vocab, user_id)},
+    {"<|assistant|>",          offsetof(ds4_vocab, assistant_id)},
+    {"<|observation|>",        offsetof(ds4_vocab, observation_id)},
+    {"<think>",                offsetof(ds4_vocab, think_start_id)},
+    {"</think>",               offsetof(ds4_vocab, think_end_id)},
+    {"<tool_call>",            offsetof(ds4_vocab, tool_call_start_id)},
+    {"</tool_call>",           offsetof(ds4_vocab, tool_call_end_id)},
+    {"<tool_response>",        offsetof(ds4_vocab, tool_response_start_id)},
+    {"</tool_response>",       offsetof(ds4_vocab, tool_response_end_id)},
+    {"<arg_key>",              offsetof(ds4_vocab, arg_key_start_id)},
+    {"</arg_key>",             offsetof(ds4_vocab, arg_key_end_id)},
+    {"<arg_value>",            offsetof(ds4_vocab, arg_value_start_id)},
+    {"</arg_value>",           offsetof(ds4_vocab, arg_value_end_id)},
+    {"｜DSML｜",                offsetof(ds4_vocab, dsml_id)},
+    {"<|im_start|>",           offsetof(ds4_vocab, im_start_id)},
+    {"<|im_end|>",             offsetof(ds4_vocab, im_end_id)},
+    {"<|endoftext|>",          offsetof(ds4_vocab, endoftext_id)},
+};
+#define CHAT_SPECIALS (sizeof(chat_specials) / sizeof(chat_specials[0]))
+
+/* ds4_chat_literal() has no engine to ask, so vocab_load() leaves the loaded
+ * model's tokens here; until then every spelling is escaped. */
+static int g_chat_special_id[CHAT_SPECIALS];
+static bool g_chat_special_loaded;
+
+static void chat_special_ids(const ds4_vocab *vocab, int *id) {
+    for (size_t i = 0; i < CHAT_SPECIALS; i++) {
+        id[i] = chat_specials[i].text == chat_ds41_system &&
+                DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ? -1 :
+                *(const int *)((const char *)vocab + chat_specials[i].id);
     }
-    return false;
+}
+
+/* The special spelled at the start of p[0..n), or -1.  NULL ids match every
+ * spelling. */
+static int chat_special_at(const int *id, const char *p, size_t n) {
+    for (size_t i = 0; n && i < CHAT_SPECIALS; i++) {
+        const char *s = chat_specials[i].text;
+        if (*p != *s || (id && id[i] < 0)) continue;
+        const size_t len = strlen(s);
+        if (len <= n && !memcmp(p, s, len)) return (int)i;
+    }
+    return -1;
+}
+
+/* Writes at most 2 * len bytes; see ds4_chat_literal(). */
+static size_t chat_literal_write(const int *id, const char *text, size_t len, char *out) {
+    size_t o = 0;
+    for (size_t i = 0; i < len;) {
+        const int s = chat_special_at(id, text + i, len - i);
+        const size_t n = s >= 0 ? strlen(chat_specials[s].text) : 1;
+        if (s >= 0 || text[i] == DS4_CHAT_LITERAL) out[o++] = DS4_CHAT_LITERAL;
+        memcpy(out + o, text + i, n);
+        o += n;
+        i += n;
+    }
+    return o;
+}
+
+char *ds4_chat_literal(const char *text, size_t len, size_t *out_len) {
+    char *out = xmalloc(2 * len + 1);
+    const size_t n = chat_literal_write(g_chat_special_loaded ? g_chat_special_id : NULL,
+                                        text ? text : "", text ? len : 0, out);
+    out[n] = '\0';
+    if (out_len) *out_len = n;
+    return out;
+}
+
+size_t ds4_chat_literal_strip(char *text, size_t len) {
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] == DS4_CHAT_LITERAL) {
+            if (i + 1 == len || text[i + 1] != DS4_CHAT_LITERAL) continue;
+            i++;
+        }
+        text[o++] = text[i];
+    }
+    if (o < len) text[o] = '\0';
+    return o;
+}
+
+static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
+    vocab_read(vocab, model);
+    chat_special_ids(vocab, g_chat_special_id);
+    g_chat_special_loaded = true;
 }
 
 static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token_vec *out) {
@@ -45775,26 +45836,77 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
 static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
                                          token_vec *out) {
     if (!text) text = "";
+    int id[CHAT_SPECIALS];
+    chat_special_ids(vocab, id);
 
-    const char *span = text;
-    const char *p = text;
-    while (*p) {
-        int token = -1;
-        size_t len = 0;
-        if (special_token_at(vocab, p, &token, &len)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
-            token_vec_push(out, token);
-            p += len;
-            span = p;
+    /* Plain text between control tokens, with the escapes taken out. */
+    const size_t len = strlen(text);
+    char *plain = xmalloc(len + 1);
+    size_t n = 0;
+    for (size_t i = 0; i < len;) {
+        if (text[i] == DS4_CHAT_LITERAL) {
+            const int s = chat_special_at(id, text + i + 1, len - i - 1);
+            const size_t k = s >= 0 ? strlen(chat_specials[s].text) :
+                             text[i + 1] == DS4_CHAT_LITERAL ? 1 : 0;
+            memcpy(plain + n, text + i + 1, k);
+            n += k;
+            i += 1 + k;
             continue;
         }
-        p++;
+        const int s = chat_special_at(id, text + i, len - i);
+        if (s < 0) {
+            plain[n++] = text[i++];
+            continue;
+        }
+        tokenize_span(vocab, plain, n, out);
+        n = 0;
+        token_vec_push(out, id[s]);
+        i += strlen(chat_specials[s].text);
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    tokenize_span(vocab, plain, n, out);
+    free(plain);
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
+}
+
+static void text_reserve(char **text, size_t *cap, size_t need) {
+    if (need <= *cap) return;
+    *cap = need > 2 * *cap ? need : 2 * *cap;
+    *text = xrealloc(*text, *cap);
+}
+
+/* Pieces of plain tokens are joined before escaping, so a spelling split
+ * across several tokens is escaped too. */
+char *ds4_chat_tokens_text(ds4_engine *e, const ds4_tokens *tokens, size_t *out_len) {
+    int id[CHAT_SPECIALS];
+    chat_special_ids(&e->vocab, id);
+    char *out = NULL, *plain = NULL;
+    size_t len = 0, cap = 0, plain_len = 0, plain_cap = 0;
+    for (int i = 0; i <= tokens->len; i++) {
+        size_t n = 0;
+        char *piece = i < tokens->len ? ds4_token_text(e, tokens->v[i], &n) : NULL;
+        const int s = piece ? chat_special_at(id, piece, n) : -1;
+        if (piece && (s < 0 || id[s] != tokens->v[i] ||
+                      strlen(chat_specials[s].text) != n)) {
+            text_reserve(&plain, &plain_cap, plain_len + n);
+            memcpy(plain + plain_len, piece, n);
+            plain_len += n;
+            free(piece);
+            continue;
+        }
+        text_reserve(&out, &cap, len + 2 * plain_len + n + 1);
+        len += chat_literal_write(id, plain ? plain : "", plain_len, out + len);
+        plain_len = 0;
+        if (piece) memcpy(out + len, piece, n);
+        len += n;
+        free(piece);
+    }
+    out[len] = '\0';
+    free(plain);
+    if (out_len) *out_len = len;
+    return out;
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {

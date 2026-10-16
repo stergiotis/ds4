@@ -656,18 +656,12 @@ void ds4_kvstore_close(ds4_kvstore *kc) {
     memset(kc, 0, sizeof(*kc));
 }
 
+/* Keys are compared byte for byte with rendered prompts, so they escape plain
+ * spellings of control tokens the same way the renderer does. */
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
                                      size_t *out_len) {
-    kv_buf b = {0};
-    for (int i = 0; i < tokens->len; i++) {
-        size_t len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[i], &len);
-        kv_buf_append(&b, piece, len);
-        free(piece);
-    }
-    if (out_len) *out_len = b.len;
-    return kv_buf_take(&b);
+    return ds4_chat_tokens_text(engine, tokens, out_len);
 }
 
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,

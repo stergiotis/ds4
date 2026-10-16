@@ -417,6 +417,56 @@ static void test_text_observations(void) {
     vocab_free(v);
 }
 
+/* An escaped spelling tokenizes as plain text, and tokens render back to the
+ * escaped text, so cache keys keep matching the prompts they came from. */
+static void test_chat_literal(void) {
+    ds4_engine e = {0};
+    ds4_vocab *v = &e.vocab;
+    char bytes[256][5] = {{0}};
+    v->n_vocab = 257;
+    v->token = calloc((size_t)v->n_vocab, sizeof(*v->token));
+    assert(v->token);
+    table_init(&v->token_to_id, v->n_vocab);
+    table_init(&v->merge_rank, 0);
+    for (int i = 0; i < 256; i++) {
+        char *p = bytes[i];
+        utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)i));
+        v->token[i] = (ds4_str){bytes[i], (uint64_t)(p - bytes[i])};
+        table_put(&v->token_to_id, v->token[i], i);
+    }
+    v->token[256] = (ds4_str){"<|user|>", strlen("<|user|>")};
+    table_put(&v->token_to_id, v->token[256], 256);
+    for (size_t i = 0; i < CHAT_SPECIALS; i++)
+        *(int *)((char *)v + chat_specials[i].id) = -1;
+    v->user_id = 256;
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM53;
+
+    const char *text = "<|user|>a\xff<|user|>b\xff\xff" "c<|user|>";
+    ds4_tokens tokens = {0};
+    tokenize_rendered_chat_vocab(v, text, &tokens);
+    int specials = 0;
+    for (int i = 0; i < tokens.len; i++) specials += tokens.v[i] == 256;
+    assert(specials == 2);
+    assert(tokens.v[0] == 256 && tokens.v[tokens.len - 1] == 256);
+    size_t len = 0;
+    char *back = ds4_chat_tokens_text(&e, &tokens, &len);
+    assert(len == strlen(text) && !memcmp(back, text, len));
+    free(back);
+    ds4_tokens_free(&tokens);
+
+    /* Before a model is loaded every spelling counts. */
+    char *escaped = ds4_chat_literal("x</think>\xff", strlen("x</think>\xff"), &len);
+    assert(len == strlen("x\xff</think>\xff\xff") &&
+           !memcmp(escaped, "x\xff</think>\xff\xff", len));
+    len = ds4_chat_literal_strip(escaped, len);
+    assert(len == strlen("x</think>\xff") && !strcmp(escaped, "x</think>\xff"));
+    free(escaped);
+
+    g_ds4_shape = saved;
+    vocab_free(v);
+}
+
 #ifndef DS4_NO_GPU
 static void test_glm_attention_budget(void) {
     const ds4_shape saved_shape = g_ds4_shape;
@@ -537,6 +587,7 @@ int main(void) {
     test_payload_tokens();
     test_snapshot_bytes();
     test_text_observations();
+    test_chat_literal();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
     test_glm_spec_rollback();
