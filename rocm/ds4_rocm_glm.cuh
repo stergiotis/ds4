@@ -1633,6 +1633,137 @@ __global__ static void glm_attention_indexed_lora_kernel(
     }
 }
 
+/* glm_attention_indexed_lora_kernel for selected rows without rope (GLM-5.3),
+ * G heads per block: each KV row is read once for G heads instead of once
+ * per head, and loads run ahead of the arithmetic. Every per-head result is
+ * computed the way the per-head kernel computes it: the score dot as one fma
+ * chain in j order, the softmax with the same 256-thread partition and tree,
+ * the output as one fma chain in row order. fmaf pins the chains, so
+ * fast-math cannot regroup them once the loops are unrolled. */
+template <uint32_t G, bool CACHE_F16>
+__global__ static void glm_attention_indexed_lora_head_group_kernel(
+        float *lora_out,
+        const float *qk_low,
+        const char *kv_lora_cache,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t cache_cap,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope) {
+    const uint32_t head0 = blockIdx.x * G;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head0 + G > n_head || token >= n_tokens || n_selected == 0u) return;
+    const float scale = rsqrtf((float)qk_nope);
+    extern __shared__ float sh[];
+    float *red = sh;
+    float *low = red + G * 256u;
+    float *scores = low + G * kv_lora_dim;
+    const float *low_g = qk_low + ((uint64_t)token * n_head + head0) * kv_lora_dim;
+    for (uint32_t i = tid; i < G * kv_lora_dim; i += 256u) low[i] = low_g[i];
+    __syncthreads();
+    const int32_t *sel = selected + (uint64_t)token * n_selected;
+
+    float local_max[G];
+#pragma unroll
+    for (uint32_t h = 0; h < G; h++) local_max[h] = -INFINITY;
+    for (uint32_t s = tid; s < n_selected; s += 256u) {
+        const int32_t row_i = sel[s];
+        const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+        float dot[G];
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) dot[h] = 0.0f;
+        if (valid) {
+            const uint64_t base = (uint64_t)(uint32_t)row_i * kv_lora_dim;
+#pragma unroll 32
+            for (uint32_t j = 0; j < kv_lora_dim; j++) {
+                const float c = glm_rocm_cache_load(kv_lora_cache, base + j, CACHE_F16);
+#pragma unroll
+                for (uint32_t h = 0; h < G; h++) dot[h] = fmaf(low[h * kv_lora_dim + j], c, dot[h]);
+            }
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) {
+            const float score = valid ? dot[h] * scale : -INFINITY;
+            scores[h * n_selected + s] = score;
+            local_max[h] = fmaxf(local_max[h], score);
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < G; h++) red[h * 256u + tid] = local_max[h];
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+#pragma unroll
+            for (uint32_t h = 0; h < G; h++) {
+                red[h * 256u + tid] = fmaxf(red[h * 256u + tid], red[h * 256u + tid + stride]);
+            }
+        }
+        __syncthreads();
+    }
+    float max_score[G];
+#pragma unroll
+    for (uint32_t h = 0; h < G; h++) max_score[h] = red[h * 256u];
+    __syncthreads();
+
+    float local_sum[G];
+#pragma unroll
+    for (uint32_t h = 0; h < G; h++) local_sum[h] = 0.0f;
+    for (uint32_t s = tid; s < n_selected; s += 256u) {
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) {
+            if (!isfinite(max_score[h])) continue;
+            const float w = expf(scores[h * n_selected + s] - max_score[h]);
+            scores[h * n_selected + s] = w;
+            local_sum[h] += w;
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < G; h++) red[h * 256u + tid] = local_sum[h];
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+#pragma unroll
+            for (uint32_t h = 0; h < G; h++) {
+                red[h * 256u + tid] += red[h * 256u + tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    float denom[G];
+#pragma unroll
+    for (uint32_t h = 0; h < G; h++) denom[h] = fmaxf(red[h * 256u], 1.0e-20f);
+
+    for (uint32_t j = tid; j < kv_lora_dim; j += 256u) {
+        float acc[G];
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) acc[h] = 0.0f;
+        /* Invalid rows load row 0 and discard the fma, without a branch, so
+         * the loads of several rows issue before the first one returns. */
+#pragma unroll 8
+        for (uint32_t s = 0; s < n_selected; s++) {
+            const int32_t row_i = sel[s];
+            const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+            const uint32_t row = valid ? (uint32_t)row_i : 0u;
+            const float c = glm_rocm_cache_load(kv_lora_cache,
+                                                (uint64_t)row * kv_lora_dim + j,
+                                                CACHE_F16);
+#pragma unroll
+            for (uint32_t h = 0; h < G; h++) {
+                const float next = fmaf(c, scores[h * n_selected + s], acc[h]);
+                acc[h] = valid ? next : acc[h];
+            }
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) {
+            float *out = lora_out + ((uint64_t)token * n_head + head0 + h) * kv_lora_dim;
+            out[j] = isfinite(max_score[h]) ? acc[h] / denom[h] : 0.0f;
+        }
+    }
+}
+
 __global__ static void glm_attention_indexed_decode_split_partial_kernel(
         float *partial_lora,
         float *partial_ms,
@@ -4457,6 +4588,35 @@ static int glm_attention_indexed_lora_launch(
             notice_printed = 1;
         }
         return 1;
+    }
+    /* DS4_ROCM_GLM_ATTN_HEAD_GROUP: heads per block for one-token selected
+     * attention without rope (2, 4 or 8; default 2: as fast as 4 on gfx1151
+     * and half the LDS, so it fits up to ~7,400 selected rows). 1 keeps the
+     * per-head kernel; every choice gives the same bits. */
+    static int head_group = -1;
+    if (head_group < 0) {
+        const char *env = getenv("DS4_ROCM_GLM_ATTN_HEAD_GROUP");
+        head_group = env && env[0] ? atoi(env) : 2;
+    }
+    const size_t group_shmem =
+        (size_t)(head_group > 0 ? head_group : 1) * (256u + kv_lora_dim + n_selected) * sizeof(float);
+    if (n_tokens == 1u && !causal_range && has_selected && qk_rope == 0u &&
+        (head_group == 2 || head_group == 4 || head_group == 8) &&
+        n_head % (uint32_t)head_group == 0u && group_shmem <= 65536u) {
+        const dim3 ggrid(n_head / (uint32_t)head_group, 1u, 1u);
+#define DS4_GLM_ATTN_GROUP_ARGS (float *)lora_out->ptr, (const float *)qk_low->ptr, \
+            (const char *)kv_lora_cache->ptr, (const int32_t *)selected->ptr, n_tokens, \
+            n_selected, cache_cap, n_head, kv_lora_dim, qk_nope
+#define DS4_GLM_ATTN_GROUP_LAUNCH(g) do { \
+            if (cache_f16) glm_attention_indexed_lora_head_group_kernel<g, true><<<ggrid, 256, group_shmem>>>(DS4_GLM_ATTN_GROUP_ARGS); \
+            else glm_attention_indexed_lora_head_group_kernel<g, false><<<ggrid, 256, group_shmem>>>(DS4_GLM_ATTN_GROUP_ARGS); \
+        } while (0)
+        if (head_group == 2) DS4_GLM_ATTN_GROUP_LAUNCH(2u);
+        else if (head_group == 4) DS4_GLM_ATTN_GROUP_LAUNCH(4u);
+        else DS4_GLM_ATTN_GROUP_LAUNCH(8u);
+#undef DS4_GLM_ATTN_GROUP_LAUNCH
+#undef DS4_GLM_ATTN_GROUP_ARGS
+        return cuda_ok(cudaGetLastError(), "glm indexed lora head group launch");
     }
     dim3 grid(n_head, n_tokens, 1);
     const size_t shmem = ((size_t)256u + n_selected) * sizeof(float);
