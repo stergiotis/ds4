@@ -363,6 +363,25 @@ kernels toward bandwidth (up to ~13 ms), grouped MLA attention with the
 reduction order kept (up to ~15 ms), Q4_K KDA matvec (~4 ms), one quantize
 per shared input, mHC kernel fusion.
 
+Done the same day, each bit-identical by `DS4_PPL_DUMP` on
+`strix/ppl/go.txt` (byte `cmp` against the baseline dump; `strix/compare.sh`
+only sees prefill) and, for the MoE kernels, the hash in
+`tests/bench_glm_moe_rocm`. All under the 45 W cap, so the absolute numbers
+are low:
+
+| Change | Stage before -> after | Decode end to end |
+|---|---|---|
+| 0bd300a MoE loads in flight | one MoE step 1,023 -> 909 us | ~2-3% expected, not resolvable under throttling |
+| 3c0c510 MLA attention per head pair | 19.7 / 17.6 -> 5.2 ms/token | 2K 9.07 -> 9.99, 4K 8.88 -> 9.91 tok/s (ABBA) |
+| 09d478b BF16 hc matvec chunks | norm stages 11.6 / 12.7 -> 9.3 / 9.6 ms/token | ~2% |
+
+Tried and dropped: the activation row of the Q4_K matvec in LDS (122 ->
+120 us, noise). The Q4_K matvec reaches ~155 GB/s and is likely
+ALU-bound at the capped clock. Quantizing each shared Q8_0 input once
+would save ~200 launches (~1 ms) but needs the call sites in ds4.c to
+share it. Under the cap, effects below ~3% are not measurable here:
+end-to-end throughput drifted 9-20% within one session as the box heated.
+
 ## Known test failures (clang 21, 2026-10-25)
 
 Two model-free ROCm tests fail at 5a9924d when built with the system hipcc
