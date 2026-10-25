@@ -915,6 +915,12 @@ tests/bench_glm_matvec_rocm.o: tests/bench_glm_matvec_rocm.c ds4_gpu.h ds4_deeps
 tests/bench_glm_matvec_rocm: tests/bench_glm_matvec_rocm.o ds4_rocm.o ds4_rocm_compat.o ds4_image.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
+tests/bench_glm_moe_rocm.o: tests/bench_glm_moe_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/bench_glm_moe_rocm: tests/bench_glm_moe_rocm.o ds4_rocm.o ds4_rocm_compat.o ds4_image.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
 test-mxfp4-rocm: tests/test_mxfp4_rocm
 	./tests/test_mxfp4_rocm
 
