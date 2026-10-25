@@ -58151,6 +58151,14 @@ static bool glm_graph_forward_token(
         }
         if (defer_completion) decode_layer_flush_interval = 0;
     }
+    /* DS4_GLM_DECODE_HOST_TIMING=1: per token, host time spent queueing work,
+     * blocked in the per-layer flushes, and in the final wait. Meant for
+     * resident decode; with SSD streaming the expert waits count as queueing. */
+    const bool host_timing = logits_out != NULL &&
+                             getenv("DS4_GLM_DECODE_HOST_TIMING") != NULL;
+    const double host_t0 = host_timing ? now_sec() : 0.0;
+    double host_flush_s = 0.0;
+    uint32_t host_flushes = 0;
     if (pos >= g->ctx_cap && !use_indexed_attention) {
         glm_graph_log_full_attention_limit(g, pos, 1);
         DS4_GLM_FT_FAIL("full attention limit");
@@ -59143,7 +59151,12 @@ glm53_attention_done:
                     ok = ds4_gpu_begin_commands() != 0;
                 }
             } else {
+                const double t = host_timing ? now_sec() : 0.0;
                 ok = ds4_gpu_flush_commands() != 0;
+                if (host_timing) {
+                    host_flush_s += now_sec() - t;
+                    host_flushes++;
+                }
             }
         }
         if (streaming_decode_sync_each_layer) {
@@ -59167,11 +59180,23 @@ glm53_attention_done:
             else (void)ds4_gpu_synchronize();
         }
     }
+    const double host_t_queued = host_timing ? now_sec() : 0.0;
     if (!g->ssd_streaming && !defer_completion) {
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
     } else if (!ok) {
         (void)ds4_gpu_synchronize();
+    }
+    if (host_timing) {
+        const double now = now_sec();
+        fprintf(stderr,
+                "ds4: GLM decode host pos=%u total=%.3f queue=%.3f flush=%.3f (%u) wait=%.3f ms\n",
+                pos,
+                (now - host_t0) * 1000.0,
+                (host_t_queued - host_t0 - host_flush_s) * 1000.0,
+                host_flush_s * 1000.0,
+                host_flushes,
+                (now - host_t_queued) * 1000.0);
     }
     if (decode_output_profile) {
         const double now = now_sec();
