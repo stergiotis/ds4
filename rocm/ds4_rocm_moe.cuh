@@ -118,6 +118,62 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
     return 0.125f * xd * y->d * (float)bsum;
 }
 
+/* dev_dot_iq2_xxs_q8_K_block_lut in two steps, so a caller can issue the
+ * loads of several blocks before any of their arithmetic: the block's words,
+ * then its integer sum. The caller applies the float scaling; see
+ * moe_gate_up_mid_decode_lut_qwarp32_kernel for the order that keeps bits. */
+typedef struct {
+    uint32_t aux[CUDA_QK_K / 16];
+    uint16_t d;
+} iq2_xxs_block_regs;
+
+__device__ __forceinline__ static void dev_iq2_xxs_block_load(
+        const cuda_block_iq2_xxs *x,
+        iq2_xxs_block_regs *r) {
+#pragma unroll
+    for (int i = 0; i < CUDA_QK_K / 16; i++) {
+        r->aux[i] = (uint32_t)x->qs[2 * i] | ((uint32_t)x->qs[2 * i + 1] << 16);
+    }
+    r->d = x->d;
+}
+
+__device__ __forceinline__ static int32_t dev_iq2_xxs_q8_K_regs_bsum_lut(
+        const iq2_xxs_block_regs *r,
+        const cuda_block_q8_K *y,
+        const uint64_t *grid,
+        const uint8_t *signs) {
+    const int8_t *q8 = y->qs;
+    int32_t bsum = 0;
+#pragma unroll
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = r->aux[2 * ib32];
+        const uint32_t aux1 = r->aux[2 * ib32 + 1];
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+        int32_t w[8];
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        int32_t sumi = 0;
+        sumi = __dp4a(w[0], *(const int32_t *)(q8 + ib32 * 32u + 0),  sumi);
+        sumi = __dp4a(w[1], *(const int32_t *)(q8 + ib32 * 32u + 4),  sumi);
+        sumi = __dp4a(w[2], *(const int32_t *)(q8 + ib32 * 32u + 8),  sumi);
+        sumi = __dp4a(w[3], *(const int32_t *)(q8 + ib32 * 32u + 12), sumi);
+        sumi = __dp4a(w[4], *(const int32_t *)(q8 + ib32 * 32u + 16), sumi);
+        sumi = __dp4a(w[5], *(const int32_t *)(q8 + ib32 * 32u + 20), sumi);
+        sumi = __dp4a(w[6], *(const int32_t *)(q8 + ib32 * 32u + 24), sumi);
+        sumi = __dp4a(w[7], *(const int32_t *)(q8 + ib32 * 32u + 28), sumi);
+        bsum += sumi * ls;
+    }
+    return bsum;
+}
+
+/* An optimization barrier: fast-math may not reassociate across it. */
+__device__ __forceinline__ static float dev_opaque_f32(float v) {
+    asm volatile("" : "+v"(v));
+    return v;
+}
+
 __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, const cuda_block_q8_K *y) {
     const float d = dev_f16_to_f32(x->d) * y->d;
     const uint16_t *q2 = x->qs;
@@ -1226,8 +1282,19 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            /* Gate and up blocks are loaded before either dot: one memory
+             * round trip for both instead of one per 32 weights of each. */
+            iq2_xxs_block_regs gq, uq;
+            dev_iq2_xxs_block_load(gr + b, &gq);
+            dev_iq2_xxs_block_load(ur + b, &uq);
+            const int32_t gsum = dev_iq2_xxs_q8_K_regs_bsum_lut(&gq, xqb + b, s_iq2_grid, s_iq2_signs);
+            const int32_t usum = dev_iq2_xxs_q8_K_regs_bsum_lut(&uq, xqb + b, s_iq2_grid, s_iq2_signs);
+            /* The scaling as the rolled kernel compiled it under fast-math,
+             * spelled out so the bits stay the same:
+             * acc = fma((0.125 * y.d) * x.d, (float)bsum, acc). */
+            const float s = dev_opaque_f32(0.125f * xqb[b].d);
+            gate = fmaf(dev_opaque_f32(s * dev_f16_to_f32(gq.d)), (float)gsum, gate);
+            up = fmaf(dev_opaque_f32(s * dev_f16_to_f32(uq.d)), (float)usum, up);
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -4591,6 +4658,86 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
             const unsigned char *db = dr + (uint64_t)b * 84u;
             float d, dmin;
             q2_K_scale_broadcast_w32(db, &d, &dmin);
+            const uint64_t mbase = (uint64_t)b * 256u;
+#pragma unroll
+            for (uint32_t kk = 0; kk < 8u; kk++) {
+                const uint32_t i = lane + (kk << 5u);
+                acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) * mr[mbase + i];
+            }
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+/* moe_down_q2K_sum_rows_w32_kernel with the same terms added in the same
+ * order, but a wave loads U Q2_K blocks before their arithmetic and every
+ * lane reads the block's d/dmin itself. The original waits twice per 84-byte
+ * block: for lane 0's scales, then for the data. */
+template <uint32_t U>
+__global__ static void moe_down_q2K_sum_rows_w32_grouped_kernel(
+        float *out,
+        const char *down_base,
+        const float *mid,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t n_expert) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+
+    float acc = 0.0f;
+    const uint32_t nb = expert_mid_dim >> 8u;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+        if (expert_i < 0) expert_i = 0;
+        const unsigned char *dr = (const unsigned char *)down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const float *mr = mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim;
+        uint32_t b = 0;
+        for (; b + U <= nb; b += U) {
+            float d[U], dmin[U], m[U][8];
+            uint8_t q[U][8], sc[U][8];
+#pragma unroll
+            for (uint32_t u = 0; u < U; u++) {
+                const unsigned char *db = dr + (uint64_t)(b + u) * 84u;
+                d[u] = dev_f16_to_f32((uint16_t)db[80] | ((uint16_t)db[81] << 8));
+                dmin[u] = dev_f16_to_f32((uint16_t)db[82] | ((uint16_t)db[83] << 8));
+#pragma unroll
+                for (uint32_t kk = 0; kk < 8u; kk++) {
+                    const uint32_t g = (lane >> 4u) + (kk << 1u);
+                    const uint32_t within = g & 7u;
+                    q[u][kk] = db[16u + (g >> 3u) * 32u + (within & 1u) * 16u + (lane & 15u)];
+                    sc[u][kk] = db[g];
+                    m[u][kk] = mr[(uint64_t)(b + u) * 256u + lane + (kk << 5u)];
+                }
+            }
+#pragma unroll
+            for (uint32_t u = 0; u < U; u++) {
+#pragma unroll
+                for (uint32_t kk = 0; kk < 8u; kk++) {
+                    const uint32_t g = (lane >> 4u) + (kk << 1u);
+                    const uint32_t shift = ((g & 7u) >> 1u) * 2u;
+                    const float qv = (float)((q[u][kk] >> shift) & 3u);
+                    const float scale = (float)(sc[u][kk] & 0x0fu);
+                    const float mn = (float)(sc[u][kk] >> 4u);
+                    acc += (d[u] * scale * qv - dmin[u] * mn) * m[u][kk];
+                }
+            }
+        }
+        for (; b < nb; b++) {
+            const unsigned char *db = dr + (uint64_t)b * 84u;
+            const float d = dev_f16_to_f32((uint16_t)db[80] | ((uint16_t)db[81] << 8));
+            const float dmin = dev_f16_to_f32((uint16_t)db[82] | ((uint16_t)db[83] << 8));
             const uint64_t mbase = (uint64_t)b * 256u;
 #pragma unroll
             for (uint32_t kk = 0; kk < 8u; kk++) {

@@ -1950,17 +1950,27 @@ static int routed_moe_launch(
                     down_row_bytes,
                     n_expert);
             } else {
-                moe_down_q2K_sum_rows_w32_kernel<<<dgrid, threads>>>(
-                    (float *)out->ptr,
-                    down_w,
-                    (const float *)mid->ptr,
-                    (const int32_t *)selected_exec->ptr,
-                    n_tokens,
-                    expert_mid_dim,
-                    out_dim,
-                    down_expert_bytes,
-                    down_row_bytes,
-                    n_expert);
+                /* DS4_ROCM_MOE_DOWN_GROUP: Q2_K blocks a wave loads before
+                 * their arithmetic (2, 4 or 8; default 4). 1 selects the
+                 * original kernel; all give the same bits. */
+                static int down_group = -1;
+                if (down_group < 0) {
+                    const char *env = getenv("DS4_ROCM_MOE_DOWN_GROUP");
+                    down_group = env && env[0] ? atoi(env) : 4;
+                }
+#define DS4_MOE_DOWN_Q2K_ARGS (float *)out->ptr, down_w, (const float *)mid->ptr, \
+                    (const int32_t *)selected_exec->ptr, n_tokens, expert_mid_dim, \
+                    out_dim, down_expert_bytes, down_row_bytes, n_expert
+                if (down_group == 2) {
+                    moe_down_q2K_sum_rows_w32_grouped_kernel<2u><<<dgrid, threads>>>(DS4_MOE_DOWN_Q2K_ARGS);
+                } else if (down_group == 4) {
+                    moe_down_q2K_sum_rows_w32_grouped_kernel<4u><<<dgrid, threads>>>(DS4_MOE_DOWN_Q2K_ARGS);
+                } else if (down_group == 8) {
+                    moe_down_q2K_sum_rows_w32_grouped_kernel<8u><<<dgrid, threads>>>(DS4_MOE_DOWN_Q2K_ARGS);
+                } else {
+                    moe_down_q2K_sum_rows_w32_kernel<<<dgrid, threads>>>(DS4_MOE_DOWN_Q2K_ARGS);
+                }
+#undef DS4_MOE_DOWN_Q2K_ARGS
             }
             ok = cuda_ok(cudaGetLastError(),
                          "routed_moe decode fp32 q2 down launch");
