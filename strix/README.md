@@ -310,6 +310,59 @@ Things they found that may still apply here:
   in A/B pairs (teacher forcing) so that changed routing could not
   confound a speed result.
 
+## GLM-5.3 Q2 resident decode (2026-10-25)
+
+The whole Q2 file (89.9 GiB) in GTT, no `--ssd-streaming`, 5a9924d, clang 21.
+Results under `~/.local/share/llm-eval/glm53-q2-ds4-20261025-1142/` and
+`~/.local/share/ds4/bench/20261025-1610-q2-decode-baseline/`.
+
+| Profile, socket | Prefill 2K/4K/6K/8K | Decode 2K/4K/6K/8K | GTT peak |
+|---|---|---|---:|
+| balanced (morning) | 61.9 / 52.3 / 50.3 / 48.3 | 10.61 / 10.52 / 10.40 / 10.37 | 95.8 GiB |
+| performance, 45 W cap | 52.9 / 44.3 / 43.1 / 41.4 | 9.67 / 9.64 / 9.58 / 9.48 | 95.0 GiB |
+
+In the afternoon the socket sat at a hard 45 W under GPU load (slow-PPT
+throttle engaged, GPU 2,077 MHz of 2,900, Tctl 63 °C); in September it
+reached 120 W. Long generations through ds4-server fall from 11.6 tok/s at
+1K context to 9.2 at 32K. The three llm-eval Go tasks: 1/3 (semver; expr
+and glob spent the 32K budget thinking). Perplexity on `strix/ppl/`
+(1,000 tokens): Go 1.771, Markdown 9.259; the dumps are the reference for
+later lossy changes.
+
+Where a token goes (45 W run):
+- **GPU-bound, not launch-bound.** `DS4_GLM_DECODE_HOST_TIMING=1`: the host
+  queues a token in 5.0-5.4 ms and then waits 95-101 ms. HIP graphs would
+  hide host time that is already hidden.
+- **1,745 kernel launches per token** (HIP launch log, symbols mapped from
+  the binary): 373 `quantize_q8_0_f32` next to 373 Q8_0 matvecs, because each
+  matvec quantizes its input again even when the input is shared; 112 BF16
+  matvecs, 90 each of the mHC split/expand kernels, 2 routed-MoE kernels per
+  layer.
+- **The 11 flushes per token** (every 4 layers; `cudaDeviceSynchronize` on
+  ROCm): `DS4_GLM_DECODE_FLUSH_INTERVAL=0` is +0.5-2% with bit-identical
+  frontier logits.
+- **Per stage** (`DS4_ROCM_DECODE_STAGE_PROFILE=1`, 2K, 106 ms/token with its
+  syncs):
+
+| ms/token | Stage | Note |
+|---:|---|---|
+| 29.2 | attn_output, 45 layers | KDA projections; matches the matvec bench |
+| 27.1 | routed_moe, 42 layers | 2.4 GB of IQ2_XXS/Q2_K experts at ~90 GB/s |
+| 18.7 | attention, 11 MLA layers | 1.7 ms/layer at 2K; per-head re-reads of the shared KV latent would explain it |
+| 9.1 | attn_norm + ffn_norm, 90x | mHC mixing in several small kernels, ~100 us each |
+| 8.3 | shared expert | ~135 GB/s |
+| 3.1 | router | F32 4096x288 and top-k |
+
+- **Dense matvecs** (`tests/bench_glm_matvec_rocm`): Q8_0 projections of
+  8 MiB and up reach 188-226 GB/s, near the ~240 GB/s the chip delivers; the
+  Q4_K kda_q/k shape 130 GB/s; matvecs under 2 MiB cost 7-19 us, mostly
+  fixed overhead.
+
+Exact (bit-identical) work in order of expected gain: routed-MoE decode
+kernels toward bandwidth (up to ~13 ms), grouped MLA attention with the
+reduction order kept (up to ~15 ms), Q4_K KDA matvec (~4 ms), one quantize
+per shared input, mHC kernel fusion.
+
 ## Known test failures (clang 21, 2026-10-25)
 
 Two model-free ROCm tests fail at 5a9924d when built with the system hipcc
