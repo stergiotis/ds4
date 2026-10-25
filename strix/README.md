@@ -310,6 +310,26 @@ Things they found that may still apply here:
   in A/B pairs (teacher forcing) so that changed routing could not
   confound a speed result.
 
+## Known test failures (clang 21, 2026-10-25)
+
+Two model-free ROCm tests fail at 5a9924d when built with the system hipcc
+(ROCm 7.1, Ubuntu clang 21.1.8); neither comes from this fork's changes.
+Everything else in `make test-rocm` and the other model-free ROCm and CPU
+targets passes.
+
+- `make test-deepseek41-rocm`: the bulk V4.1 F16 projection
+  (`ds4_gpu_dsv41_projection_rows`) is not bit-identical to the per-row
+  `ds4_gpu_matmul_f16_tensor` reference at shape 12 (width 20480, 24
+  outputs, 33 rows); `tests/test_deepseek41_rocm.c:837` compares with
+  `memcmp`. Shapes up to 7 rows at width 20480, and 513 rows at width 512,
+  are exact. The test stops at the first failure, so later shapes are
+  unchecked.
+- `make test-qwen4-rocm`: `moe mxfp4 E=2560 F=640 slots=10 T=2:
+  reduce+combine` reaches max|d| 2.66e-3 (rel 1.17e-3, got -0.282767 vs ref
+  -0.285426), ~59x over its 2e-5 relative tolerance; the q8_0 case of the same
+  check is at 3.9e-7. Suspected cause: clang 21 vs the clang 23 of
+  `strix/hipcc23.sh`, not yet confirmed with a clang 23 build.
+
 ## Open
 
 - The root cause of the Q4_K tiled-kernel fault.
