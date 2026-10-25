@@ -272,7 +272,24 @@ __global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
     const uint16_t *wrow = weights + (uint64_t)col * in_dim;
     const float *xrow = x + (uint64_t)row * in_dim;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+    /* Whole chunks of 16 steps load before their arithmetic; a plain loop
+     * waited for every weight and input (64 round trips at in_dim 16384).
+     * The fmaf chain keeps the same i order. */
+    uint32_t i = threadIdx.x;
+    for (; i + 15u * blockDim.x < in_dim; i += 16u * blockDim.x) {
+        uint16_t wv[16];
+        float xv[16];
+#pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            wv[k] = wrow[i + k * blockDim.x];
+            xv[k] = xrow[i + k * blockDim.x];
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            sum = fmaf(__uint_as_float((uint32_t)wv[k] << 16), xv[k], sum);
+        }
+    }
+    for (; i < in_dim; i += blockDim.x) {
         const float w = __uint_as_float((uint32_t)wrow[i] << 16);
         sum = fmaf(w, xrow[i], sum);
     }
