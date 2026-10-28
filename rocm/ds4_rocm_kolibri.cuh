@@ -1413,6 +1413,11 @@ extern "C" int ds4_gpu_kolibri_moe_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu
     static int rows_max = -1;
     if (rows_max < 0) rows_max = getenv("DS4_KOLIBRI_Q4K_ROWS_MAX") ? atoi(getenv("DS4_KOLIBRI_Q4K_ROWS_MAX")) : 16;
     if (!down && K == 2560 && T <= (uint32_t)rows_max && !(M % 8u)) {
+        /* The dskgen plan's kernel first, for the T it was chosen at. */
+        if (shared_type == 8 && qwen4_rocm::dskgen_plans_enabled() &&
+            dskgen::moe_q4k_rows_launch(dskgen::MOE_Q4K_ROWS_PLAN_EXACT, K, (float *)out->ptr,
+                (const float *)x->ptr, (const int *)sel->ptr, w0, w1, s0, s1, NE, NS, M, rb, srb, T, 0))
+            return launched();
         const dim3 g(M / 8u, NO, T);
         if (shared_type == 8) moe_q4k_rows<10, 2, 8><<<g, 128, 0, 0>>>((float *)out->ptr,
             (const float *)x->ptr, (const int *)sel->ptr, w0, w1, s0, s1, NE, NS, M, rb, srb, T);

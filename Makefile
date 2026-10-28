@@ -18,7 +18,7 @@ QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
-ROCM_SRCS := $(wildcard rocm/*.cuh)
+ROCM_SRCS := $(wildcard rocm/*.cuh) $(wildcard rocm/gen/*.cuh)
 DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
@@ -293,6 +293,7 @@ help:
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
+	@echo "  make rocm-contract       Check the dskgen plan kernels' register contract (rocm/gen/README.md)"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
@@ -322,6 +323,18 @@ strix-halo:
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
 rocm: strix-halo
+
+# The dskgen plan headers under rocm/gen/ carry the VGPRs and occupancy each
+# kernel was measured at; this compiles ds4_rocm.cu once more with the
+# compiler's resource-usage remarks on and checks every plan kernel against
+# them, so a kernel the production compiler allocates differently from the
+# measured one is caught before it ships (rocm/gen/README.md).
+DSKGEN_CONTRACT_DIR ?= /var/tmp/ds4-dskgen-contract
+.PHONY: rocm-contract
+rocm-contract:
+	mkdir -p $(DSKGEN_CONTRACT_DIR)
+	$(HIPCC) $(ROCM_CFLAGS) -Rpass-analysis=kernel-resource-usage -c -o $(DSKGEN_CONTRACT_DIR)/ds4_rocm.o ds4_rocm.cu 2> $(DSKGEN_CONTRACT_DIR)/remarks.txt || { cat $(DSKGEN_CONTRACT_DIR)/remarks.txt; exit 1; }
+	sh rocm/gen/dskgen-contract.sh $(DSKGEN_CONTRACT_DIR)/remarks.txt rocm/gen/dskgen_*.cuh
 
 # Core regression suite for ROCm-only hosts: the CUDA-specific binaries
 # (tests/test_sampling, the CUDA session/mixed-batch oracles) are not part

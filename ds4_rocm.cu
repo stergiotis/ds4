@@ -189,6 +189,10 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 #include "rocm/ds4_rocm_deepseek4_vision.cuh"
 
+/* The dskgen plan headers (rocm/gen/README.md): the measured decode kernels
+ * for the Qwen3.8 expert projections, launched before the hand-written ones. */
+#include "rocm/gen/dskgen_moe_q4k_rows.cuh"
+#include "rocm/gen/dskgen_moe_down_mxfp4_rows.cuh"
 #include "rocm/ds4_rocm_qwen4.cuh"
 #include "rocm/ds4_rocm_kolibri.cuh"
 

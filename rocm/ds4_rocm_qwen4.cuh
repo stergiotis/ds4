@@ -1009,22 +1009,42 @@ __global__ __launch_bounds__(128) void moe_down_mxfp4_q8(float *out, const float
     }
 }
 
+/* The dskgen plan kernels (rocm/gen/) run before the hand-written decode
+ * kernels; DS4_DSKGEN=0 leaves them out. */
+static int dskgen_plans_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("DS4_DSKGEN") || atoi(getenv("DS4_DSKGEN")) != 0;
+    return on;
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     /* MXFP4 expert down for 1-16 tokens: integer dots on int8 x by default,
      * DS4_QWEN4_MXFP4_Q8=0 the float kernel.  One instance serves every T,
-     * so verify rows match plain decode. */
+     * so verify rows match plain decode.  The dskgen plan's kernel of the
+     * same math first (the budget plan is the integer-dot one), for the T
+     * it was chosen at. */
     static int mxfp4_q8 = -1;
     if (mxfp4_q8 < 0) mxfp4_q8 = !getenv("DS4_QWEN4_MXFP4_Q8") || atoi(getenv("DS4_QWEN4_MXFP4_Q8")) != 0;
     if (down && T >= 1 && T <= (mxfp4_q8 ? 16u : 3u) && type == 39 && st == 8 && K == 640 &&
         M % 16 == 0 && !((uintptr_t)w0 & 3) && !((uintptr_t)x & 15)) {
+        if (dskgen_plans_enabled() && dskgen::moe_down_mxfp4_rows_launch(
+                mxfp4_q8 ? dskgen::MOE_DOWN_MXFP4_ROWS_PLAN_BUDGET : dskgen::MOE_DOWN_MXFP4_ROWS_PLAN_EXACT,
+                K, out, x, sel, w0, s0, NE, NS, M, rb, srb, T, 0)) return launched();
         const dim3 grid(M / 16, NS + 1, T);
         if (mxfp4_q8) moe_down_mxfp4_q8<3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
         else moe_down_mxfp4_rows<4,3><<<grid, 128, 0, 0>>>(out, x, sel, w0, s0, NE, NS, M, rb, srb, T);
         return launched();
     }
+    /* Q4_K gate/up with a Q8_0 shared expert: the dskgen plan's kernel for
+     * the T it was chosen at (ds4.c reaches the Kolibri Q4_K path first for
+     * this model; the synthetic kernel test comes through here). */
+    if (!down && type == 12 && st == 8 && K == 2560 && dskgen_plans_enabled() &&
+        !(((uintptr_t)w0 | (uintptr_t)w1 | (uintptr_t)x) & 15) &&
+        dskgen::moe_q4k_rows_launch(dskgen::MOE_Q4K_ROWS_PLAN_EXACT, K, out, x, sel, w0, w1, s0, s1,
+                                    NE, NS, M, rb, srb, T, 0)) return launched();
     if (ds4_rocm_is_gfx1151() && T >= 2 && T <= 3 && NS == 10 && NE == 512 && st == 8 && !((uintptr_t)x&15)) {
         if (!down && K == 2560 && M == 640 && (type == 16 || type == 12)) {
             const dim3 grouped(M,(NS+1)*T);
